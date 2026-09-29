@@ -4,6 +4,7 @@ import './presenter.css';
 import type { DeckSession } from '@shared/ipc.js';
 import { bindSpeakerKeys, createSpeakerView } from './speakerView.js';
 import { installWindowApiPosterProvider } from '../player/previewPosterProvider.js';
+import { installEditorTheme } from '../editorTheme.js';
 
 // Thumbnails in Speaker View take their frames from the main process, so this
 // window never opens a video pipeline for a preview (see posterCache.ts).
@@ -13,6 +14,8 @@ installWindowApiPosterProvider();
  * The desktop Speaker View window. The view itself is shared with the browser
  * collaboration client; this file is only the Electron transport for it.
  */
+
+installEditorTheme();
 
 const view = createSpeakerView({
   host: document.getElementById('root')!,

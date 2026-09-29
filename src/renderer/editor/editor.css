@@ -1926,6 +1926,7 @@ input[type="range"] { accent-color: var(--accent); padding: 0; background: trans
   --green: #9ece6a;
   --yellow: #e0af68;
   --danger: #f7768e;      /* pastel red */
+  --canvas: #101017;      /* the well behind the slide */
   --radius: 0;
   --mono: "Monaspace Krypton", monospace;
 }
@@ -2011,7 +2012,7 @@ button.primary:hover:not(:disabled) { background: rgb(122 162 247 / 22%); }
 .rail-item.active .rail-thumb { --rail-thumb-stroke: var(--accent); }
 
 /* Canvas: flat, focused. */
-.canvas-host { background: #101017; }
+.canvas-host { background: var(--canvas); }
 .canvas-host .stage { box-shadow: 0 0 0 1px var(--line), 0 18px 50px rgb(0 0 0 / 60%); border-radius: 0; }
 
 /* Panels read like a TUI: uppercase mono section headers, ruled groups. */
@@ -4492,4 +4493,52 @@ button.ghost:hover:not(:disabled) { color: var(--text); background: transparent;
   text-transform: uppercase;
   transform: translateX(-50%);
   pointer-events: none;
+}
+
+/* --- editor appearance dialog (editor themes, not deck themes) --- */
+
+.editor-theme-dialog h2 { margin: 0; font-size: 14px; }
+.editor-theme-hint { margin: -6px 0 0; color: var(--muted); }
+.editor-theme-presets {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+  gap: 8px;
+}
+.editor-theme-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px !important;
+  text-align: left;
+}
+.editor-theme-card[aria-checked="true"] {
+  border-color: var(--accent) !important;
+  background: var(--accent-soft) !important;
+}
+.editor-theme-swatch {
+  position: relative;
+  display: block;
+  height: 48px;
+  border: 1px solid;
+  overflow: hidden;
+}
+.editor-theme-swatch > span { position: absolute; display: block; }
+.editor-theme-swatch > span:nth-child(1) { inset: 0 0 auto 0; height: 10px; }
+.editor-theme-swatch > span:nth-child(2) { left: 8px; top: 18px; width: 55%; height: 3px; }
+.editor-theme-swatch > span:nth-child(3) { left: 8px; top: 26px; width: 38%; height: 3px; }
+.editor-theme-swatch > span:nth-child(4) { right: 8px; bottom: 8px; width: 10px; height: 10px; }
+.editor-theme-card-label { font-size: 11px; }
+.editor-theme-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.editor-theme-row > span:first-child { width: 56px; color: var(--muted); }
+.editor-theme-row select { flex: 1; }
+.editor-theme-accent {
+  width: 36px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--line);
+  background: none;
 }
