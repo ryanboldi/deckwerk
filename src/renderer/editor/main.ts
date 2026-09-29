@@ -21,6 +21,8 @@ import {
 import { AgentBridge, type HtmlSyncOutcome } from './agentBridge.js';
 import { AgentPanel } from './agentPanel.js';
 import { createDeckWerkButton } from './aboutDialog.js';
+import { showEditorThemeDialog } from './editorThemeDialog.js';
+import { installEditorTheme } from '../editorTheme.js';
 import { trackPreviewFrameRecovery } from '../player/previewFrameRecovery.js';
 import { EditorCanvas } from './canvas.js';
 import { CssEditor } from './cssEditor.js';
@@ -888,6 +890,13 @@ rail.onSlideActivate = () => {
   themePanel.dismiss();
   designWorkspace.hide();
 };
+installEditorTheme();
+// ⌘, / Ctrl+, — the platform's usual Preferences chord — opens editor appearance.
+document.addEventListener('keydown', (event) => {
+  if (event.key !== ',' || !(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey) return;
+  event.preventDefault();
+  showEditorThemeDialog();
+});
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
   const escaped = designWorkspace.escape();

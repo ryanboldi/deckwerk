@@ -1,3 +1,5 @@
+import { showEditorThemeDialog } from './editorThemeDialog.js';
+
 const ABOUT_DIALOG_ID = 'deckwerk-about';
 
 /** The product wordmark used at the leading edge of editor toolbars. */
@@ -52,7 +54,10 @@ export function showAboutDialog(): void {
   close.type = 'button';
   close.className = 'primary';
   close.textContent = 'Close';
-  actions.appendChild(close);
+  const appearance = document.createElement('button');
+  appearance.type = 'button';
+  appearance.textContent = 'Editor appearance…';
+  actions.append(appearance, close);
 
   let finished = false;
   const dismiss = (): void => {
@@ -62,6 +67,10 @@ export function showAboutDialog(): void {
     previousFocus?.focus();
   };
   close.addEventListener('click', dismiss);
+  appearance.addEventListener('click', () => {
+    dismiss();
+    showEditorThemeDialog();
+  });
   overlay.addEventListener('pointerdown', (event) => {
     if (event.target === overlay) dismiss();
   });
