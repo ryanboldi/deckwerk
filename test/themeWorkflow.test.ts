@@ -95,10 +95,15 @@ describe('role-based theme workflow', () => {
     const popover = document.querySelector<HTMLElement>('.color-picker-popover')!;
     const hue = popover.querySelector<HTMLInputElement>('input[aria-label="Hue"]')!;
 
+    // A hue drag recolours as it goes, without closing or rebuilding the popover.
     hue.value = '180';
     hue.dispatchEvent(new Event('input', { bubbles: true }));
     expect(popover.isConnected).toBe(true);
-    expect(store.slide!.elements.find((el) => el.id === 'title')!.style.color).toBe('#f00');
+    const dragged = store.slide!.elements.find((el) => el.id === 'title')!.style.color;
+    expect(dragged).not.toBe('#f00');
+    hue.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(popover.isConnected).toBe(true);
+    expect(store.slide!.elements.find((el) => el.id === 'title')!.style.color).toBe(dragged);
 
     const hex = popover.querySelector<HTMLInputElement>('input[aria-label="Hex color"]')!;
     hex.value = '#123456';

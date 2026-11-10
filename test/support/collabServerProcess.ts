@@ -1,0 +1,236 @@
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import { join, resolve } from 'node:path';
+
+/**
+ * The collab server in a child process, sandboxed the way production runs it.
+ *
+ * In-process test servers cannot see the systemd sandbox at all, and it is
+ * where two production failures lived that every in-process suite passed:
+ * - Sept 2026: libuv's copyfile calls fchown(2), the syscall filter killed the
+ *   server with SIGSYS mid-upload, and every browser saw "upload failed".
+ * - Oct 2026: Chromium's sandbox needs user namespaces plus chroot(2) and
+ *   capset(2); `RestrictNamespaces=yes` and the filter forbade them, so every
+ *   headless-browser launch aborted and every agent save, render and page
+ *   check on the hosted server answered 500.
+ *
+ * This is the policy deckwerk-collab.service must have — the unit plus the
+ * drop-in in docs/collab.md, "Running under systemd". Whether the unit
+ * installed on a machine actually matches is checked separately, against the
+ * live unit (`installedUnitSandbox`).
+ */
+export const PRODUCTION_SANDBOX = [
+  '-p', 'NoNewPrivileges=yes',
+  '-p', 'SystemCallArchitectures=native',
+  // The drop-in deckwerk-collab.service.d/syscall-eperm.conf: a filtered
+  // syscall fails with EPERM rather than killing the process with SIGSYS.
+  '-p', 'SystemCallErrorNumber=EPERM',
+  // The namespaces and syscall filter, read from the drop-in itself so the
+  // policy tested here and the one documented for servers cannot drift apart.
+  ...chromiumSandboxDropIn(),
+];
+
+/** The [Service] settings of packaging/linux/deckwerk-collab-chromium-sandbox.conf, as systemd-run properties. */
+function chromiumSandboxDropIn(): string[] {
+  const file = resolve(import.meta.dirname, '..', '..', 'packaging', 'linux', 'deckwerk-collab-chromium-sandbox.conf');
+  return readFileSync(file, 'utf8').split('\n')
+    .map((line) => line.trim())
+    // A transient unit starts with no filter, so the drop-in's reset is moot.
+    .filter((line) => /^[A-Z]\w*=/.test(line) && line !== 'SystemCallFilter=')
+    .flatMap((line) => ['-p', line]);
+}
+
+const UNIT = 'deckwerk-collab.service';
+const SANDBOX_PROPERTIES = [
+  'NoNewPrivileges', 'SystemCallArchitectures', 'RestrictNamespaces', 'SystemCallFilter', 'SystemCallErrorNumber',
+] as const;
+
+/**
+ * The sandbox of the deckwerk-collab unit installed on this machine, as
+ * `systemd-run` properties, or null where there is none.
+ *
+ * Read from what systemd resolved — the unit and every drop-in merged — so a
+ * test running under it is a test of production, not of this file's idea of
+ * production.
+ */
+export function installedUnitSandbox(): string[] | null {
+  let shown: string;
+  try {
+    shown = execFileSync('systemctl', ['show', UNIT, '-p', 'LoadState', ...SANDBOX_PROPERTIES.flatMap((name) => ['-p', name])], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return null;
+  }
+  const values = new Map(shown.split('\n').filter(Boolean).map((line) => {
+    const at = line.indexOf('=');
+    return [line.slice(0, at), line.slice(at + 1)] as const;
+  }));
+  if (values.get('LoadState') !== 'loaded') return null;
+  const properties: string[] = [];
+  for (const name of SANDBOX_PROPERTIES) {
+    const value = values.get(name);
+    if (!value) continue;
+    // The resolved errno is numeric (EPERM is 1); systemd-run takes either.
+    properties.push('-p', `${name}=${value}`);
+  }
+  return properties;
+}
+
+const REPO = resolve(import.meta.dirname, '..', '..');
+
+let hostSandboxes: boolean | undefined;
+
+/**
+ * Whether Chromium can sandbox itself here with `NoNewPrivileges` and nothing
+ * else — that is, whether this host lets an ordinary process create user
+ * namespaces, which is what the production policy relies on.
+ *
+ * GitHub's Ubuntu runners do not (AppArmor restricts unprivileged user
+ * namespaces), and CI's setuid chrome-sandbox is ignored under
+ * NoNewPrivileges, so there the policy cannot be tested at all. That is a
+ * fact about the runner, not a regression in DeckWerk.
+ */
+export function chromiumSandboxesHere(electron: string): boolean {
+  if (hostSandboxes === undefined) {
+    const dir = mkdtempSync(join(tmpdir(), 'chromium-sandbox-probe-'));
+    const probe = join(dir, 'probe.cjs');
+    writeFileSync(probe, [
+      "const { app, BrowserWindow } = require('electron');",
+      'app.disableHardwareAcceleration();',
+      'app.whenReady().then(async () => {',
+      "  const win = new BrowserWindow({ show: false, webPreferences: { offscreen: true } });",
+      "  await win.loadURL('data:text/html,<p>ok</p>');",
+      "  process.stdout.write(await win.webContents.executeJavaScript('document.body.textContent'));",
+      '  app.exit(0);',
+      '});',
+    ].join('\n'));
+    try {
+      const out = execFileSync('systemd-run', [
+        '--user', '--pipe', '--wait', '--quiet', '--collect', '-p', 'NoNewPrivileges=yes',
+        electron, probe, '--ozone-platform=headless',
+      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 60_000 });
+      hostSandboxes = out.includes('ok');
+    } catch {
+      hostSandboxes = false;
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  return hostSandboxes;
+}
+
+/** What the server's own event loop went through (test/support/collabServerMain.mts). */
+export interface StallReport {
+  windowMs: number;
+  /** The longest the event loop was blocked, in ms. */
+  maxMs: number;
+  p99Ms: number;
+  /** The longest blocks: ms after the window opened, how long, and how much of it was GC. */
+  blocks: Array<{ at: number; ms: number; gcMs: number }>;
+}
+
+export interface CollabServerProcess {
+  port: number;
+  /** False where no user systemd session exists (CI): the server then runs unsandboxed. */
+  sandboxed: boolean;
+  /** The server's event-loop blocks since the last reset; needs `measureStalls`. */
+  stalls: (reset?: boolean) => Promise<StallReport>;
+  /** Everything the server wrote to stderr so far, for failure messages. */
+  stderr: () => string;
+  /** Whether the server process is still running. */
+  alive: () => boolean;
+  close: () => Promise<void>;
+}
+
+let sandboxAvailable: boolean | undefined;
+
+/** Whether this machine can run a transient unit under the production sandbox. */
+export function canSandbox(): boolean {
+  if (sandboxAvailable === undefined) {
+    try {
+      execFileSync('systemd-run', ['--user', '--wait', '--quiet', '--collect', ...PRODUCTION_SANDBOX, 'true'], { stdio: 'ignore' });
+      sandboxAvailable = true;
+    } catch {
+      sandboxAvailable = false;
+    }
+  }
+  return sandboxAvailable;
+}
+
+export async function startCollabServerProcess(options: {
+  rootDir: string;
+  clientDir?: string;
+  /** Let filesystem agents connect (the bridge and `./deck` routes). */
+  localAgents?: boolean;
+  /** systemd-run properties to run under instead of PRODUCTION_SANDBOX. */
+  sandbox?: string[];
+  /** Time the server's event loop; read it with `stalls()` (see collabServerMain.mts). */
+  measureStalls?: boolean;
+}): Promise<CollabServerProcess> {
+  const command = [
+    join(REPO, 'node_modules/.bin/vite-node'),
+    '--config', 'vitest.config.ts', 'test/support/collabServerMain.mts',
+  ];
+  const config = JSON.stringify({
+    rootDir: options.rootDir, clientDir: options.clientDir, localAgents: options.localAgents, measureStalls: options.measureStalls,
+  });
+  const sandboxed = canSandbox();
+  // Named, because the transient unit outlives a killed systemd-run client:
+  // liveness and shutdown both have to go through the unit itself.
+  const unit = `deckwerk-test-${randomUUID().slice(0, 8)}.service`;
+  const child: ChildProcess = sandboxed
+    ? spawn('systemd-run', [
+      '--user', '--pipe', '--wait', '--quiet', '--collect', `--unit=${unit}`,
+      `--working-directory=${REPO}`, `--setenv=PATH=${process.env.PATH}`,
+      `--setenv=DECKWERK_TEST_SERVER=${config}`,
+      ...(options.sandbox ?? PRODUCTION_SANDBOX), ...command,
+    ])
+    : spawn(command[0], command.slice(1), { cwd: REPO, env: { ...process.env, DECKWERK_TEST_SERVER: config } });
+
+  let stderr = '';
+  let exited = false;
+  child.stderr?.on('data', (chunk) => { stderr += chunk; });
+  child.once('exit', () => { exited = true; });
+  const unitActive = (): boolean => {
+    try {
+      execFileSync('systemctl', ['--user', 'is-active', '--quiet', unit], { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  let stallsPort: number | null = null;
+  const port = await new Promise<number>((resolvePort, reject) => {
+    let stdout = '';
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk;
+      const match = /"status":"serving","port":(\d+)(?:,"stallsPort":(\d+))?/.exec(stdout);
+      if (match) {
+        if (match[2]) stallsPort = Number(match[2]);
+        resolvePort(Number(match[1]));
+      }
+    });
+    child.once('exit', (code, signal) => reject(new Error(`collab server exited (${code ?? signal}) before serving:\n${stderr}`)));
+  });
+  return {
+    port,
+    sandboxed,
+    stalls: async (reset = false) => {
+      if (stallsPort === null) throw new Error('start the server with measureStalls to read its stalls');
+      const response = await fetch(`http://127.0.0.1:${stallsPort}/stalls${reset ? '?reset=1' : ''}`);
+      return await response.json() as StallReport;
+    },
+    stderr: () => stderr,
+    alive: () => !exited && (!sandboxed || unitActive()),
+    close: async () => {
+      if (sandboxed) execFileSync('systemctl', ['--user', 'stop', unit], { stdio: 'ignore' });
+      if (exited) return;
+      const done = new Promise((resolveExit) => child.once('exit', resolveExit));
+      child.kill();
+      await done;
+    },
+  };
+}

@@ -2,12 +2,17 @@ import '../player/player.css';
 import '../appChrome.css';
 import '../editor/editor.css';
 import './collab.css';
+import '../lightTheme.css';
+import { applyUiTheme } from '../uiTheme.js';
+import { applyUiScale } from '../uiScale.js';
 import { emptyDeck } from '@shared/deck.js';
 import { setIdSuffix } from '@shared/geometry.js';
-import { EditorCanvas } from '../editor/canvas.js';
+import { CANVAS_NOTICE_EVENT, EditorCanvas } from '../editor/canvas.js';
 import { SpeakerNotesDrawer } from '../editor/speakerNotesDrawer.js';
+import { CanvasRulers } from '../editor/rulers.js';
 import { createDeckWerkButton } from '../editor/aboutDialog.js';
-import { setCommentAuthor } from '../editor/comments.js';
+import { setCommentAuthor, setCommentLinks } from '../editor/comments.js';
+import { findComment } from '@shared/comments.js';
 import { CssEditor } from '../editor/cssEditor.js';
 import {
   createToolbarPicker,
@@ -16,16 +21,21 @@ import {
 } from '../editor/exportPicker.js';
 import { showPdfExportDialog } from '../editor/pdfExportDialog.js';
 import { HistoryPanel } from '../editor/historyPanel.js';
+import { LightTable } from '../editor/lightTable.js';
+import { MediaPanel, installMediaDrop } from '../editor/mediaPanel.js';
+import { createHistoryButton, createMediaButton, popoverPanelHost } from '../editor/toolbarPanels.js';
+import { ObjectList } from '../editor/objectList.js';
 import {
+  createPenButton,
   createShapeInsertPicker,
   createTableInsertPicker,
   insertText,
 } from '../editor/elementCreation.js';
+import { insertCode } from '../editor/codeInspector.js';
 import { Inspector } from '../editor/inspector.js';
 import {
   barButton,
-  barIconButton,
-  TEXT_ICON,
+  createTextInsertPicker,
   bindEditorKeys,
   createClipboardActions,
   makeContextActions,
@@ -35,17 +45,38 @@ import {
 import { SlideRail } from '../editor/slideRail.js';
 import { EditorStore } from '../editor/store.js';
 import { createThemePanel } from '../editor/themePanel.js';
+import { BuildPreview } from '../editor/buildPreview.js';
 import { TimelinePanel } from '../editor/timelinePanel.js';
 import { CollabBridge } from './collabBridge.js';
 import { createConnectionNotice } from './connectionNotice.js';
 import { createDeckOnServer, folderOf, importKeynoteToServer, importPowerPointToServer, showDeckPicker, showShareDialog } from './deckPicker.js';
-import { installNetApi } from './netApi.js';
+import { downloadOriginalAsset, installNetApi } from './netApi.js';
+import { installWindowApiPosterProvider } from '../player/previewPosterProvider.js';
+import { installEditorVideoMemory } from './editorVideoMemory.js';
+import { OfflineCopy } from './offlineCopy.js';
+import { KEPT_HEADER } from './offlineShared.js';
+import { offlineWorker, registerOfflineShell } from './offlineShell.js';
+import {
+  isMediaPending,
+  mediaVariantsSnapshot,
+  pendingMediaSnapshot,
+  setMediaVariants,
+  setPendingMedia,
+} from './mediaVariants.js';
+import { gatedLoadsPending } from '../player/mediaLoadGate.js';
+import { mediaStackReusesBytes } from '../player/videoMemory.js';
 import { PresenceOverlay } from './presenceOverlay.js';
+import { PresenceBar, isAgentPeer } from './presenceBar.js';
+import { ChatPanel } from './chatPanel.js';
 import { createAgentPanelApi, type AgentPanelBrowserApi } from './agentPanelApi.js';
 import { openEndCollaborationPopover } from './endCollaborationPopover.js';
-import { decodeEditorView, restoreEditorView } from '@shared/editorView.js';
+import { captureEditorView, decodeEditorView, encodeEditorView, restoreEditorView } from '@shared/editorView.js';
+import { createDeckNameField, type DeckNameField } from './deckNameField.js';
 import { AgentPanel } from '../editor/agentPanel.js';
-import { startPresenting } from './presentOverlay.js';
+import { agentConnectPrompt } from './agentPrompt.js';
+import { RemoteReceiver } from './remoteControl.js';
+import { fitViewportToDevice, isPhone, rememberShell, shellUrl, wantsMobileShell } from './mobileShell.js';
+import { isPresenting, startPresenting } from './presentOverlay.js';
 import { rangeForSlideSelection } from '@shared/presentationRange.js';
 import { setRenderInvariantChecks } from '../editor/renderInvariants.js';
 import { setSelectionInvariantChecks } from '../editor/selectionInvariants.js';
@@ -54,6 +85,11 @@ import { trackVideoLoading } from '../player/videoLoadingProgress.js';
 import { DelayedOperationProgress } from '../editor/operationProgress.js';
 import { DesignWorkspace } from '../editor/designWorkspace.js';
 import { installResponsiveToolbar } from '../editor/responsiveToolbar.js';
+import { setSlideColorSource } from '../editor/colorPicker.js';
+import { slideColors } from '@shared/slideColors.js';
+
+applyUiTheme();
+applyUiScale();
 
 /**
  * Browser collaboration shell: the same canvas, rail, inspector, theme
@@ -134,18 +170,55 @@ interface ServerConfig {
     /** Participants connect their own local agents (headless server default). */
     mode?: 'local';
   };
-  /** Present when the server runs with --access: who the server says we are. */
-  access?: null | { user: string; name: string; admin: boolean };
+  /**
+   * Present when the server runs with --access: who the server says we are,
+   * and — asked with ?deck= — what we may do with this deck ('owner' covers
+   * the admin, and is what renaming takes).
+   */
+  access?: null | { user: string; name: string; admin: boolean; deckRole?: 'owner' | 'edit' | 'view' | null };
 }
+
+const CONFIG_TIMEOUT_MS = 5_000;
+/** The server did not answer for the config: the deck opens from the offline copy without waiting for the socket. */
+let serverUnanswered = false;
 
 let serverConfig: ServerConfig = { hosted: false, deckId: null, urls: [], agentPanel: null, access: null };
 
-async function fetchServerConfig(): Promise<ServerConfig> {
+async function fetchServerConfig(deck?: string | null): Promise<ServerConfig> {
+  const remembered = `deckwerk-config:${deck ?? ''}`;
   try {
-    const response = await fetch('/api/config');
-    if (response.ok) return await response.json() as ServerConfig;
+    // A server behind a dropped route never answers: the editor must still
+    // connect (and fail), so that it can open its offline copy.
+    const response = await fetch(deck ? `/api/config?deck=${encodeURIComponent(deck)}` : '/api/config', {
+      signal: AbortSignal.timeout(CONFIG_TIMEOUT_MS),
+    });
+    if (response.ok) {
+      const config = await response.json() as ServerConfig;
+      // The service worker's kept answer: the server did not answer it.
+      if (response.headers.get(KEPT_HEADER)) {
+        serverUnanswered = true;
+        return config;
+      }
+      try {
+        localStorage.setItem(remembered, JSON.stringify(config));
+      } catch {
+        // Storage refused: the next offline open asks as a stranger would.
+      }
+      return config;
+    }
+    // Refused for this deck (no access): the server-wide answer still says
+    // what kind of server this is; the socket will say the rest.
+    if (deck) return await fetchServerConfig(null);
   } catch {
-    // Older server without /api/config; behave like the multi-deck server.
+    // No server (the offline copy opens with what it said last time), or an
+    // older one without /api/config: behave like the multi-deck server.
+    serverUnanswered = true;
+    try {
+      const last = localStorage.getItem(remembered);
+      if (last) return JSON.parse(last) as ServerConfig;
+    } catch {
+      // Nothing remembered.
+    }
   }
   return { hosted: false, deckId: null, urls: [], agentPanel: null, access: null };
 }
@@ -153,6 +226,11 @@ async function fetchServerConfig(): Promise<ServerConfig> {
 /* --- deck selection -------------------------------------------------------- */
 
 const deckId = new URLSearchParams(location.search).get('deck');
+// A phone opens a deck in the phone client, unless its person chose this editor.
+if (deckId && wantsMobileShell()) {
+  location.replace(shellUrl('mobile'));
+  throw new Error('a phone — opening the phone client');
+}
 const initialView = decodeEditorView(new URLSearchParams(location.search).get('view'));
 let initialViewPending = initialView !== null;
 
@@ -183,6 +261,8 @@ async function runOperation<T>(message: string, action: () => Promise<T>): Promi
 }
 
 if (!deckId) {
+  // Only the deck list shows, and on a phone it lays out for the phone.
+  if (isPhone() || wantsMobileShell()) fitViewportToDevice();
   el('status').textContent = 'Connecting…';
   void fetchServerConfig().then((config) => {
     if (config.hosted && config.deckId) {
@@ -199,6 +279,8 @@ if (!deckId) {
       dismissable: false,
       onStatus: (text) => { el('status').textContent = text; },
       access: config.access ?? null,
+      // The phone client's "All presentations" opens the list in its deck's folder.
+      folder: new URLSearchParams(location.search).get('folder') ?? undefined,
     });
   });
   throw new Error('no deck selected — showing picker');
@@ -207,14 +289,27 @@ if (!deckId) {
 /* --- boot ----------------------------------------------------------------- */
 
 installNetApi({ deckId, saveTheme: (css) => bridge.sendTheme(css) });
+// Thumbnails get server-cut stills instead of loading the clips they show.
+installWindowApiPosterProvider();
+// Safari re-downloads a clip for every element that opens it: the canvas
+// reads clips from memory there (editorVideoMemory.ts).
+const videoMemory = installEditorVideoMemory(deckId);
 
 const store = new EditorStore(emptyDeck('Connecting…'));
+/** The offline copy (offlineCopy.ts), once the deck is open; null where none can be kept. */
+let offline: OfflineCopy | null = null;
+// The colour picker offers the colours already on the slide being edited.
+setSlideColorSource(() => slideColors(store.slide));
 // Development builds verify after every in-place patch that the canvas DOM
 // still matches a fresh render of the deck, and report any property the two
-// paths disagree about. See renderInvariants.ts.
-setRenderInvariantChecks(import.meta.env.DEV);
+// paths disagree about. See renderInvariants.ts. The test builds turn it on
+// too (VITE_RENDER_INVARIANTS), so the fuzz walks fail on what it reports.
+setRenderInvariantChecks(import.meta.env.DEV || import.meta.env.VITE_RENDER_INVARIANTS === '1');
 setSelectionInvariantChecks(import.meta.env.DEV);
 const canvas = new EditorCanvas(el('canvas'), store);
+el('canvas').addEventListener(CANVAS_NOTICE_EVENT, (event) => {
+  setStatusMessage((event as CustomEvent<string>).detail);
+});
 // Remote sessions fetch video bytes over the wire; until a frame decodes each
 // video is a black box, so overlay loading progress on the editing canvas.
 trackVideoLoading(el('canvas'));
@@ -231,10 +326,30 @@ new SpeakerNotesDrawer(el('canvas'), store, {
   onInsetChange: (px) => canvas.setBottomInset(px),
   onStatus: setStatusMessage,
 });
+// The toggle only: Cmd/Ctrl+R, the desktop app's shortcut, is the browser's
+// reload here, and a page that swallowed it would surprise more than help.
+new CanvasRulers(el('canvas'), canvas, store);
+new LightTable(el('canvas'), canvas, store);
 const inspector = new Inspector(el('inspector'), store);
-new TimelinePanel(el('timeline'), store);
-new HistoryPanel(el('history'), store);
+new TimelinePanel(el('timeline'), store, new BuildPreview(canvas, store));
+// History opens beside the deck name and Media from the Insert bar, as in the
+// desktop app (toolbarPanels.ts).
+const historyHost = popoverPanelHost('history');
+new HistoryPanel(historyHost, store);
+const mediaHost = popoverPanelHost('media');
+const mediaPanel = new MediaPanel(mediaHost, store, {
+  setStatusMessage,
+  beginOperation: (message) => operationProgress.begin(message),
+});
+installMediaDrop(el('canvas'), store, mediaPanel);
 const rail = new SlideRail(el('rail'), store);
+rail.onStatus = setStatusMessage;
+const objectsDrawer = document.createElement('div');
+objectsDrawer.id = 'objects';
+objectsDrawer.className = 'objects-drawer';
+const objectList = new ObjectList(objectsDrawer, store);
+objectList.toggle.classList.add('objects-toggle');
+el('canvas').append(objectList.toggle, objectsDrawer);
 // The CSS buffer backs the Theme panel and live theme sync. Like the desktop
 // app it has no sidebar tab of its own — theme.css is edited on disk or
 // through theme adoption, not in this UI.
@@ -247,11 +362,235 @@ const cssEditor = new CssEditor(cssHost);
 cssEditor.onChange = () => {
   canvas.refitAutoText();
   inspector.noteThemeChanged();
+  offline?.deckChanged();
 };
+
+/* --- offline copy ------------------------------------------------------------ */
+
+/**
+ * Whether the editor is fetching what it shows, or presenting. The offline
+ * copy downloads only while it is not, so it never competes with the slide
+ * somebody is looking at.
+ */
+function editorFetching(): boolean {
+  if (isPresenting() || gatedLoadsPending() || videoMemory?.transferring()) return true;
+  for (const video of el('canvas').querySelectorAll('video')) {
+    if (video.networkState === HTMLMediaElement.NETWORK_LOADING && video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return true;
+  }
+  for (const image of el('canvas').querySelectorAll('img')) if (!image.complete) return true;
+  return false;
+}
+
+if (OfflineCopy.supported()) {
+  offline = new OfflineCopy({
+    deckId,
+    deck: () => store.get().deck,
+    slideIndex: () => store.get().slideIndex,
+    themeCss: () => cssEditor.getValue(),
+    mediaVariants: mediaVariantsSnapshot,
+    pendingMedia: pendingMediaSnapshot,
+    resolveSrc: (src) => window.api.assetUrl(src),
+    isPending: isMediaPending,
+    busy: editorFetching,
+    borrow: videoMemory ? (url) => videoMemory.objectUrl(url) : undefined,
+    rangeReuse: mediaStackReusesBytes(),
+    onChange: () => renderStatus(),
+    storage: navigator.storage,
+    worker: offlineWorker,
+  });
+  // The presentation this tab embeds, and the video memory, fetch through it
+  // (present.ts, editorVideoMemory.ts), so a file is never downloaded twice.
+  window.deckwerkOffline = offline;
+}
+
+// The worker took charge of this page: downloads read back through it can start.
+navigator.serviceWorker?.addEventListener('controllerchange', () => offline?.resume());
+
+// A snapshot due in a moment is written now if the page goes away: a deck
+// closed right after an edit still opens without the server as it was.
+window.addEventListener('pagehide', () => offline?.flushSnapshot());
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') offline?.flushSnapshot();
+});
+
+let offlineStarted = false;
+/** 'pending' while the worker is being installed, 'retry' once an attempt failed. */
+let shellInstall: 'idle' | 'pending' | 'retry' | 'done' = 'idle';
+/** The deck is open: keep a copy of it, and install the worker that answers from it. */
+function startOffline(): void {
+  if (!offline || offlineStarted) return;
+  offlineStarted = true;
+  offline.start();
+  // A worker already controls this page (it loaded the page, perhaps without
+  // a server): the shell is there now, and registering again only updates it.
+  if (navigator.serviceWorker?.controller) offline.setShellReady(true);
+  installShell();
+}
+
+/**
+ * Install (or update) the worker. An attempt the connection cut short is
+ * tried again when the editor reconnects: without it, a deck opened just
+ * before the link dropped could never be presented offline that session.
+ */
+function installShell(): void {
+  if (!offline || shellInstall === 'pending' || shellInstall === 'done') return;
+  shellInstall = 'pending';
+  void registerOfflineShell(editorFetching).then((result) => {
+    shellInstall = result === 'failed' ? 'retry' : 'done';
+    if (result === 'failed') return;
+    if (result === 'ready' || !navigator.serviceWorker?.controller) offline?.setShellReady(result === 'ready');
+  });
+}
+
+/**
+ * Opened without a server: show the deck as it was last seen here. Edits
+ * made now are kept on screen and dropped when the server answers, exactly
+ * as edits made during any disconnection are (collabBridge.ts).
+ */
+const READ_ONLY_COPY = 'Read-only: editing comes back when the server answers, since changes made to this copy could not be saved.';
+
+/**
+ * The deck on screen is the copy kept in this browser: anything edited in it
+ * would be discarded when the server answers (the bridge drops unconfirmed
+ * edits on reconnect). So it is read-only until then: the store refuses
+ * every edit and says why, the canvas and the side panels take no input
+ * (`inert`), and the rail hides its edit buttons. The rail still moves
+ * between slides, and Present still works.
+ */
+function lockOfflineCopy(on: boolean): void {
+  store.setEditLock(on ? READ_ONLY_COPY : null);
+  el('canvas').inert = on;
+  el('side').inert = on;
+  if (on) document.documentElement.dataset.readOnlyCopy = 'true';
+  else delete document.documentElement.dataset.readOnlyCopy;
+  // The banner names what still works; say it again in the new terms.
+  if (connectionNotice.state() === 'disconnected') connectionNotice.showDisconnected();
+}
+store.onEditRefused = (reason) => {
+  if (!statusMessage.endsWith(reason)) setStatusMessage(reason);
+};
+
+/**
+ * A server that has not even accepted the connection by now is as good as
+ * gone for opening the deck: show the offline copy rather than "Connecting…"
+ * for as long as an unanswered handshake takes. At once without a network.
+ */
+const OFFLINE_OPEN_DELAY_MS = 4_000;
+setTimeout(() => {
+  if (!welcomed && !bridge.open) void openOfflineCopy();
+}, navigator.onLine === false ? 0 : OFFLINE_OPEN_DELAY_MS);
+
+async function openOfflineCopy(): Promise<void> {
+  if (!offline || welcomed || shownOffline) return;
+  const snapshot = await OfflineCopy.loadSnapshot(deckId!);
+  if (!snapshot || welcomed || shownOffline) return;
+  shownOffline = true;
+  setMediaVariants(snapshot.mediaVariants, true);
+  setPendingMedia(snapshot.pendingMedia);
+  store.load(snapshot.deck, `(offline) ${deckId}`, { keepView: true });
+  if (initialViewPending) {
+    restoreEditorView(store, initialView);
+    initialViewPending = false;
+  }
+  cssEditor.setValue(snapshot.themeCss);
+  themePanel.noteDeckOpened(snapshot.deck);
+  document.documentElement.dataset.offlineDeck = 'true';
+  lockOfflineCopy(true);
+  setStatusMessage(`Offline: showing the copy kept in this browser (${new Date(snapshot.savedAt).toLocaleString()}). ${READ_ONLY_COPY}`);
+  startOffline();
+}
 // The documented HTML-first surface and visible agent workspace share this
 // compiler and the live theme buffer.
 const presence = new PresenceOverlay(canvas, store);
 rail.presenceForSlide = (slideId) => presence.peersOnSlide(slideId);
+const slideIndexOf = (slideId: string): number => store.get().deck.slides.findIndex((slide) => slide.id === slideId);
+const presenceBar = new PresenceBar(
+  (slideId) => {
+    const index = slideIndexOf(slideId);
+    return index >= 0 ? `slide ${index + 1}` : null;
+  },
+  (peer) => {
+    const index = peer.activeSlideId ? slideIndexOf(peer.activeSlideId) : -1;
+    if (index >= 0) store.selectSlide(index);
+  },
+);
+presence.onPeersChange = () => presenceBar.setPeers(presence.list());
+
+/* --- deck chat ---------------------------------------------------------------- */
+
+let chatSelf: { name: string; color: string } | null = null;
+const chatPanel = new ChatPanel(el('chat'), {
+  deckId,
+  send: (post) => bridge.sendChat(post),
+  self: () => chatSelf,
+  peers: () => presence.list().map((peer) => ({ name: peer.name, color: peer.color, agent: isAgentPeer(peer) })),
+  currentSlide: () => {
+    const { deck, slideIndex } = store.get();
+    const slide = deck.slides[slideIndex];
+    return slide ? { id: slide.id, number: slideIndex + 1 } : null;
+  },
+  slideNumber: (slideId) => {
+    const index = slideIndexOf(slideId);
+    return index >= 0 ? index + 1 : null;
+  },
+  slideOfComment: (commentId) => findComment(store.get().deck, commentId)?.target.slideId ?? null,
+  openComment: (commentId) => openCommentById(commentId),
+  jumpTo: (slideId, elementId) => {
+    const index = slideIndexOf(slideId);
+    if (index < 0) return;
+    store.selectSlide(index);
+    if (elementId && store.get().deck.slides[index].elements.some((element) => element.id === elementId)) {
+      store.select([elementId]);
+    }
+  },
+  onUnreadChange: (unread, mentions) => setChatBadge(unread, mentions),
+});
+
+/* --- comment links ----------------------------------------------------------- */
+
+// A comment's link is this page with `comment=<id>`: anyone who can open the
+// presentation lands on its slide with the thread open.
+setCommentLinks((commentId) => {
+  const url = new URL(location.pathname, location.origin);
+  url.searchParams.set('deck', deckId);
+  url.searchParams.set('comment', commentId);
+  return url.href;
+});
+let linkedCommentPending = new URLSearchParams(location.search).get('comment');
+
+/** Go to the slide holding a comment, select what it is on, and open its thread. */
+function openCommentById(commentId: string): void {
+  const found = findComment(store.get().deck, commentId);
+  if (!found) {
+    setStatusMessage('That comment no longer exists. It may have been deleted.');
+    return;
+  }
+  store.selectSlide(found.slideIndex);
+  if (found.target.elementId) store.select([found.target.elementId]);
+  else store.clearSelection();
+  // The canvas draws the slide on the store's change; anchor on it after.
+  requestAnimationFrame(() => canvas.openComments(found.target.elementId ?? null, undefined, { threadId: commentId }));
+}
+
+/** The Chat tab's unread count; accented when one of them mentions this person. */
+function setChatBadge(unread: number, mentions: number): void {
+  const tab = document.querySelector<HTMLButtonElement>('#side-tabs button[data-panel="chat"]');
+  if (!tab) return;
+  let badge = tab.querySelector<HTMLElement>('.chat-tab-badge');
+  if (unread === 0) {
+    badge?.remove();
+    tab.removeAttribute('aria-description');
+    return;
+  }
+  if (!badge) {
+    badge = document.createElement('span');
+    badge.className = 'chat-tab-badge';
+    tab.append(badge);
+  }
+  badge.textContent = unread > 99 ? '99+' : String(unread);
+  badge.classList.toggle('is-mention', mentions > 0);
+  tab.setAttribute('aria-description', `${unread} unread${mentions > 0 ? `, ${mentions} mentioning you` : ''}`);
+}
 
 wireCanvasInspector(canvas, inspector);
 
@@ -278,6 +617,8 @@ rail.onSlideActivate = () => {
 };
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
+  // Escape in the toolbar's name field cancels the rename, and only that.
+  if (deckNameField?.editing()) return;
   const escaped = designWorkspace.escape();
   if (escaped === 'theme') themePanel.dismiss();
   const dismissedThemeEditor = !escaped && themePanel.dismiss();
@@ -295,6 +636,8 @@ el('themePanel').classList.add('theme-panel');
 let connectionState = 'connecting…';
 /** Whether a welcome has already been handled, i.e. later ones are reconnects. */
 let welcomed = false;
+/** Whether the deck on screen came from the offline copy, the server being unreachable at open. */
+let shownOffline = false;
 /** Live connection state; gates the actions that need the server (Present, export). */
 let connected = false;
 
@@ -312,6 +655,8 @@ const connectionNotice = createConnectionNotice({
       2,
     ),
   }),
+  presentsOffline: () => offline?.ready() ?? false,
+  readOnlyCopy: () => shownOffline,
 });
 
 const wsUrl = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?deck=${encodeURIComponent(deckId)}`;
@@ -327,15 +672,30 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     lastCursorKey = '';
     setIdSuffix(welcome.clientId.slice(0, 4));
     setCommentAuthor(welcome.self.name);
+    chatSelf = welcome.self;
+    chatPanel.setHistory(welcome.chat ?? []);
+    presenceBar.setSelf(welcome.self);
     connectionState = `connected as ${welcome.self.name}`;
     // The first welcome opens the document; every later one is a reconnect of
     // the same session, where the revision log and the selection must survive.
-    if (welcomed) store.resyncRemote(welcome.deck, `(collab) ${deckId}`);
+    if (welcomed || shownOffline) store.resyncRemote(welcome.deck, `(collab) ${deckId}`);
     else store.load(welcome.deck, `(collab) ${deckId}`, { keepView: true });
     welcomed = true;
+    if (shownOffline) lockOfflineCopy(false);
+    shownOffline = false;
+    delete document.documentElement.dataset.offlineDeck;
     if (initialViewPending) {
       restoreEditorView(store, initialView);
       initialViewPending = false;
+    }
+    if (linkedCommentPending) {
+      const commentId = linkedCommentPending;
+      linkedCommentPending = null;
+      openCommentById(commentId);
+      // Reloading the page should not open the thread again.
+      const params = new URLSearchParams(location.search);
+      params.delete('comment');
+      history.replaceState(history.state, '', `${location.pathname}?${params.toString()}${location.hash}`);
     }
     cssEditor.setValue(welcome.themeCss);
     themePanel.noteDeckOpened(welcome.deck);
@@ -343,6 +703,10 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     rail.refreshPresence();
     renderStatus();
     document.documentElement.dataset.collabReady = 'true';
+    // Counted, so a test can tell a fresh welcome from a flag never cleared.
+    document.documentElement.dataset.collabWelcomes = String(Number(document.documentElement.dataset.collabWelcomes ?? 0) + 1);
+    startOffline();
+    offline?.deckChanged();
   },
   onDeckReplaced: (deck, label, options) => {
     store.applyRemote(deck, label, options);
@@ -352,9 +716,14 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     rail.refreshPresence();
   },
   onPeerCursor: (clientId, cursor) => presence.moveCursor(clientId, cursor),
+  onChat: (message) => chatPanel.receive(message),
   onPeerLeft: (clientId) => {
     presence.remove(clientId);
     rail.refreshPresence();
+  },
+  onMediaVariants: (srcs) => {
+    canvas.refreshMediaSources(srcs);
+    offline?.deckChanged();
   },
   onThemeCss: (css) => {
     // Never yank the CodeMirror buffer out from under someone typing in it.
@@ -371,11 +740,16 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     connected = isConnected;
     if (isConnected) {
       connectionNotice.hide();
+      offline?.resume();
+      if (shellInstall === 'retry') installShell();
       // The refusal is moot once the server is back; don't leave it lingering.
-      if (statusMessage === PRESENT_NEEDS_SERVER) setStatusMessage('');
+      if (statusMessage.startsWith(PRESENT_NEEDS_SERVER)) setStatusMessage('');
     } else {
       delete document.documentElement.dataset.collabReady;
       connectionNotice.showDisconnected();
+      remote.disconnected();
+      // Opened while the server is unreachable: show the copy kept here.
+      if (!welcomed) void openOfflineCopy();
     }
   },
   onEditsDiscarded: (count) => {
@@ -389,9 +763,30 @@ const bridge = new CollabBridge(wsUrl, undefined, {
     setStatusMessage('The host ended this collaboration.');
     connectionNotice.showEnded('The host ended this collaboration. All synced edits are saved on the host.');
   },
+  // Somebody renamed the deck — possibly this tab, from the toolbar.
+  onMoved: (moved, unsent) => followDeck(moved.deckId, moved.title, unsent),
+  onUnavailable: (reason) => {
+    connected = false;
+    setStatusMessage(reason);
+    connectionNotice.showEnded(reason);
+    // Gone, or no longer this person's to open: keep nothing of it here.
+    void offline?.forget();
+  },
+  onAccessRevoked: () => void offline?.forget(),
+  onRemote: (message) => remote.handle(message),
 });
 
 store.onLocalEdit = bridge.localEdit;
+
+// Somebody presenting can hand this tab their remote (remoteControl.ts).
+const remote = new RemoteReceiver({
+  send: (message) => bridge.sendRemote(message),
+  deck: () => store.get().deck,
+  subscribeDeck: (listener) => store.subscribe(listener),
+  themeCss: () => cssEditor.getValue(),
+  resolveSrc: (src) => window.api.assetUrl(src),
+  onStatus: setStatusMessage,
+});
 
 /* --- shared shell wiring --------------------------------------------------- */
 
@@ -404,8 +799,11 @@ const shellDeps: ShellDeps = {
   setStatusMessage,
   runOperation,
   currentThemeCss: () => cssEditor.getValue(),
-  undo: () => bridge.undo(store.get().deck),
-  redo: () => bridge.redo(store.get().deck),
+  // The browser's own downloads show progress and where the file went.
+  downloadOriginal: { label: 'Download original', run: (element) => downloadOriginalAsset(deckId!, element.src) },
+  // Collab undo goes through the bridge, not the store's edit path: refused here.
+  undo: () => (store.editLocked ? setStatusMessage(store.editLocked) : bridge.undo(store.get().deck)),
+  redo: () => (store.editLocked ? setStatusMessage(store.editLocked) : bridge.redo(store.get().deck)),
 };
 const clipboard = createClipboardActions(shellDeps);
 bindEditorKeys(shellDeps, clipboard);
@@ -478,11 +876,22 @@ function publishPresence(): void {
   lastPresenceKey = key;
   bridge.sendPresence(state);
 }
+let chatDeck = store.get().deck;
+let chatSlideIndex = store.get().slideIndex;
 store.subscribe(() => {
   publishPresence();
+  presenceBar.refresh();
+  // Slide numbers in the chat follow the deck; skip the work on selection churn.
+  const { deck, slideIndex } = store.get();
+  if (deck !== chatDeck || slideIndex !== chatSlideIndex) {
+    // The offline copy keeps the deck, and downloads outward from the slide shown.
+    if (deck !== chatDeck) offline?.deckChanged();
+    else offline?.slideChanged();
+    chatDeck = deck;
+    chatSlideIndex = slideIndex;
+    chatPanel.refresh();
+  }
   syncSlideSelectionContext();
-  const title = document.querySelector<HTMLElement>('.toolbar-deck-title');
-  if (title) title.textContent = store.get().deck.title;
   renderStatus();
 });
 const inspectorRefresh = canvas.onTextEditModeChange;
@@ -497,22 +906,14 @@ canvas.onTextEditModeChange = (elementId) => {
  * navigator.clipboard only exists in secure contexts; joiners load this page
  * over plain http on the LAN, so fall back to the legacy execCommand path.
  */
-/**
- * The one line a person runs to bring their own agent into this deck: fetch
- * the server's own bridge and run it with Node. The page's origin is the
- * address that reaches the server from their machine — the tailnet name they
- * opened, not a loopback the server prints.
- */
-function localAgentConnectCommand(deck: string, participantId: string): string {
-  return `curl -fsSL ${location.origin}/deckwerk-connect.mjs -o deckwerk-connect.mjs `
-    + `&& node deckwerk-connect.mjs '${localAgentSessionUrl(deck, participantId)}'`;
-}
-
-function localAgentSessionUrl(deck: string, participantId: string): string {
-  const session = new URL(location.origin);
-  session.searchParams.set('deck', deck);
-  session.searchParams.set('agent', participantId);
-  return session.href;
+/** The Agent prompt for this deck as it is titled now. */
+function currentAgentPrompt(): string {
+  return agentConnectPrompt({
+    origin: location.origin,
+    deckId: deckId!,
+    title: welcomed ? store.get().deck.title : deckId!,
+    participantId: agentPanelBrowserApi?.participantId ?? '',
+  });
 }
 
 async function copyText(text: string): Promise<void> {
@@ -559,20 +960,34 @@ async function exportPdf(): Promise<void> {
  */
 function startPresentation(speakerView = false): void {
   // present.html and its bundle are served by the collab server; with the
-  // server gone the iframe would load nothing — a white overlay with no
-  // explanation. Refuse with the reason instead.
-  if (!connected) {
-    setStatusMessage(PRESENT_NEEDS_SERVER);
+  // server gone the iframe loads them from the offline copy (sw.ts), and the
+  // deck's files from there too. Without a complete copy it would show a
+  // white overlay, or slides missing their pictures: refuse with the reason.
+  if (!connected && !offline?.ready()) {
+    // Say what is missing when it is the offline copy, not just the server.
+    const copy = offline?.statusText() ?? '';
+    setStatusMessage(copy && copy !== 'Available offline'
+      ? `${PRESENT_NEEDS_SERVER} This browser does not hold the whole talk (${copy.charAt(0).toLowerCase()}${copy.slice(1)}).`
+      : PRESENT_NEEDS_SERVER);
     connectionNotice.showDisconnected();
     return;
   }
   const { deck, slideIndex, slideSelection } = store.get();
   const range = rangeForSlideSelection(deck.slides, slideSelection);
-  startPresenting(
+  void startPresenting(
     deckId!,
     range?.start ?? slideIndex,
-    () => ({ deck: store.get().deck, themeCss: cssEditor.getValue() }),
-    { endSlideIndex: range?.end, speakerView, onStatus: setStatusMessage },
+    () => ({ deck: store.get().deck, themeCss: cssEditor.getValue(), hostClientId: bridge.clientId }),
+    {
+      endSlideIndex: range?.end,
+      speakerView,
+      onStatus: setStatusMessage,
+      // Leave the show where it was, not where it started.
+      onEnd: (slideId) => {
+        const index = store.get().deck.slides.findIndex((slide) => slide.id === slideId);
+        if (index >= 0) store.selectSlide(index);
+      },
+    },
   );
 }
 
@@ -607,6 +1022,90 @@ async function exportWeb(): Promise<void> {
   setStatusMessage('Building the web export — the download starts when the server is done.');
 }
 
+/* --- renaming the open deck -------------------------------------------------- */
+
+let deckNameField: DeckNameField | null = null;
+
+/**
+ * Renaming is the deck owner's (or the admin's) call, and never a joiner's in
+ * a hosted session, where the desktop app owns the folder. The server checks
+ * the same rules; this only decides whether the name invites a click.
+ */
+function canRenameDeck(): boolean {
+  if (serverConfig.hosted) return false;
+  if (!serverConfig.access) return true;
+  return serverConfig.access.deckRole === 'owner';
+}
+
+/**
+ * Rename the open presentation: its folder and its title change together
+ * (the server keeps them one name). The deck's id is its folder path, so this
+ * moves the deck; the server tells every peer in the room — this tab included
+ * — where it went, and everyone follows (followDeck). Resolves once the
+ * server has done it; rejects with its reason otherwise.
+ */
+async function renameDeck(name: string): Promise<void> {
+  const body = await runOperation(`Renaming the presentation to “${name}”…`, async () => {
+    const response = await fetch(
+      `/api/decks/rename?deck=${encodeURIComponent(deckId!)}&name=${encodeURIComponent(name)}`,
+      { method: 'POST' },
+    );
+    const answer = await response.json().catch(() => null) as { id?: string; title?: string; error?: string } | null;
+    if (!response.ok || !answer?.id) throw new Error(answer?.error ?? `HTTP ${response.status}`);
+    return answer as { id: string; title?: string };
+  });
+  // The socket usually brings the news first; whichever arrives first wins.
+  followDeck(body.id, body.title ?? name, 0);
+}
+
+/** Carried across the reload to the renamed deck, for its status line. */
+const RENAMED_KEY = 'deckwerk.collab-renamed';
+let followingDeck = false;
+
+/**
+ * Go to the deck's new id. Every deck-scoped route, the socket, the agent
+ * panel and the asset URLs are keyed by the id this page loaded with, so the
+ * simplest correct move is the deck picker's: load the page again under the
+ * new one. The editor view (slide, selection) rides along in `?view=`, and
+ * `replace` keeps Back from returning to an id that is gone.
+ */
+function followDeck(nextId: string, title: string, unsent: number): void {
+  if (followingDeck) return;
+  if (nextId === deckId) {
+    // Only the title changed; that arrives as an ordinary edit.
+    setStatusMessage(`Renamed to “${title}”`);
+    return;
+  }
+  followingDeck = true;
+  bridge.close();
+  const params = new URLSearchParams(location.search);
+  params.set('deck', nextId);
+  params.set('view', encodeEditorView(captureEditorView(store)));
+  try {
+    sessionStorage.setItem(RENAMED_KEY, JSON.stringify({ deckId: nextId, title, unsent }));
+  } catch {
+    // Storage unavailable: the new page simply opens without the note.
+  }
+  location.replace(`${location.pathname}?${params.toString()}${location.hash}`);
+}
+
+/** The note followDeck left for this page, if it is the deck it renamed to. */
+function takeRenamedNote(): string | null {
+  try {
+    const raw = sessionStorage.getItem(RENAMED_KEY);
+    if (!raw) return null;
+    sessionStorage.removeItem(RENAMED_KEY);
+    const note = JSON.parse(raw) as { deckId?: string; title?: string; unsent?: number };
+    if (note.deckId !== deckId || typeof note.title !== 'string') return null;
+    const lost = note.unsent ?? 0;
+    return `Renamed to “${note.title}”`
+      + (lost === 1 ? ' — 1 change made during the rename could not be saved.' : '')
+      + (lost > 1 ? ` — ${lost} changes made during the rename could not be saved.` : '');
+  } catch {
+    return null;
+  }
+}
+
 function buildToolbar(): void {
   const bar = el('toolbar');
   bar.replaceChildren();
@@ -619,10 +1118,13 @@ function buildToolbar(): void {
     line.setAttribute('aria-hidden', 'true');
     return line;
   };
-  const deckName = document.createElement('span');
-  deckName.className = 'bar-deck-name';
-  deckName.textContent = deckId;
-  left.append(createDeckWerkButton(), deckName, divider());
+  deckNameField = createDeckNameField({
+    deckId: deckId!,
+    editable: canRenameDeck(),
+    rename: renameDeck,
+    onError: (message) => setStatusMessage(`Rename failed: ${message}`),
+  });
+  left.append(createDeckWerkButton(), deckNameField.element, createHistoryButton(historyHost), divider());
   const fileActions = document.createElement('span');
   fileActions.className = 'toolbar-expanded-file-actions';
   const compactFileEntries: ToolbarPickerEntry[] = [];
@@ -705,9 +1207,16 @@ function buildToolbar(): void {
   const mid = document.createElement('div');
   mid.className = 'bar-group bar-center';
   mid.append(
-    barIconButton('Text', TEXT_ICON, () => insertText(store)),
+    // Straight into the new box, its placeholder selected: typing replaces it.
+    createTextInsertPicker({
+      textBox: () => canvas.beginTextEdit(insertText(store).id),
+      // A starter listing, selected, so typing replaces it.
+      codeBlock: () => { canvas.beginCodeEdit(insertCode(store).id, 'all'); },
+    }),
     createShapeInsertPicker(store),
+    createPenButton(canvas),
     createTableInsertPicker(store),
+    createMediaButton(mediaHost),
   );
 
   const right = document.createElement('div');
@@ -723,10 +1232,25 @@ function buildToolbar(): void {
     compactSecondaryEntries.push({ label: 'Share…', action: share });
   }
   if (serverConfig.agentPanel?.enabled) {
-    const toggleAgentPanel = (): void => agentPanel?.toggle();
-    const agentLabel = serverConfig.agentPanel.personal || serverConfig.agentPanel.mode === 'local'
-      ? 'Agent…'
-      : 'Shared Agent';
+    const local = serverConfig.agentPanel.personal || serverConfig.agentPanel.mode === 'local';
+    // A person's own agent: the click copies the prompt that has the agent
+    // connect itself, and opens the panel that shows when it has.
+    const toggleAgentPanel = (): void => {
+      if (!agentPanel) return;
+      if (!local) {
+        agentPanel.toggle();
+        return;
+      }
+      if (!agentPanel.element.hidden) {
+        agentPanel.hide();
+        return;
+      }
+      agentPanel.setConnectCommand(currentAgentPrompt());
+      void agentPanel.copyConnectCommand().then((copied) => setStatusMessage(copied
+        ? 'Agent prompt copied — paste it into your agent, and it connects itself to this deck.'
+        : 'Could not copy the agent prompt — select it in the Agent panel and copy it from there.'));
+    };
+    const agentLabel = local ? 'Agent…' : 'Shared Agent';
     const agent = barButton(
       agentLabel,
       toggleAgentPanel,
@@ -778,11 +1302,23 @@ function buildToolbar(): void {
       ),
     });
   }
+  // The editor on a phone is a choice somebody made; offer the way back.
+  if (isPhone()) {
+    compactSecondaryEntries.push({
+      label: 'Phone view',
+      action: () => {
+        rememberShell('mobile');
+        location.assign(shellUrl('mobile'));
+      },
+    });
+  }
   if (compactSecondaryEntries.length > 0) {
     compactSecondary = createToolbarPicker('More', compactSecondaryEntries);
     compactSecondary.classList.add('toolbar-compact-secondary-action');
   }
   right.append(
+    presenceBar.element,
+    divider(),
     secondaryActions,
     ...(compactSecondary ? [compactSecondary] : []),
     createToolbarSplitButton(
@@ -801,8 +1337,11 @@ const PANELS = [
   { id: 'inspector', label: 'Props' },
   { id: 'themePanel', label: 'Design' },
   { id: 'timeline', label: 'Build' },
-  { id: 'history', label: 'History' },
+  { id: 'chat', label: 'Chat' },
 ] as const;
+
+/** Tabs that stay open while several slides are selected: they are not about one slide. */
+const DECK_LEVEL_PANELS: ReadonlySet<string> = new Set(['themePanel', 'inspector', 'chat']);
 
 let activePanelId = 'inspector';
 
@@ -820,7 +1359,7 @@ function buildTabs(): void {
 }
 
 function showPanel(id: string): void {
-  if (store.get().slideSelection.size > 1 && id !== 'themePanel' && id !== 'inspector') return;
+  if (store.get().slideSelection.size > 1 && !DECK_LEVEL_PANELS.has(id)) return;
   activePanelId = id;
   for (const panel of PANELS) el(panel.id).hidden = panel.id !== id;
   for (const b of el('side-tabs').querySelectorAll('button')) {
@@ -838,11 +1377,9 @@ function syncSlideSelectionContext(): void {
   const count = store.get().slideSelection.size;
   const multiple = count > 1;
   for (const button of el('side-tabs').querySelectorAll<HTMLButtonElement>('button')) {
-    button.disabled = multiple
-      && button.dataset.panel !== 'themePanel'
-      && button.dataset.panel !== 'inspector';
+    button.disabled = multiple && !DECK_LEVEL_PANELS.has(button.dataset.panel ?? '');
   }
-  if (multiple && activePanelId !== 'themePanel' && activePanelId !== 'inspector') {
+  if (multiple && !DECK_LEVEL_PANELS.has(activePanelId)) {
     showPanel('themePanel');
   }
   themePanel.syncScope(count);
@@ -858,6 +1395,9 @@ function renderStatus(): void {
   if (slideSelection.size > 1) bits.push(`${slideSelection.size} slides selected`);
   if (selection.size > 0) bits.push(`${selection.size} selected`);
   if (dirty) bits.push('syncing…');
+  const offlineText = offline?.statusText();
+  if (offlineText) bits.push(offlineText);
+  document.documentElement.dataset.offline = offline?.status().state ?? 'unavailable';
   if (statusMessage) bits.push(statusMessage);
   // In a hosted session, keep the invite address visible so anyone at the
   // machine can read it out — the LAN/tailscale URL, not loopback.
@@ -873,8 +1413,9 @@ function renderStatus(): void {
 
 // The toolbar depends on whether this is a hosted session; one round-trip
 // before first paint of the buttons keeps New/Open/Import from flashing in.
-void fetchServerConfig().then((config) => {
+void fetchServerConfig(deckId).then((config) => {
   serverConfig = config;
+  if (serverUnanswered) void openOfflineCopy();
   if (config.agentPanel?.enabled && !agentPanel) {
     agentPanelBrowserApi = createAgentPanelApi(deckId!);
     const local = config.agentPanel.mode === 'local';
@@ -882,7 +1423,7 @@ void fetchServerConfig().then((config) => {
       api: agentPanelBrowserApi.api,
       currentDeckPath: () => deckId,
       title: config.agentPanel.name,
-      connectCommand: localAgentConnectCommand(deckId!, agentPanelBrowserApi.participantId),
+      connectCommand: currentAgentPrompt(),
     });
     // The bridge a person starts from that panel pairs with this browser's
     // selection through the participant id announced in the hello.
@@ -907,6 +1448,8 @@ void fetchServerConfig().then((config) => {
 buildTabs();
 syncSlideSelectionContext();
 renderStatus();
+const renamedNote = takeRenamedNote();
+if (renamedNote) setStatusMessage(renamedNote);
 
 // Console access for debugging and driving a session from devtools.
 Object.assign(window, { store, canvas, rail, bridge });

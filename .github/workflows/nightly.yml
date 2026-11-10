@@ -55,6 +55,15 @@ jobs:
           # ever being run; the two bugs its fixed seed finds are fixed.
           - name: Exhaustive list-editing fuzz
             script: test:lists:exhaustive
+          # Agents through every door — CLI, desktop editor, hosted mirror —
+          # with a person editing alongside: the fixed seed plus tonight's,
+          # walked far longer than the per-push gate walks them.
+          - name: Agent collaboration fuzz
+            script: test:agents:fuzz
+          # The browser editor losing its server, walked long: the fixed seed
+          # plus tonight's (FUZZ_SEED). The per-push gate walks it briefly.
+          - name: Offline presenting fuzz
+            script: test:offline:fuzz
           # test:interactions:exhaustive is deliberately absent: the suite
           # skips itself under CI_NO_WINDOW_MANAGER, so on this runner the
           # step ran nothing while looking like coverage. Bring it back with a
@@ -66,9 +75,7 @@ jobs:
           node-version: 22
           cache: npm
       - name: Install system dependencies (Electron + ffmpeg)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb ffmpeg libnss3 libgtk-3-0 libasound2t64
+        uses: ./.github/actions/electron-system-deps
       - run: npm ci
       - name: Configure Electron's SUID sandbox helper
         run: |

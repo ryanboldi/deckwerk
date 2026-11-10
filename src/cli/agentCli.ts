@@ -1,15 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   AGENT_PROTOCOL_VERSION,
   AgentTransactionSchema,
   authoredScene,
+  importGaps as importGapsOf,
   type AgentContext,
+  type ImportGap,
   type ComputedSlideScene,
 } from '@shared/agent.js';
 import { deckOutline, deckStyleDigest } from '@shared/deckDigest.js';
@@ -17,8 +18,10 @@ import { slidesToHtml } from '@shared/htmlSlides.js';
 import { capabilities } from '@shared/capabilities.js';
 import { PLAYER_TYPE_CSS } from '@shared/playerTypeCss.js';
 import { CustomThemeSchema, parseDeck, type Comment, type Deck, type Slide, type SlideElement } from '@shared/deck.js';
+import { commentsOperation, findComment, threadEdits } from '@shared/comments.js';
 import { diffDecks } from '@shared/deckDiff.js';
 import { renameRetiredFields } from '@shared/fieldAliases.js';
+import { rotatedBounds } from '@shared/geometry.js';
 import {
   type ThemeAdoption,
   type ThemePreset,
@@ -40,19 +43,28 @@ import {
   deckRevision,
   readAgentContextFile,
   readLiveAgentContext,
+  replaceFileAtomically,
   waitForAgentResponse,
   writeAgentRequest,
 } from '../main/agentRuntime.js';
-import { adoptAuthoredIds, htmlSyncSummary } from '@shared/htmlSlides.js';
-import { DECK_FILE, importAsset, importWebPage, loadDeck } from '../main/deckStore.js';
+import { adoptAuthoredIds, htmlSyncSummary, insertionAnchor, pageStampOf, stampPage, type PageStamp } from '@shared/htmlSlides.js';
+import { DECK_FILE, importAsset, importWebPage, loadDeck, loadTheme, saveDeck, saveTheme } from '../main/deckStore.js';
+import { listDeckVersions, readDeckVersion, VERSIONS_DIR, writeDeckVersion } from '../main/deckVersions.js';
 import { injectWebBridgeRuntime } from '@shared/webBridge.js';
 import { measureBuiltTextOverflows } from './compileHtml.js';
 import { serveBundle } from './previewServer.js';
 import { exportDeck } from '../main/exportDeck.js';
 import { spawn } from 'node:child_process';
 import { htmlEditTransaction } from '../main/htmlAuthoring.js';
+import { termBuildProblems } from '@shared/equationTerms.js';
+import { unclosedMath } from '@shared/mathDelimiters.js';
+import { findHostingServer, hostedContext, hostedLiveDeck, hostedRequest, type HostedDeck } from './hostedDeck.js';
 import { checkWebPage, renderSlidesToPng } from './renderSlides.js';
+import { removeTempDir, tempDir, untilStopped } from './scratch.js';
+import { failureMessage } from '../main/writeFailure.js';
 import { runConnectCommand } from './agentConnect.js';
+import { ChatUsageError, listChat, postChat, resolveChatTarget, waitForMention } from './chatClient.js';
+import { HISTORY_FILE, HISTORY_ROTATED_FILE, parseEditHistory, type EditHistoryEntry } from '@shared/editHistory.js';
 
 /**
  * `slide-agent` — the filesystem-first agent interface.
@@ -92,17 +104,19 @@ The loop — edit HTML, the editor syncs it back:
   new       [deck] [--count <n>]          a blank authoring page: the same
                                           skeleton, with no slide ids and no
                                           scope, so saving it only ADDS slides
-  inspect   [deck] --html [--selected|--slide id|number|--all]
+  inspect   [deck] --html [--selected|--slide id|number|a-b|--all]
                                           create a scoped authoring page —
                                           editing a section replaces its slide,
                                           removing one deletes it
-  inspect   [deck] --html-body [--slide id|number]
+  inspect   [deck] --html-body [--slide id|number|a-b]
                                           compact read-only section markup
-  inspect   [deck] --elements-only [--slide id|number]
+  inspect   [deck] --elements-only [--slide id|number|a-b]
                                           compact object inventory
   # then edit edit/<file>.html and save it; with the editor open the deck
   # follows within ~200ms. With it closed, apply the same file explicitly:
   apply     [deck] --html <file> [--after <slide>] [--label <text>]
+                                          new slides go after <slide> (id or
+                                          number; 0 puts them first), else last
 
 Working on a deck someone hosts on a collaboration server:
 
@@ -119,9 +133,10 @@ Everything else:
   docs [authoring|web|themes|internals]   focused guides; bare docs is the
                                           full repository reference
   capabilities                            every feature, with copyable JSON
-  validate  [deck] [--slide id|number|--selected]
-                                          schema, ids, references, assets, and
-                                          canvas overflows (scoped to your slides)
+  validate  [deck] [--slide id|number|a-b|--selected]
+                                          schema, ids, references, assets, canvas
+                                          overflows and unclosed maths (scoped
+                                          to your slides)
   asset import <deck> <paths...>          copy media into assets/, probed
   web import <deck> <page.html> [--after <slideId>] [--title <text>] [--no-poster]
                                           add one slide showing a complete HTML
@@ -147,7 +162,7 @@ Everything else:
                                           frame will; --replace infers the
                                           existing element's exact box size
   inspect   [deck] [--dom]                computed scenes, for questions
-  render    [deck] [--selected|--slide id|number|--all] --output <dir>
+  render    [deck] [--selected|--slide id|number|a-b|--all] --output <dir>
             [--annotate] [--built]
                                           add --contact-sheet for one tiled
                                           overview of everything rendered
@@ -163,7 +178,7 @@ Everything else:
   theme     choose [deck] --id <themeId>  the deck's current theme: what new
                                           slides are born wearing
   theme     apply  [deck] --id <themeId> [--scope deck|slides]
-            [--slide id|number|--all]
+            [--slide id|number|a-b|--all]
             [--roles title,heading,body,caption,base]
             [--properties fonts,weights,scale,text-color,background,object-colors]
             [--keep-overrides] [--detect-roles]
@@ -173,12 +188,33 @@ Everything else:
   comments  [deck] [--unresolved]         every comment, with its slide number.
                                           Humans leave instructions this way —
                                           check it at the start of a task.
-  comments  [deck] --resolve <commentId>  mark a comment resolved (do this
+  comments  [deck] --resolve <commentId>  mark a thread resolved (do this
                                           after acting on it; never delete)
+  comments  [deck] --add <text> --reply <commentId> [--author <name>]
+                                          answer in a thread (reopens it)
   comments  [deck] --add <text> (--slide <id|number> | --element <elementId>)
-                                          [--author <name>]  reply on a thread
+                                          [--author <name>]  start a new thread
+  chat      [deck] [--since <messageId>]  the deck's chat, oldest first. Lives on
+                                          the collab server, not in the folder:
+                                          run it in a connected mirror, or pass
+                                          --server <origin> --deck-id <id>
+  chat      [deck] --wait [--since <id>] [--timeout <seconds>]
+                                          block until a person writes @agent in
+                                          the chat, then print that message
+  say       [deck] <text> [--slide <id|number>]
+                                          post to the chat as the agent
   transaction apply <deck> <file.json>    JSON fallback, for tooling with no
                                           browser — not how slides are authored
+  history   [deck] [--deleted] [--slide <id>] [--limit <n>] [--full]
+                                          a hosted deck's edit log (history.jsonl,
+                                          kept by the collaboration server): who
+                                          changed what, when. --deleted lists only
+                                          changes that removed slides or objects,
+                                          with their full JSON, to put them back
+            [deck] --versions             the deck as it was, every few minutes of
+                                          editing (.versions/, kept by the server)
+            [deck] --restore <id | time>  put a version back, for everyone editing;
+                                          what it replaces becomes a version too
 
 Adding slides vs. changing them: 'new' writes a page that can only add, while
 'inspect --html' creates authoring HTML that governs the slides it names — do
@@ -191,7 +227,9 @@ save/apply that file. Slides outside its recorded scope stay untouched.
 
 Anywhere a slide is named, --slide takes its id or its 1-based number — the
 number the rail shows and the number 'context' and 'comments' print. So
-"slide 44" is --slide 44, and its neighbours are --slide 43,44,45.
+"slide 44" is --slide 44, and its neighbours are --slide 43,44,45. Where
+several slides can be named (inspect, render, validate, theme apply), a range
+of numbers counts too, and a list can mix them: --slide 2-40, --slide 1,3-5.
 
 Do not hand-compute geometry: write CSS and let the browser measure.
 `;
@@ -229,10 +267,16 @@ export async function runAgentCli(argv: string[], io: CliIo): Promise<number> {
         return await themeCommand(rest, io);
       case 'comments':
         return await commentsCommand(rest, io);
+      case 'chat':
+        return await chatCommand(rest, io);
+      case 'say':
+        return await sayCommand(rest, io);
       case 'transaction':
         return await transactionCommand(rest, io);
       case 'connect':
         return await connectCommand(rest, io);
+      case 'history':
+        return await historyCommand(rest, io);
       case 'help':
       case '--help':
       case undefined:
@@ -247,7 +291,9 @@ export async function runAgentCli(argv: string[], io: CliIo): Promise<number> {
       io.out(json({ status: 'conflict', revision: error.revision, message: error.message }));
       return EXIT_CONFLICT;
     }
-    io.err(error instanceof Error ? error.message : String(error));
+    // A full disk or used-up quota names the file and what to free, rather
+    // than "Unknown system error -122, write" (EDQUOT has no name in Node).
+    io.err(failureMessage(error));
     return error instanceof UsageError ? EXIT_USAGE : EXIT_ERROR;
   }
 }
@@ -352,10 +398,11 @@ async function applyCommand(argv: string[], io: CliIo): Promise<number> {
   }
 
   const deck = await loadDeck(deckDir);
-  // Like every other slide reference, `--after` takes an id or a 1-based number.
+  // Like every other slide reference, `--after` takes an id or a 1-based
+  // number; `--after 0` puts new slides first. Left out, they go last.
   const afterRef = options.get('after');
-  const after = afterRef === undefined ? null : slideIdForRef(deck, afterRef);
-  if (afterRef !== undefined && after === null) {
+  const after = afterRef === undefined ? undefined : insertionAnchor(deck, afterRef);
+  if (afterRef !== undefined && after === undefined) {
     io.err(`No such slide: ${afterRef}`);
     return EXIT_USAGE;
   }
@@ -367,7 +414,7 @@ async function applyCommand(argv: string[], io: CliIo): Promise<number> {
   // asking it explicitly returns what that did, and it answers a request for
   // the same document once — the CLI compiling alongside it used to insert
   // every new section twice. The editor stamps the ids itself.
-  const live = await readLiveAgentContext(deckDir);
+  const live = await liveContext(deckDir);
   if (live) {
     const response = await request(deckDir, {
       version: AGENT_PROTOCOL_VERSION,
@@ -379,12 +426,17 @@ async function applyCommand(argv: string[], io: CliIo): Promise<number> {
       ...(options.get('label') ? { label: options.get('label') } : {}),
     }, 180_000);
     const outcome = (response.payload ?? {}) as Partial<{
-      changes: unknown; slides: unknown; warnings: string[]; message: string;
+      changes: { replaced: string[]; inserted: string[]; deleted: string[]; moved: number };
+      slides: unknown; warnings: string[]; message: string; stamp: PageStamp;
     }>;
+    const changes = outcome.changes;
     io.out(json({
       status: response.status,
       revision: response.revision,
-      applied: response.status === 'applied',
+      // Whether the deck changed, as offline and on a hosted deck: a page that
+      // compiles to what the deck already holds is answered, not applied.
+      applied: response.status === 'applied' && Boolean(changes) && (changes!.replaced.length
+        + changes!.inserted.length + changes!.deleted.length + changes!.moved) > 0,
       live: true,
       ...(response.message ? { message: response.message } : {}),
       ...(outcome.changes ? { changes: outcome.changes } : {}),
@@ -394,15 +446,19 @@ async function applyCommand(argv: string[], io: CliIo): Promise<number> {
     }));
     if (response.status === 'conflict') return EXIT_CONFLICT;
     if (response.status === 'error') return EXIT_ERROR;
-    // The editor stamps ids only into files under edit/. Anything else (a
-    // drafts/ page) is stamped here, or applying it again would insert the
-    // slide a second time. A file the editor already stamped no longer
-    // matches what was sent, so this never overwrites its write.
-    if (Array.isArray(outcome.slides)) {
+    // The editor stamps files under edit/ itself. Anything else (a drafts/
+    // page) is stamped here, or applying it again would insert the slide a
+    // second time. Never a file in edit/: the editor's watcher would take
+    // this process's write for a save and compile the page again, later and
+    // against whatever the deck has become by then. A server hosting the
+    // deck watches no edit/ folder, so there every page is stamped here.
+    const inEditDir = dirname(filePath) === join(deckDir, 'edit');
+    if (Array.isArray(outcome.slides) && (!inEditDir || hostedDecks.has(resolve(deckDir)))) {
       const authored = await readFile(filePath, 'utf8');
       if (authored === authoredBefore) {
-        const adopted = adoptAuthoredIds(authored, outcome.slides as Slide[]);
-        if (adopted) await writeFile(filePath, adopted, 'utf8');
+        const adopted = adoptAuthoredIds(authored, outcome.slides as Slide[]) ?? authored;
+        const stamped = outcome.stamp ? stampPage(adopted, outcome.stamp) : adopted;
+        if (stamped !== authored) await replaceFileAtomically(filePath, stamped);
       }
     }
     return EXIT_OK;
@@ -423,12 +479,11 @@ async function applyCommand(argv: string[], io: CliIo): Promise<number> {
   // push a previously fitted box into clipping and nothing else on this path
   // would ever say so.
   const overflows = await measureBuiltTextOverflows(deckDir, deck, slides);
-
-  const code = await applyTransaction(deckDir, transaction, io, {
+  const report = {
     // Insert and replace are indistinguishable in the result otherwise: both
     // end with the deck showing what was authored. Naming the deleted slides
     // is the whole point — that is the outcome nobody asks for on purpose.
-    changes: htmlSyncSummary(transaction.operations),
+    changes: htmlSyncSummary(transaction?.operations ?? []),
     overflows,
     slides: slides.map((slide) => ({
       id: slide.id,
@@ -440,17 +495,23 @@ async function applyCommand(argv: string[], io: CliIo): Promise<number> {
     // Inline style the browser's parser silently dropped: without this the
     // apply reports success while the page laid out without the declaration.
     ...(warnings.length > 0 ? { warnings } : {}),
-  });
+  };
+  const code = transaction
+    ? await applyTransaction(deckDir, transaction, io, report)
+    : (io.out(json({ status: 'applied', revision: deckRevision(deck), applied: false, live: false, ...report })), EXIT_OK);
 
   // Stamp the assigned ids back into the file so applying it again replaces
   // these slides instead of inserting them a second time. Skipped if the file
   // changed while the compile ran — stamping ids onto contents that were not
   // compiled would misattribute them.
+  // The fingerprints too: the next save of the page is compared with what
+  // it says now, not with what it was exported from.
   if (code === EXIT_OK) {
     const authored = await readFile(filePath, 'utf8');
     if (authored === authoredBefore) {
-      const adopted = adoptAuthoredIds(authored, slides);
-      if (adopted) await writeFile(filePath, adopted, 'utf8');
+      const stamped = stampPage(adoptAuthoredIds(authored, slides) ?? authored, pageStampOf(slides));
+      // Replaced, not written in place, which shows a reader an empty page.
+      if (stamped !== authored) await replaceFileAtomically(filePath, stamped);
     }
   }
   return code;
@@ -536,7 +597,7 @@ async function inspectCommand(argv: string[], io: CliIo): Promise<number> {
   }
 
   if (flags.has('dom')) {
-    const live = await readLiveAgentContext(deckDir);
+    const live = await liveContext(deckDir);
     if (!live) {
       io.err('--dom needs the editor running; it renders the live DOM. Use plain inspect otherwise.');
       return EXIT_ERROR;
@@ -616,7 +677,7 @@ async function renderCommand(argv: string[], io: CliIo): Promise<number> {
     return EXIT_ERROR;
   }
 
-  const { images, contactSheet } = await renderSlidesToPng({
+  const { images, contactSheet, contactSheets } = await renderSlidesToPng({
     deckDir,
     deck,
     outDir: resolve(io.cwd, outDir),
@@ -626,7 +687,17 @@ async function renderCommand(argv: string[], io: CliIo): Promise<number> {
     contactSheet: flags.has('contact-sheet'),
     selectedElementIds: context.selectedElementIds,
   });
-  io.out(json({ revision: context.deckRevision, images, contactSheet }));
+  // A PNG that may be missing media says so, here and in the JSON: a
+  // picture that silently lacks its video reads as a slide that has none.
+  for (const image of images) {
+    for (const problem of image.problems ?? []) io.err(`slide ${image.number} (${image.slideId}): ${problem}`);
+  }
+  io.out(json({
+    revision: context.deckRevision,
+    images,
+    contactSheet,
+    ...(contactSheets.length > 1 ? { contactSheets } : {}),
+  }));
   return EXIT_OK;
 }
 
@@ -654,11 +725,10 @@ async function previewCommand(argv: string[], io: CliIo): Promise<number> {
   if (flags.has('open') && process.platform === 'darwin') {
     spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
   }
-  // Serve until killed: the caller owns this process's lifetime.
-  await new Promise<void>((done) => {
-    process.once('SIGINT', done);
-    process.once('SIGTERM', done);
-  });
+  // Serve until killed: the caller owns this process's lifetime. The bundle
+  // is the whole deck's export, media and all, so it goes with the process.
+  await untilStopped();
+  await removeTempDir(bundleDir);
   return EXIT_OK;
 }
 
@@ -686,19 +756,9 @@ async function validateCommand(argv: string[], io: CliIo): Promise<number> {
       if (error instanceof UsageError) throw error;
     }
   }
-  let importGaps: Array<{
-    slideId: string; elementId: string; originalType: string; note: string;
-  }> = [];
+  let importGaps: ImportGap[] = [];
   try {
-    const deck = await loadDeck(deckDir);
-    importGaps = deck.slides.flatMap((slide) => slide.elements
-      .filter((element) => element.type === 'unsupported')
-      .map((element) => ({
-        slideId: slide.id,
-        elementId: element.id,
-        originalType: element.originalType,
-        note: element.note,
-      })));
+    importGaps = importGapsOf(await loadDeck(deckDir));
   } catch {
     // The parse failure is already represented in `errors`.
   }
@@ -711,15 +771,50 @@ async function validateCommand(argv: string[], io: CliIo): Promise<number> {
   try {
     const deck = await loadDeck(deckDir);
     overflows = deck.slides.flatMap((slide) => slide.elements.flatMap((element) => {
+      // The box it covers as drawn: a vertical axis label (rot -90) is
+      // checked as the tall, narrow thing on screen, not its wide stored box.
+      const box = rotatedBounds(element, element.rot);
       const beyond: Record<string, number> = {};
-      if (element.x < 0) beyond.left = round2(-element.x);
-      if (element.y < 0) beyond.top = round2(-element.y);
-      if (element.x + element.w > deck.canvas.w) beyond.right = round2(element.x + element.w - deck.canvas.w);
-      if (element.y + element.h > deck.canvas.h) beyond.bottom = round2(element.y + element.h - deck.canvas.h);
+      if (round2(box.x) < 0) beyond.left = round2(-box.x);
+      if (round2(box.y) < 0) beyond.top = round2(-box.y);
+      if (round2(box.x + box.w) > deck.canvas.w) beyond.right = round2(box.x + box.w - deck.canvas.w);
+      if (round2(box.y + box.h) > deck.canvas.h) beyond.bottom = round2(box.y + box.h - deck.canvas.h);
       return Object.keys(beyond).length > 0
         ? [{ slideId: slide.id, elementId: element.id, type: element.type, beyond }]
         : [];
     }));
+  } catch {
+    // The parse failure is already represented in `errors`.
+  }
+  // Maths a text element opens and never closes shows on the slide as raw
+  // TeX. The classic cause is a `<` inside `$…$` in an authoring page, which
+  // the HTML parser reads as a tag and cuts the text off at.
+  let mathProblems: Array<{
+    slideId: string; elementId: string; delimiter: string; excerpt: string; message: string;
+  }> = [];
+  try {
+    const deck = await loadDeck(deckDir);
+    mathProblems = deck.slides.flatMap((slide) => slide.elements.flatMap((element) => {
+      const open = element.type === 'text' ? unclosedMath(element.html) : null;
+      return open ? [{
+        slideId: slide.id,
+        elementId: element.id,
+        delimiter: open.delimiter,
+        excerpt: open.excerpt,
+        message: `maths opened with ${open.delimiter} is never closed, so the slide shows it as raw TeX. `
+          + 'If a "<" inside the maths cut it short, write it as &lt; or \\lt.',
+      }] : [];
+    }));
+  } catch {
+    // The parse failure is already represented in `errors`.
+  }
+  // A term build with nothing to step through: valid, and on screen a click
+  // that does nothing.
+  let buildProblems: Array<{ slideId: string; entryId: string; elementId: string; message: string }> = [];
+  try {
+    const deck = await loadDeck(deckDir);
+    buildProblems = deck.slides.flatMap((slide) => termBuildProblems(slide)
+      .map((problem) => ({ slideId: slide.id, ...problem })));
   } catch {
     // The parse failure is already represented in `errors`.
   }
@@ -729,6 +824,8 @@ async function validateCommand(argv: string[], io: CliIo): Promise<number> {
       filter({ id: slideId, index: 0, selected: selectedSlideIds.includes(slideId), active: false });
     importGaps = importGaps.filter((gap) => keep(gap.slideId));
     overflows = overflows.filter((overflow) => keep(overflow.slideId));
+    mathProblems = mathProblems.filter((problem) => keep(problem.slideId));
+    buildProblems = buildProblems.filter((problem) => keep(problem.slideId));
   }
 
   io.out(jsonCompactArrays(
@@ -739,6 +836,8 @@ async function validateCommand(argv: string[], io: CliIo): Promise<number> {
       errors,
       importGaps,
       overflows,
+      mathProblems,
+      buildProblems,
     },
     ['overflows'],
   ));
@@ -846,8 +945,9 @@ async function webCommand(argv: string[], io: CliIo): Promise<number> {
   // bundle or no display simply means no poster.
   let poster: string | null = null;
   if (!flags.has('no-poster')) {
+    let shots: string | null = null;
     try {
-      const shots = await mkdtemp(join(tmpdir(), 'web-poster-'));
+          shots = await tempDir('web-poster-');
       const { images } = await renderSlidesToPng({
         deckDir,
         deck: { ...deck, slides: [slide] },
@@ -867,7 +967,9 @@ async function webCommand(argv: string[], io: CliIo): Promise<number> {
         if (element.type === 'web') element.poster = poster;
       }
     } catch (error) {
-      io.err(`No poster captured (${error instanceof Error ? error.message : String(error)}); the slide still works, previews show an inert frame.`);
+      io.err(`No poster captured (${failureMessage(error)}); the slide still works, previews show an inert frame.`);
+    } finally {
+      if (shots) await removeTempDir(shots);
     }
   }
 
@@ -1135,15 +1237,21 @@ async function webCheckCommand(argv: string[], io: CliIo): Promise<number> {
   if (!size) throw new UsageError(`--size takes WIDTHxHEIGHT, not "${options.get('size')}".`);
   // Checked with the bridge in place, as it will run once imported, so a page
   // that calls `deckwerk.onActive` does not fail here for a missing global.
-  const staged = join(await mkdtemp(join(tmpdir(), 'web-check-')), positional[0].replace(/^.*[\\/]/, ''));
-  await writeFile(staged, injectWebBridgeRuntime(await readFile(pagePath, 'utf8')), 'utf8');
+  const stage = await tempDir('web-check-');
+  const staged = join(stage, positional[0].replace(/^.*[\\/]/, ''));
   const screenshot = options.get('screenshot');
-  const result = await checkWebPage({
-    pagePath: staged,
-    width: Number(size[1]),
-    height: Number(size[2]),
-    screenshot: screenshot ? resolve(io.cwd, screenshot) : null,
-  });
+  let result: Awaited<ReturnType<typeof checkWebPage>>;
+  try {
+    await writeFile(staged, injectWebBridgeRuntime(await readFile(pagePath, 'utf8')), 'utf8');
+    result = await checkWebPage({
+      pagePath: staged,
+      width: Number(size[1]),
+      height: Number(size[2]),
+      screenshot: screenshot ? resolve(io.cwd, screenshot) : null,
+    });
+  } finally {
+    await removeTempDir(stage);
+  }
   io.out(json({
     ...result,
     checked: pagePath,
@@ -1168,7 +1276,7 @@ function titleFromHtml(html: string): string | null {
  */
 async function commentsCommand(argv: string[], io: CliIo): Promise<number> {
   const { flags, options, positional } = parseFlags(argv, [
-    'resolve', 'add', 'slide', 'element', 'author',
+    'resolve', 'add', 'slide', 'element', 'author', 'reply',
   ]);
   ensureKnownFlags('comments', flags, ['unresolved']);
   ensurePositionals('comments', positional, 1);
@@ -1178,12 +1286,19 @@ async function commentsCommand(argv: string[], io: CliIo): Promise<number> {
   const addText = options.get('add');
   const slideRef = options.get('slide');
   const elementId = options.get('element');
+  const replyId = options.get('reply');
 
   if (resolveId) {
-    const operation = resolveCommentOperation(deck, resolveId);
-    if (!operation) {
+    const found = findComment(deck, resolveId);
+    if (!found) {
       io.err(`No comment with id ${resolveId}`);
       return EXIT_ERROR;
+    }
+    const operation = commentsOperation(deck, found.target, (comments) =>
+      threadEdits.resolve(comments, resolveId, true, options.get('author') ?? 'agent'));
+    if (!operation) {
+      io.out(json({ resolved: resolveId, alreadyResolved: true }));
+      return EXIT_OK;
     }
     return applyTransaction(deckDir, {
       version: AGENT_PROTOCOL_VERSION,
@@ -1193,10 +1308,6 @@ async function commentsCommand(argv: string[], io: CliIo): Promise<number> {
   }
 
   if (addText) {
-    if (Boolean(slideRef) === Boolean(elementId)) {
-      io.err('comments --add needs exactly one of --slide <slideId> or --element <elementId>');
-      return EXIT_USAGE;
-    }
     const comment: Comment = {
       id: `comment-${randomUUID().slice(0, 8)}`,
       author: options.get('author') ?? 'agent',
@@ -1204,24 +1315,92 @@ async function commentsCommand(argv: string[], io: CliIo): Promise<number> {
       ts: new Date().toISOString(),
       resolved: false,
     };
-    // A number here is the slide number the listing above prints, so a reply
-    // can name the slide the same way the comment it answers did.
-    const slideId = slideRef ? slideIdForRef(deck, slideRef) ?? slideRef : undefined;
-    const operation = addCommentOperation(deck, comment, slideId, elementId);
-    if (!operation) {
-      io.err(`No such ${slideRef ? `slide: ${slideRef}` : `element: ${elementId}`}`);
-      return EXIT_ERROR;
+    let operation: DraftOperation | null;
+    if (replyId) {
+      const found = findComment(deck, replyId);
+      if (!found) {
+        io.err(`No comment with id ${replyId}`);
+        return EXIT_ERROR;
+      }
+      operation = commentsOperation(deck, found.target, (comments) => threadEdits.reply(comments, replyId, comment));
+    } else {
+      if (Boolean(slideRef) === Boolean(elementId)) {
+        io.err('comments --add needs --reply <commentId>, or exactly one of --slide <slideId> or --element <elementId>');
+        return EXIT_USAGE;
+      }
+      // A number here is the slide number the listing above prints, so a
+      // comment can name the slide the same way a person does.
+      const slideId = slideRef ? slideIdForRef(deck, slideRef) ?? slideRef : undefined;
+      const slide = deck.slides.find((candidate) => (slideId
+        ? candidate.id === slideId
+        : candidate.elements.some((element) => element.id === elementId)));
+      if (!slide) {
+        io.err(`No such ${slideRef ? `slide: ${slideRef}` : `element: ${elementId}`}`);
+        return EXIT_ERROR;
+      }
+      operation = commentsOperation(deck, { slideId: slide.id, ...(elementId ? { elementId } : {}) },
+        (comments) => threadEdits.start(comments, comment));
     }
     return applyTransaction(deckDir, {
       version: AGENT_PROTOCOL_VERSION,
-      label: 'Add comment',
-      operations: [operation],
+      label: replyId ? 'Reply to comment' : 'Add comment',
+      operations: [operation!],
     }, io, { commentId: comment.id });
   }
 
   const rows = listComments(deck).filter((row) => !flags.has('unresolved') || !row.resolved);
   io.out(json({ commentCount: rows.length, comments: rows }));
   return EXIT_OK;
+}
+
+/**
+ * The deck chat, for an agent: read it, or wait for somebody to address it.
+ * Unlike comments this is not deck content, so it is fetched from the server
+ * rather than read off disk.
+ */
+async function chatCommand(argv: string[], io: CliIo): Promise<number> {
+  const { flags, options, positional } = parseFlags(argv, ['since', 'timeout', 'server', 'deck-id']);
+  ensureKnownFlags('chat', flags, ['wait']);
+  ensurePositionals('chat', positional, 1);
+  const target = chatTargetFor(positional[0], options, io);
+  const since = options.get('since');
+  if (flags.has('wait')) {
+    const timeout = options.get('timeout');
+    if (timeout !== undefined && !(Number(timeout) > 0)) throw new UsageError('--timeout takes seconds, e.g. --timeout 600');
+    const messages = await waitForMention(target, {
+      since, deadlineMs: timeout !== undefined ? Number(timeout) * 1000 : undefined,
+    });
+    io.out(json({ chatCount: messages.length, messages, last: messages.at(-1)?.id ?? since ?? null, timedOut: messages.length === 0 }));
+    return messages.length > 0 ? EXIT_OK : EXIT_ERROR;
+  }
+  const listing = await listChat(target, since);
+  io.out(jsonCompactArrays({ chatCount: listing.chatCount, last: listing.last, messages: listing.messages }, ['messages']));
+  return EXIT_OK;
+}
+
+async function sayCommand(argv: string[], io: CliIo): Promise<number> {
+  const { flags, options, positional } = parseFlags(argv, ['server', 'deck-id']);
+  ensureKnownFlags('say', flags, ['slide']);
+  if (positional.length === 0 || positional.length > 2) {
+    throw new UsageError('usage: slide-agent say [deck] "text" [--slide <id|number>]');
+  }
+  const text = positional[positional.length - 1];
+  if (!text.trim()) throw new UsageError('say needs some text');
+  const slides = requestedSlideIds(flags);
+  if (slides.length > 1) throw new UsageError('say points at one slide at most');
+  const target = chatTargetFor(positional.length === 2 ? positional[0] : undefined, options, io);
+  const message = await postChat(target, text, slides[0]);
+  io.out(json({ status: 'posted', id: message.id, message }));
+  return EXIT_OK;
+}
+
+function chatTargetFor(deckArg: string | undefined, options: Map<string, string>, io: CliIo) {
+  try {
+    return resolveChatTarget(io.cwd, deckArg, { server: options.get('server'), deckId: options.get('deck-id') });
+  } catch (error) {
+    if (error instanceof ChatUsageError) throw new UsageError(error.message);
+    throw error;
+  }
 }
 
 interface CommentRow extends Comment {
@@ -1248,49 +1427,6 @@ function listComments(deck: Deck): CommentRow[] {
 }
 
 type DraftOperation = DraftTransaction['operations'][number];
-
-function resolveCommentOperation(deck: Deck, commentId: string): DraftOperation | null {
-  for (const slide of deck.slides) {
-    const onSlide = slide.comments?.find((c) => c.id === commentId);
-    if (onSlide) {
-      const { elements: _elements, ...props } = structuredClone(slide);
-      for (const c of props.comments ?? []) if (c.id === commentId) c.resolved = true;
-      return { op: 'setSlideProperties', slideId: slide.id, slide: props };
-    }
-    for (const element of slide.elements) {
-      if (element.comments?.some((c) => c.id === commentId)) {
-        const next = structuredClone(element);
-        for (const c of next.comments ?? []) if (c.id === commentId) c.resolved = true;
-        return { op: 'replaceElement', slideId: slide.id, elementId: element.id, element: next };
-      }
-    }
-  }
-  return null;
-}
-
-function addCommentOperation(
-  deck: Deck,
-  comment: Comment,
-  slideId?: string,
-  elementId?: string,
-): DraftOperation | null {
-  for (const slide of deck.slides) {
-    if (slideId && slide.id === slideId) {
-      const { elements: _elements, ...props } = structuredClone(slide);
-      (props.comments ??= []).push(comment);
-      return { op: 'setSlideProperties', slideId: slide.id, slide: props };
-    }
-    if (elementId) {
-      const element = slide.elements.find((e) => e.id === elementId);
-      if (element) {
-        const next = structuredClone(element);
-        (next.comments ??= []).push(comment);
-        return { op: 'replaceElement', slideId: slide.id, elementId, element: next };
-      }
-    }
-  }
-  return null;
-}
 
 async function transactionCommand(argv: string[], io: CliIo): Promise<number> {
   const [sub, ...rest] = argv;
@@ -1331,7 +1467,7 @@ async function applyTransaction(
   io: CliIo,
   extra: Record<string, unknown> = {},
 ): Promise<number> {
-  const live = await readLiveAgentContext(deckDir);
+  const live = await liveContext(deckDir);
   const expectedRevision = draft.expectedRevision
     ?? live?.deckRevision
     ?? deckRevision(await loadDeck(deckDir));
@@ -1401,10 +1537,12 @@ export async function currentContext(
   const digest = opts.digest
     ? { outline: deckOutline(deck), style: deckStyleDigest(deck) }
     : {};
-  const live = await readLiveAgentContext(deckDir);
+  const live = await liveContext(deckDir);
   if (live) {
+    const host = hostedDecks.get(resolve(deckDir));
     return {
       ...live,
+      ...(host ? { hostedBy: host.url, hostedDeckId: host.deckId } : {}),
       ...digest,
       scenes: opts.scenes ? live.scenes : [],
       diskRevision,
@@ -1461,6 +1599,150 @@ function authoredScenes(
     authoredScene(deck, slide, index, selectedSlideIds, selectedElementIds, activeSlideId));
 }
 
+/**
+ * The edit log a collaboration server keeps beside a hosted deck, read from
+ * the deck folder on that machine: newest last. Deleted slides carry their
+ * full JSON with --deleted or --full, and their number and title otherwise.
+ */
+async function historyCommand(argv: string[], io: CliIo): Promise<number> {
+  const { flags, options, positional } = parseFlags(argv, ['limit', 'restore']);
+  ensureKnownFlags('history', flags, ['deleted', 'slide', 'full', 'versions']);
+  ensurePositionals('history', positional, 1);
+  const deckDir = resolveDeckDir(positional[0], io);
+  const limit = options.has('limit') ? Number.parseInt(options.get('limit')!, 10) : 50;
+  if (!Number.isFinite(limit) || limit < 1) throw new UsageError('--limit takes a positive number');
+  if (options.has('restore')) return restoreVersion(deckDir, options.get('restore')!, io);
+  if (flags.has('versions')) {
+    const versions = await listDeckVersions(deckDir);
+    io.out(json({
+      dir: join(deckDir, VERSIONS_DIR),
+      total: versions.length,
+      shown: Math.min(limit, versions.length),
+      ...(versions.length ? {} : { note: 'No versions here. A collaboration server keeps them for decks it hosts.' }),
+      versions: versions.slice(-limit).map(({ id, at, bytes }) => ({ id, at: at.toISOString(), bytes })),
+      restore: 'slide-agent history <deck> --restore <id | ISO time>',
+    }));
+    return EXIT_OK;
+  }
+  const slideIds = new Set([...flags].filter((flag) => flag.startsWith('slide='))
+    .flatMap((flag) => flag.slice('slide='.length).split(',')).map((id) => id.trim()).filter(Boolean));
+  const deletedOnly = flags.has('deleted');
+  const full = flags.has('full') || deletedOnly;
+
+  let text = '';
+  for (const name of [HISTORY_ROTATED_FILE, HISTORY_FILE]) {
+    text += await readFile(join(deckDir, name), 'utf8').catch(() => '');
+  }
+  const touches = (entry: EditHistoryEntry, id: string): boolean => Boolean(
+    entry.slides?.inserted?.includes(id) || entry.slides?.moved?.includes(id) || entry.slides?.changed?.includes(id)
+    || entry.slides?.deleted?.some((slide) => slide.id === id)
+    || entry.elements?.deleted?.some((element) => element.slideId === id));
+  const entries = parseEditHistory(text)
+    .filter((entry) => !deletedOnly || Boolean(entry.slides?.deleted?.length || entry.elements?.deleted?.length))
+    .filter((entry) => slideIds.size === 0 || [...slideIds].some((id) => touches(entry, id)));
+  const shown = entries.slice(-limit).map((entry) => (full ? entry : {
+    ...entry,
+    ...(entry.slides?.deleted ? {
+      slides: { ...entry.slides, deleted: entry.slides.deleted.map(({ slide: _slide, ...rest }) => rest) },
+    } : {}),
+    ...(entry.elements?.deleted ? {
+      elements: { ...entry.elements, deleted: entry.elements.deleted.map(({ element: _element, ...rest }) => rest) },
+    } : {}),
+  }));
+  io.out(json({
+    file: join(deckDir, HISTORY_FILE),
+    total: entries.length,
+    shown: shown.length,
+    ...(text ? {} : { note: 'No edit log here. A collaboration server writes history.jsonl beside a deck it hosts.' }),
+    entries: shown,
+  }));
+  return EXIT_OK;
+}
+
+/** How long a hosting server takes to notice a deck.json written behind it and adopt it. */
+const restoreSettleMs = (): number => Number(process.env.DECKWERK_RESTORE_SETTLE_MS ?? 2_500);
+
+/**
+ * Put a version of the deck back: `id` names one exactly (or by a unique
+ * prefix), or is a time, meaning the newest version at or before it. What the
+ * deck holds now becomes a version first, so a restore is itself undoable.
+ *
+ * A deck a collaboration server hosts is restored through the server, as one
+ * transaction. Otherwise the version is written as deck.json, checked and
+ * rewritten should anything save over it in the same instant.
+ */
+async function restoreVersion(deckDir: string, wanted: string, io: CliIo): Promise<number> {
+  const versions = await listDeckVersions(deckDir);
+  const byId = versions.filter((version) => version.id === wanted || version.id.startsWith(wanted));
+  const time = Date.parse(wanted);
+  const chosen = byId.length === 1 ? byId[0]
+    : byId.length === 0 && Number.isFinite(time) ? versions.filter((version) => version.at.getTime() <= time).at(-1)
+      : undefined;
+  if (!chosen) {
+    throw new UsageError(byId.length > 1
+      ? `"${wanted}" matches ${byId.length} versions; give more of the id.`
+      : `No version "${wanted}" in ${join(deckDir, VERSIONS_DIR)}. List them with: slide-agent history <deck> --versions`);
+  }
+  const { deck: raw, theme } = await readDeckVersion(chosen);
+  const deck = parseDeck(raw);
+
+  const currentJson = await readFile(join(deckDir, DECK_FILE), 'utf8');
+  const currentThemeFile = parseDeck(JSON.parse(currentJson)).theme;
+  const currentTheme = await loadTheme(deckDir, currentThemeFile);
+  const kept = await writeDeckVersion(deckDir, {
+    deckJson: currentJson, theme: { file: currentThemeFile, css: currentTheme },
+  });
+
+  if (theme && (theme.file !== currentThemeFile || theme.css !== currentTheme)) {
+    await saveTheme(deckDir, theme.file, theme.css);
+  }
+  const reply = {
+    restored: chosen.id,
+    at: chosen.at.toISOString(),
+    slides: deck.slides.length,
+    previous: kept?.id ?? 'unchanged since the newest version',
+    undo: `slide-agent history <deck> --restore ${kept?.id ?? versions.at(-1)?.id ?? '<id>'}`,
+  };
+
+  // A deck a server hosts is restored through it, as one transaction from
+  // the live deck to the version: everyone in it sees the restore land, and
+  // nothing anybody types meanwhile is written over.
+  if (await liveContext(deckDir) && hostedDecks.has(resolve(deckDir))) {
+    const host = hostedDecks.get(resolve(deckDir))!;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const live = await hostedLiveDeck(host);
+      const response = await request(deckDir, {
+        version: AGENT_PROTOCOL_VERSION,
+        id: requestId(),
+        kind: 'transaction',
+        transaction: {
+          version: 1,
+          expectedRevision: deckRevision(live),
+          label: `Restore version ${chosen.id}`,
+          operations: diffDecks(live, deck),
+        },
+      });
+      if (response.status === 'applied') {
+        io.out(json({ ...reply, live: true, revision: response.revision }));
+        return EXIT_OK;
+      }
+      if (response.status !== 'conflict') throw new Error(response.message ?? 'The server could not restore that version.');
+    }
+    throw new Error('The deck kept changing while the restore was sent (someone is editing it right now). Try again.');
+  }
+
+  let written = '';
+  for (let attempt = 0; attempt < 4; attempt++) {
+    written = await saveDeck(deckDir, deck);
+    await new Promise((resolveWait) => setTimeout(resolveWait, restoreSettleMs()));
+    if (await readFile(join(deckDir, DECK_FILE), 'utf8') === written) {
+      io.out(json(reply));
+      return EXIT_OK;
+    }
+  }
+  throw new Error('The server hosting this deck kept saving over the restore (someone is editing it right now). Try again.');
+}
+
 /** A caller mistake, reported as usage rather than as a failure of the tool. */
 export class UsageError extends Error {}
 
@@ -1503,7 +1785,7 @@ function ensurePositionals(command: string, positional: string[], max: number): 
 /**
  * What `--slide` named, each flag holding one reference or a comma-separated
  * list. These are ids only once `resolveRequestedSlides` has run over them;
- * before that an entry may still be a slide number.
+ * before that an entry may still be a slide number or a range of them.
  */
 function requestedSlideIds(flags: Set<string>): string[] {
   return [...flags]
@@ -1539,18 +1821,38 @@ function resolveRequestedSlides(flags: Set<string>, deck: Deck): void {
   const refs = requestedSlideIds(flags);
   if (refs.length === 0) return;
   const missing: string[] = [];
-  const resolved = refs.map((ref) => {
-    const id = slideIdForRef(deck, ref);
-    if (id === null) missing.push(ref);
-    return id;
+  const resolved = refs.flatMap((ref) => {
+    const ids = slideIdsForRef(deck, ref);
+    if (ids === null) missing.push(ref);
+    return ids ?? [];
   });
   if (missing.length > 0) {
     throw new UsageError(`No such slide: ${missing.join(', ')}.`
-      + ` This deck has ${deck.slides.length} slides; name one by id or by its 1-based number.`
+      + ` This deck has ${deck.slides.length} slides; name one by id or by its 1-based number,`
+      + ' or a range of numbers from low to high (2-40).'
       + ' Run `slide-agent context` for the current outline.');
   }
   for (const flag of [...flags]) if (flag.startsWith('slide=')) flags.delete(flag);
   for (const id of resolved) flags.add(`slide=${id}`);
+}
+
+/**
+ * The slides one `--slide` entry names: an id, a number, or a range of
+ * numbers (`2-40`, both ends included). Null when any of it is not a slide —
+ * a range reaching past the deck or running backwards is a mistake to
+ * report, not one to clip silently.
+ */
+function slideIdsForRef(deck: Deck, ref: string): string[] | null {
+  const range = /^(\d+)-(\d+)$/.exec(ref);
+  // An id wins over a range, as it does over a number.
+  if (!range || deck.slides.some((slide) => slide.id === ref)) {
+    const id = slideIdForRef(deck, ref);
+    return id === null ? null : [id];
+  }
+  const first = Number(range[1]);
+  const last = Number(range[2]);
+  if (first < 1 || last < first || last > deck.slides.length) return null;
+  return deck.slides.slice(first - 1, last).map((slide) => slide.id);
 }
 
 /** `--selected` (default), `--slide <id>` (repeatable, or comma-separated) or `--all`. */
@@ -1568,8 +1870,35 @@ async function request(
   payload: Parameters<typeof writeAgentRequest>[1],
   timeoutMs?: number,
 ) {
+  const host = hostedDecks.get(resolve(deckDir));
+  if (host) return hostedRequest(host, payload, timeoutMs);
   const responsePath = await writeAgentRequest(deckDir, payload);
   return waitForAgentResponse(responsePath, timeoutMs);
+}
+
+/** The servers found hosting deck folders this run (cli/hostedDeck.ts), by folder. */
+const hostedDecks = new Map<string, HostedDeck>();
+
+/**
+ * Whoever holds the live deck for a folder: the desktop editor with it open,
+ * or a collaboration server hosting it. Either way the deck on disk trails
+ * the real document, and every change goes through `request` to them. Null
+ * when nobody does, and the folder on disk is the deck.
+ *
+ * A server that is running but does not answer is an error, never a reason
+ * to fall back to writing deck.json beside it.
+ */
+async function liveContext(deckDir: string): Promise<AgentContext | null> {
+  const desktop = await readLiveAgentContext(deckDir);
+  if (desktop) return desktop;
+  const host = await findHostingServer(deckDir);
+  if (!host) {
+    hostedDecks.delete(resolve(deckDir));
+    return null;
+  }
+  const context = await hostedContext(host);
+  hostedDecks.set(resolve(deckDir), host);
+  return context;
 }
 
 function requestId(): string {
@@ -2066,7 +2395,3 @@ function parseList(value: string | undefined, allowed: string[], label: string):
   return parts;
 }
 
-/** A scratch directory for the export a render is captured from. */
-export async function tempDir(prefix: string): Promise<string> {
-  return mkdtemp(join(tmpdir(), prefix));
-}

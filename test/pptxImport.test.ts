@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,17 +16,15 @@ import { loadDeck, loadTheme } from '../src/main/deckStore.js';
  * inches wide, which maps to the 1920px canvas at 144px per inch and 2px per
  * point. The assertions below are those numbers.
  *
- * Point PPTX_FIXTURES at a folder of real .pptx decks to run the corpus check
- * as well; it skips itself when the folder is absent so a fresh checkout passes.
+ * Both decks are checked in, so nothing here skips: a missing fixture or
+ * importer venv is a broken checkout, and the suite fails on it.
  */
 
-const PYTHON = existsSync(join(process.cwd(), '.venv-import/bin/python'))
-  ? join(process.cwd(), '.venv-import/bin/python')
-  : 'python3';
+const PYTHON = join(process.cwd(), '.venv-import/bin/python');
 
 const REFERENCE = join(process.cwd(), 'test/fixtures/pptx/reference.pptx');
-const FIXTURES = process.env.PPTX_FIXTURES;
-const LOCAL_FIXTURES = join(process.cwd(), 'example_presentations');
+// reference.pptx plus one slide: a bent arrow and an embedded PDF (make_embedded.py).
+const EMBEDDED = join(process.cwd(), 'test/fixtures/pptx/embedded.pptx');
 
 const IN = 144;
 
@@ -49,7 +47,12 @@ function shape(deck: Deck, slide: number, predicate: (el: SlideElement) => boole
   return found;
 }
 
-describe.skipIf(!existsSync(REFERENCE))('powerpoint importer', () => {
+describe('powerpoint importer', () => {
+  it('has its checked-in decks', () => {
+    expect(existsSync(REFERENCE)).toBe(true);
+    expect(existsSync(EMBEDDED)).toBe(true);
+  });
+
   let cached: ReturnType<typeof analyse> | null = null;
   const reference = () => (cached ??= analyse(REFERENCE));
 
@@ -120,6 +123,16 @@ describe.skipIf(!existsSync(REFERENCE))('powerpoint importer', () => {
     expect(hello.style.color).toBe('#123456');
     expect(hello.html).toBe('Hello <span style="font-style: italic">world</span>');
     expect(deck.slides[1].notes).toBe('Speaker notes for slide two.');
+  });
+
+  it('escapes the quotes a run\'s font family carries inside its style attribute', () => {
+    // Unescaped, `style="font-family: "Calibri", …"` ends at the first quote
+    // and the run loses its face and everything listed after it.
+    const stdout = execFileSync(PYTHON, ['-c', [
+      'from importers.pptx.import_pptx import _style_attr',
+      "print(_style_attr({'font-family': '\"Calibri\", \"Carlito\", sans-serif', 'font-weight': '700'}))",
+    ].join('\n')], { encoding: 'utf8', cwd: process.cwd() });
+    expect(stdout.trim()).toBe('style="font-family: &quot;Calibri&quot;, &quot;Carlito&quot;, sans-serif; font-weight: 700"');
   });
 
   it('inherits placeholder geometry and type from the layout and master', () => {
@@ -211,15 +224,69 @@ describe.skipIf(!existsSync(REFERENCE))('powerpoint importer', () => {
     }
   }, 60_000);
 
-  const fixtures = FIXTURES && existsSync(FIXTURES)
-    ? FIXTURES
-    : existsSync(LOCAL_FIXTURES) ? LOCAL_FIXTURES : null;
-  const corpus = fixtures
-    ? readdirSync(fixtures).filter((f) => f.endsWith('.pptx') && !f.startsWith('~$')).map((f) => join(fixtures, f))
-    : [];
+  describe('OLE-era content', () => {
+    let embedded: ReturnType<typeof analyse> | null = null;
+    const deck = () => (embedded ??= analyse(EMBEDDED)).deck;
 
-  it.skipIf(corpus.length === 0)('imports every corpus deck without failing', () => {
-    for (const deckPath of corpus) {
+    it('draws a bent arrow as its preset path instead of a rectangle', () => {
+      const arrow = shape(deck(), 5, (el) => el.type === 'shape' && el.fill === '#156082');
+      if (arrow.type !== 'shape') throw new Error('expected a shape');
+      expect([arrow.x, arrow.y, arrow.w, arrow.h]).toEqual([IN, IN, 2 * IN, 3 * IN]);
+      expect(arrow.shape).toBe('path');
+      // The end point of every segment. With the default adjustments in a
+      // 288 x 432 box the preset's guides are: shaft 72 wide, head 144 wide
+      // and 72 long, outer corner radius 126, inner 54.
+      const ends = (arrow.path ?? '').split(/(?=[MLCZ])/).map((segment) => segment.trim().split(/\s+/))
+        .filter((parts) => parts[0] !== 'Z')
+        .map((parts) => parts.slice(-2).map(Number));
+      expect(ends).toEqual([
+        [0, 432], [0, 162], [126, 36], [216, 36], [216, 0], [288, 72],
+        [216, 144], [216, 108], [126, 108], [72, 162], [72, 432],
+      ]);
+      expect(embedded!.report.warnings.join('\n')).not.toContain('approximated as a rectangle');
+    });
+
+    it('renders an embedded PDF from the OLE object, not its unconvertible EMF preview', () => {
+      const object = shape(deck(), 5, (el) => el.type === 'image');
+      if (object.type !== 'image') throw new Error('expected an image');
+      expect([object.x, object.y, object.w, object.h]).toEqual([5 * IN, IN, 3 * IN, 3 * IN]);
+      expect(object.src).toBe('assets/oleObject1.webp');
+      expect(embedded!.report.unsupported).toEqual({});
+    });
+
+    it('writes the rendered page, read through the compound file\'s sector chain', async () => {
+      const out = await mkdtemp(join(tmpdir(), 'pptx-embedded-'));
+      try {
+        // The PDF's sectors are stored back to front: a scan for "%PDF" finds
+        // scrambled bytes, so the solid fill only comes out if the FAT was followed.
+        const stdout = execFileSync(PYTHON, ['-c', [
+          'import json, sys',
+          'from pathlib import Path',
+          'from PIL import Image',
+          'sys.path.insert(0, "importers/pptx")',
+          'from import_pptx import import_pptx',
+          'out = Path(sys.argv[2])',
+          'deck, report = import_pptx(Path(sys.argv[1]), out, True)',
+          'image = next(el for el in deck["slides"][5]["elements"] if el["type"] == "image")',
+          'with Image.open(out / image["src"]) as img:',
+          '    pixel = img.convert("RGB").getpixel((img.width // 2, img.height // 2))',
+          '    size = img.size',
+          'print(json.dumps({"src": image["src"], "pixel": pixel, "size": size, "unsupported": report.to_dict()["unsupported"]}))',
+        ].join('\n'), EMBEDDED, out], { encoding: 'utf8', cwd: process.cwd(), maxBuffer: 64 * 1024 * 1024 });
+        const result = JSON.parse(stdout) as { src: string; pixel: number[]; size: number[]; unsupported: Record<string, number> };
+        expect(result.src).toBe('assets/oleObject1.webp');
+        expect(result.pixel).toEqual([0x20, 0x80, 0xe0]);
+        // Rendered for a 2x display, not at the PDF's 200pt size.
+        expect(Math.min(...result.size)).toBeGreaterThanOrEqual(400);
+        expect(result.unsupported).toEqual({});
+      } finally {
+        await rm(out, { recursive: true, force: true });
+      }
+    }, 60_000);
+  });
+
+  it('imports every checked-in deck with sane geometry and few placeholders', () => {
+    for (const deckPath of [REFERENCE, EMBEDDED]) {
       const { deck, report } = analyse(deckPath);
       expect(report.slides, `${deckPath} produced no slides`).toBeGreaterThan(0);
       const skipped = Object.values(report.unsupported).reduce((a, b) => a + b, 0);

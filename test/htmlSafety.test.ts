@@ -1,6 +1,8 @@
 import { JSDOM } from 'jsdom';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { sanitizeAuthoredHtml, stripLayoutDeclarations } from '../src/shared/htmlSafety.js';
+import {
+  sanitizeAuthoredHtml, stripFittedFontSize, stripLayoutDeclarations, stripScriptsKeepingTimeline,
+} from '../src/shared/htmlSafety.js';
 import { ElementSchema } from '../src/shared/deck.js';
 
 describe('HTML import safety and fallback compatibility', () => {
@@ -26,6 +28,28 @@ describe('HTML import safety and fallback compatibility', () => {
     expect(result.report.blockedUrls.length).toBeGreaterThanOrEqual(3);
   });
 
+  it('keeps a section\'s timeline block, and only in exactly that form', () => {
+    const block = '<script type="application/deckwerk-timeline">[{"id":"t"}]</script>';
+    const result = sanitizeAuthoredHtml(`<!doctype html><html><head></head><body><section class="slide">
+      ${block}
+      <script type="application/deckwerk-timeline" src="x.js">steal()</script>
+      <script type="text/javascript">steal()</script></section></body></html>`);
+    expect(result.html).toContain(block);
+    expect(result.html).not.toContain('steal()');
+    expect(result.report.removedScripts).toBe(2);
+  });
+
+  it('strips scripts textually, keeping a timeline block only when nothing can hide inside it', () => {
+    const block = '<script type="application/deckwerk-timeline">[{"id":"t"}]</script>';
+    expect(stripScriptsKeepingTimeline(`<p>a</p>${block}<script>steal()</script>`)).toBe(`<p>a</p>${block}`);
+    // A browser ends a script at `</script/`, a textual match does not: a
+    // block that closes early must not carry a live script out with it.
+    const smuggled = '<script type="application/deckwerk-timeline"></script/><script>steal()</script>';
+    expect(stripScriptsKeepingTimeline(smuggled)).not.toContain('steal()');
+    const parsed = new JSDOM(stripScriptsKeepingTimeline(smuggled)).window.document;
+    expect([...parsed.querySelectorAll('script')].map((node) => node.textContent)).not.toContain('steal()');
+  });
+
   it('reports data URLs for extraction into deck assets', () => {
     const result = sanitizeAuthoredHtml('<section class="slide"><img src="data:image/png;base64,AAAA"></section>');
     expect(result.report.dataUrls).toEqual([{ mime: 'image/png', value: 'data:image/png;base64,AAAA' }]);
@@ -46,6 +70,27 @@ describe('HTML import safety and fallback compatibility', () => {
     expect(box.innerHTML).toBe('<ol><li>71w174<span style="font-weight: 700;">bold</span><br></li></ol>');
     expect(box.querySelector('li')!.firstChild).toBe(plainText);
     expect(stripLayoutDeclarations(box)).toBe(false);
+  });
+
+  it('strips the fitted size a join baked into an auto-fit box, and only that size', () => {
+    // The list fuzz's short auto-fit box (seed 9012026, step 4): Backspace at
+    // the start of a paragraph joined it to the line above, and Chromium
+    // wrapped the moved text in the box's fitted size, 13.8px. The box then
+    // refitted to 16.5px around text that no longer followed it.
+    const { document } = new JSDOM('').window;
+    const box = document.createElement('div');
+    box.innerHTML = '<p>gamma<span style="font-size: 13.8px;">delta</span>'
+      + '<span style="font-size: 13.8px; font-weight: 700;">f1a</span>'
+      + '<span style="font-size: 20px;">big</span><sup style="font-size: 0.7em;">2</sup></p>';
+    const moved = box.querySelector('span')!.firstChild;
+
+    expect(stripFittedFontSize(box, '13.8px')).toBe(true);
+    // An authored size, absolute or relative, is not the fit's and stays.
+    expect(box.innerHTML).toBe('<p>gammadelta<span style="font-weight: 700;">f1a</span>'
+      + '<span style="font-size: 20px;">big</span><sup style="font-size: 0.7em;">2</sup></p>');
+    expect(box.querySelector('p')!.childNodes[1]).toBe(moved);
+    expect(stripFittedFontSize(box, '13.8px')).toBe(false);
+    expect(stripFittedFontSize(box, '')).toBe(false);
   });
 
   it('keeps old HTML elements unchanged and accepts isolated fallback fields', () => {

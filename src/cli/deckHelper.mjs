@@ -36,7 +36,9 @@ The loop:
                                           export slides as an editable page
   # edit edit/<file>.html and save it — the bridge syncs it and stamps ids back
   apply     --html <file> [--after <id|number>] [--label <text>]
-                                          sync a page now and print what changed
+                                          sync a page now and print what changed;
+                                          new slides go after that slide (0 puts
+                                          them first), else at the end
 
 Saving and apply are two ways to request the same sync. For the fastest path,
 either save and let the bridge watch it, or run apply immediately after writing
@@ -50,8 +52,13 @@ Everything else:
   render    (--selected|--slide …|--all) --output <dir>
                                           PNGs of slides, through the server's renderer
   comments  [--unresolved]                every comment, with its slide number
-  comments  --resolve <commentId>         mark a comment done (never delete)
+  comments  --resolve <commentId>         mark a thread done (never delete)
+  comments  --add <text> --reply <commentId> [--author <name>]   answer in a thread
   comments  --add <text> (--slide <id|number> | --element <elementId>) [--author <name>]
+  chat      [--since <messageId>]         the deck's chat with the people in it, oldest first
+  chat      --wait [--since <id>] [--timeout <seconds>]
+                                          block until someone writes @agent, then print it
+  say       <text> [--slide <id|number>]  post to the chat as yourself, the agent
   asset import <paths...>                 import media through the server; the JSON
                                           output tells you the final assets/… src
   web check <page.html> [--size <WxH>]    run an interactive page in the server's
@@ -105,12 +112,32 @@ async function api(path, params = {}, init = {}) {
     fail(`Could not reach ${session().origin}: ${error.message}. Is the bridge still connected?`);
   }
   const type = response.headers.get('content-type') ?? '';
-  const body = type.includes('application/json') ? await response.json() : await response.text();
+  const text = await response.text();
+  let body = text;
+  if (type.includes('application/json')) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      // Labelled JSON but not: keep the text, which is what explains it.
+    }
+  }
   if (!response.ok) {
     const message = typeof body === 'object' && body && body.error ? body.error : String(body).slice(0, 300);
     fail(`${path} failed (${response.status}): ${message}`, response.status === 409 ? EXIT_CONFLICT : EXIT_ERROR);
   }
   return body;
+}
+
+/** What the server said about a failed request, JSON `{ error }` or plain text. */
+async function explanation(response) {
+  const text = await response.text().catch(() => '');
+  try {
+    const body = JSON.parse(text);
+    if (body && typeof body.error === 'string') return body.error;
+  } catch {
+    // Not JSON: a proxy or an older server. The text is the explanation.
+  }
+  return text.trim().slice(0, 600) || 'no explanation from the server';
 }
 
 function fail(message, code = EXIT_ERROR) {
@@ -258,8 +285,10 @@ async function main(argv) {
       mkdirSync(dir, { recursive: true });
       const images = [];
       for (const entry of wanted) {
-        const response = await fetch(apiUrl('/api/render-slide.png', { slideId: entry.id }));
-        if (!response.ok) fail(`render of slide ${entry.index} failed (${response.status})`);
+        const response = await fetch(apiUrl('/api/render-slide.png', { slideId: entry.id }), {
+          headers: { 'x-deckwerk-bridge': '1' },
+        });
+        if (!response.ok) fail(`render of slide ${entry.index} failed (${response.status}): ${await explanation(response)}`);
         const path = join(dir, `slide-${String(entry.index).padStart(2, '0')}.png`);
         writeFileSync(path, Buffer.from(await response.arrayBuffer()));
         images.push({ slide: entry.index, slideId: entry.id, path });
@@ -267,8 +296,49 @@ async function main(argv) {
       out({ revision: context.revision, images });
       return EXIT_OK;
     }
+    case 'chat': {
+      const { flags, options } = parseArgs(rest, ['since', 'timeout']);
+      if (!flags.has('wait')) {
+        const listing = await api('/api/chat', { since: options.get('since') });
+        out(listing);
+        return EXIT_OK;
+      }
+      // Pin "now" to a message id first, so nothing posted between two
+      // long polls slips through the gap. An id no log holds means "from the start".
+      const since = options.get('since') ?? (await api('/api/chat')).last ?? 'start-of-chat';
+      const seconds = options.has('timeout') ? Number(options.get('timeout')) : Infinity;
+      if (!(seconds > 0)) fail('--timeout takes seconds, e.g. --timeout 600', EXIT_USAGE);
+      const deadline = Date.now() + seconds * 1000;
+      for (;;) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          out({ chatCount: 0, messages: [], last: since, timedOut: true });
+          return EXIT_ERROR;
+        }
+        const result = await api('/api/chat', {
+          since, wait: '1', timeout: Math.min(25_000, Math.max(100, remaining)),
+        });
+        if (result.messages.length > 0) {
+          out(result);
+          return EXIT_OK;
+        }
+      }
+    }
+    case 'say': {
+      const { options, positional: rawPositional } = parseArgs(rest, ['slide']);
+      // `say . "text"` as the brief spells it for slide-agent: the deck is this folder.
+      const positional = rawPositional[0] === '.' ? rawPositional.slice(1) : rawPositional;
+      const text = positional.join(' ').trim();
+      if (!text) fail('usage: ./deck say "text" [--slide <id|number>]', EXIT_USAGE);
+      const message = await api('/api/chat', {}, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text, ...(options.has('slide') ? { slide: options.get('slide') } : {}) }),
+      });
+      out({ status: 'posted', id: message.id, message });
+      return EXIT_OK;
+    }
     case 'comments': {
-      const { flags, options } = parseArgs(rest, ['resolve', 'add', 'slide', 'element', 'author']);
+      const { flags, options } = parseArgs(rest, ['resolve', 'add', 'slide', 'element', 'author', 'reply']);
       if (options.has('resolve')) {
         const body = await api('/api/comments/resolve', {}, {
           method: 'POST', headers: { 'content-type': 'application/json' },
@@ -277,11 +347,21 @@ async function main(argv) {
         out({ status: 'applied', applied: true, live: true, resolved: options.get('resolve'), ...body });
         return EXIT_OK;
       }
+      if (options.has('add') && options.has('reply')) {
+        const comment = await api('/api/comments', {}, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            text: options.get('add'), author: options.get('author') ?? 'agent', parentId: options.get('reply'),
+          }),
+        });
+        out({ status: 'applied', applied: true, live: true, commentId: comment.id });
+        return EXIT_OK;
+      }
       if (options.has('add')) {
         const slideRef = options.get('slide');
         const elementId = options.get('element');
         if (Boolean(slideRef) === Boolean(elementId)) {
-          fail('comments --add needs exactly one of --slide <id|number> or --element <elementId>', EXIT_USAGE);
+          fail('comments --add needs --reply <commentId>, or exactly one of --slide <id|number> or --element <elementId>', EXIT_USAGE);
         }
         let slideId;
         if (slideRef) {

@@ -119,6 +119,15 @@ describe('resolveState', () => {
     expect(resolveState(slide, 0).playing.has('v')).toBe(true);
     expect(resolveState(slide, 1).playing.has('v')).toBe(false);
   });
+
+  it('removeClass takes away a class the element was authored with', () => {
+    const slide = slideWith([
+      { id: 't1', trigger: { on: 'click' }, action: { type: 'removeClass', target: 'a', value: 'frost' } },
+    ]);
+    slide.elements[0].class = ['glass', 'frost'];
+    expect([...resolveState(slide, 0).classes.get('a')!]).toEqual(['glass', 'frost']);
+    expect([...resolveState(slide, 1).classes.get('a')!]).toEqual(['glass']);
+  });
 });
 
 describe('deck navigation', () => {
@@ -136,6 +145,35 @@ describe('deck navigation', () => {
 
   it('steps back onto the fully-built state of the previous slide', () => {
     expect(prevCursor(slides, { slide: 1, step: 0 })).toEqual({ slide: 0, step: 1 });
+  });
+
+  it('steps back over emphasis steps to the last change on screen', () => {
+    const pulse = (id: string, target: string, on = 'click') => ({
+      id, trigger: { on }, action: { type: 'pulse', target, value: null },
+    });
+    // a appears, b appears, then two pulses: stepping back from the end
+    // lands before b's reveal, the first press that changes the picture.
+    const slide = slideWith([reveal('a'), reveal('b'), pulse('p1', 'a'), pulse('p2', 'b')]);
+    const deck = [slideWith([reveal('v')]), slide];
+    expect(prevCursor(deck, { slide: 1, step: 4 })).toEqual({ slide: 1, step: 1 });
+    expect(prevCursor(deck, { slide: 1, step: 3 })).toEqual({ slide: 1, step: 1 });
+    expect(prevCursor(deck, { slide: 1, step: 2 })).toEqual({ slide: 1, step: 1 });
+    expect(prevCursor(deck, { slide: 1, step: 1 })).toEqual({ slide: 1, step: 0 });
+    // A step that pulses and also reveals something changes the picture.
+    const mixed = slideWith([reveal('a'), pulse('p1', 'a'), reveal('b', 'withPrev')]);
+    expect(prevCursor([mixed], { slide: 0, step: 2 })).toEqual({ slide: 0, step: 1 });
+    // Nothing but emphasis so far: back goes to the previous slide.
+    const only = slideWith([pulse('p1', 'a'), pulse('p2', 'b')]);
+    expect(prevCursor([slideWith([reveal('v')]), only], { slide: 1, step: 2 })).toEqual({ slide: 0, step: 1 });
+    expect(prevCursor([only], { slide: 0, step: 2 })).toEqual({ slide: 0, step: 0 });
+  });
+
+  it('treats jiggle and pop as emphasis too', () => {
+    const act = (id: string, type: string, target: string) => ({
+      id, trigger: { on: 'click' }, action: { type, target, value: null },
+    });
+    const slide = slideWith([reveal('a'), act('j', 'jiggle', 'a'), act('p', 'pop', 'a')]);
+    expect(prevCursor([slide], { slide: 0, step: 3 })).toEqual({ slide: 0, step: 0 });
   });
 
   it('stops at the start of the deck', () => {

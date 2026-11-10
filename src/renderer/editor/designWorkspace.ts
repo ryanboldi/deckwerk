@@ -54,7 +54,6 @@ export class DesignWorkspace {
     const edit = barButton('Edit layouts…', () => this.openLayoutEditor(
       (this.deps.store.slide?.layout ?? 'freeform') as FixedLayout,
     ));
-    edit.classList.add('primary');
     header.append(copy, edit);
     this.previewGrid = document.createElement('div');
     this.previewGrid.className = 'design-preview-grid';
@@ -238,8 +237,8 @@ export class DesignWorkspace {
     const tools = document.createElement('div');
     tools.className = 'layout-editor-tools';
     tools.append(
-      barButton('Text', () => insertText(masterStore)),
-      createShapeInsertPicker(masterStore),
+      barButton('Text', () => masterCanvas.beginTextEdit(insertText(masterStore).id)),
+      createShapeInsertPicker(masterStore, { drawPath: () => masterCanvas.startPen() }),
       barButton('Duplicate', () => duplicateUnlocked(masterStore)),
       barButton('Delete', () => deleteUnlocked(masterStore)),
     );

@@ -17,7 +17,9 @@ import {
   rewriteAssetSrcs,
 } from '@shared/clipboard.js';
 import { importClipboardImageUrl, importImageSource } from './clipboardImageFetch.js';
+import { clipboardFilePaths, firstClipboardMediaPath } from '@shared/clipboardFiles.js';
 import type { ClipboardImageSource } from '@shared/clipboardImages.js';
+import { injectWebBridgeRuntime } from '@shared/webBridge.js';
 import { IPC } from '@shared/ipc.js';
 import type {
   AgentContextDraft,
@@ -53,8 +55,10 @@ import {
   derivedAssetPath,
   importAsset,
   importImageBuffer,
+  importWebPage,
   loadDeck,
   loadTheme,
+  originalAssetPath,
   resolveAsset,
   saveDeck,
   saveSpeakerNotes,
@@ -65,14 +69,18 @@ import { exportDeck } from './exportDeck.js';
 import { writeExportThumbnail } from './exportThumbnail.js';
 import { probeMedia, runTrim } from './ffmpeg.js';
 import { attachRendererHealth } from './windowHealth.js';
-import { POSTER_HOST, posterFor } from './posterCache.js';
+import { POSTER_HOST, posterFor, printStillFor } from './posterCache.js';
 import { showOpenDialog, showSaveDialog } from './dialogs.js';
 import { importKeynote } from './keynoteImport.js';
 import { importPowerPoint } from './pptxImport.js';
 import { loadDeckHistory, saveDeckHistory } from './deckHistoryStore.js';
 import { serializeSpeakerNotes, SPEAKER_NOTES_FILE } from '@shared/speakerNotes.js';
+import { originalDownloadName } from '@shared/media.js';
+import { copyFileStreamed } from './copyFileStreamed.js';
+import { closeRemoteDecks, registerRemoteDeckIpc, releaseRemoteMirror } from './remoteDeckIpc.js';
 import { HTML_EDIT_DIR, isAuthoringFileName, readSettledFile, writeHtmlScope } from './htmlAuthoring.js';
 import { AGENT_GUIDE_FILE, defaultLauncherPath, writeAgentGuide } from './agentGuide.js';
+import { replaceFileAtomically } from './agentRuntime.js';
 import {
   attachWindow,
   deckKeyFor,
@@ -108,6 +116,8 @@ import {
   shouldShowAudienceWindow,
   swappedPresentationDisplays,
 } from './presentationDisplays.js';
+import { registerDeckAssetIpc } from './deckAssetsIpc.js';
+import { registerUpdates } from './updates.js';
 
 /** Pick a loopback URL for the local bridge and a reachable URL for people. */
 function collaborationInviteUrl(urls: string[], deckId: string, agent = false): string | null {
@@ -310,6 +320,7 @@ function endBackgroundAgentSession(): Promise<void> {
 /** Give a window a document, and tell it which deck its assets now come from. */
 function setSession(state: DeckWindowState, dir: string, deck: Deck): DeckSession {
   const session: DeckSession = { dir, deck };
+  releaseRemoteMirror(state, dir);
   state.session = session;
   state.themeCss = null;
   state.lastSavedDeckJson = null;
@@ -406,6 +417,7 @@ function closeDocument(state: DeckWindowState): void {
     if (win && !win.isDestroyed()) win.close();
   }
   if (collabOwner === state) void endBackgroundAgentSession();
+  releaseRemoteMirror(state);
   forgetEditorWindow(state);
 }
 
@@ -591,6 +603,12 @@ app.whenReady().then(async () => {
 
   installAssetProtocol();
   registerHandlers();
+  registerUpdates({
+    editorWindows: () => editorStates().map((state) => state.editor),
+    presenting: () => editorStates().some((state) => state.present !== null && !state.present.isDestroyed()),
+    // A background agent session reconnects by itself; people do not.
+    sharing: () => collabServer !== null && collabMode !== 'agent-background',
+  });
 
   const initial = deckDirFromArgv();
   const deck = initial
@@ -638,9 +656,13 @@ app.on('before-quit', () => {
   for (const state of editorStates()) void state.agentRuntime.close();
   localAgents.close();
   void collabServer?.close();
+  void closeRemoteDecks();
 });
 
 function registerHandlers(): void {
+  // The Media library: list the deck's assets, move unused ones to the Trash.
+  registerDeckAssetIpc(requireSession);
+  registerRemoteDeckIpc({ requireOwner, requireSession, reportOperation, openDeckForRequester });
   ipcMain.handle(IPC.deckNew, async (event, operationId?: string): Promise<DeckSession | null> => {
     const res = await showSaveDialog({
       title: 'New deck',
@@ -746,6 +768,16 @@ function registerHandlers(): void {
     },
   );
 
+  // A still of the asking window, for the colour picker's eyedropper: Electron
+  // has no EyeDropper, so the renderer samples (and magnifies) this instead.
+  ipcMain.handle(IPC.windowCapture, async (event): Promise<string | null> => {
+    try {
+      return (await event.sender.capturePage()).toDataURL();
+    } catch {
+      return null;
+    }
+  });
+
   ipcMain.handle(IPC.deckSaveAs, async (event, operationId?: string): Promise<DeckSession | null> => {
     const s = requireSession(event);
     const target = await showSaveDialog({
@@ -810,14 +842,16 @@ function registerHandlers(): void {
     if (target !== editDir && !target.startsWith(editDir + sep)) {
       throw new Error(`Refusing to write outside ${editDir}: ${target}`);
     }
-    const { readFile, writeFile } = await import('node:fs/promises');
+    const { readFile } = await import('node:fs/promises');
     // The author may have saved again while the compile ran; stamping ids onto
     // *those* contents is the next compile's job, not a reason to lose them.
     const current = await readFile(target, 'utf8').catch(() => null);
     if (current !== expected) return;
     // Our own write; the watcher event it fires is an echo, not an edit.
     requireOwner(event).lastWrittenHtml.set(target, contents);
-    await writeFile(target, contents, 'utf8');
+    // Replaced, not written in place: an agent reading its page meanwhile
+    // would otherwise find it empty.
+    await replaceFileAtomically(target, contents);
   });
 
   ipcMain.handle(
@@ -846,6 +880,25 @@ function registerHandlers(): void {
       return out;
     },
   );
+
+  /** Files a file manager's Copy left on the pasteboard, in each OS's format. */
+  const readClipboardFilePaths = (): string[] => {
+    const read = (format: string): string => {
+      try {
+        return clipboard.readBuffer(format).toString(format === 'FileNameW' ? 'utf16le' : 'utf8');
+      } catch {
+        return '';
+      }
+    };
+    if (process.platform === 'win32') {
+      const path = read('FileNameW').replace(/\0+$/, '');
+      return path ? [path] : [];
+    }
+    const lists = process.platform === 'darwin'
+      ? [read('public.file-url')]
+      : [read('text/uri-list'), read('x-special/gnome-copied-files')];
+    return lists.map((list) => clipboardFilePaths(list)).find((paths) => paths.length > 0) ?? [];
+  };
 
   // Copy: serialise the fragment onto the OS pasteboard under a private
   // format, with absolute asset paths attached, so any instance of this app —
@@ -880,6 +933,14 @@ function registerHandlers(): void {
       // copied cells wants cells.
       if (/<table\b/i.test(html)) {
         return { kind: 'external-html', html, text };
+      }
+      // A file copied in the file manager: the pasteboard holds only its
+      // path (and, from Finder, the file's icon as a bitmap, which must not
+      // win). Import the file itself, video included.
+      const copiedFile = firstClipboardMediaPath(readClipboardFilePaths());
+      if (copiedFile) {
+        const asset = await importAsset(requireSession(event).dir, copiedFile);
+        return { kind: 'external-image', asset };
       }
       const image = clipboard.readImage();
       if (!image.isEmpty()) {
@@ -928,7 +989,11 @@ function registerHandlers(): void {
         // Foreign-shaped src; fall through to import.
       }
       try {
-        const imported = await importAsset(s.dir, asset.absPath);
+        // A web element's page is a document, not media: importAsset
+        // refuses it, and it belongs under assets/web/.
+        const imported = /^assets\/web\/[^/]+\.x?html?$/i.test(asset.src)
+          ? await importWebPage(s.dir, asset.absPath, injectWebBridgeRuntime)
+          : await importAsset(s.dir, asset.absPath);
         map.set(asset.src, imported.src);
       } catch (err) {
         // Source deck gone since the copy. The element still pastes; its
@@ -952,6 +1017,27 @@ function registerHandlers(): void {
   ipcMain.handle(IPC.assetProbe, async (event, src: string) => {
     const s = requireSession(event);
     return probeMedia(resolveAsset(s.dir, src));
+  });
+
+  // "Download original…": the file the author dropped, not the PNG or H.264
+  // copy the slide shows, and never cropped or masked — those are display.
+  ipcMain.handle(IPC.assetSaveOriginal, async (
+    event,
+    src: string,
+    operationId?: string,
+  ): Promise<string | null> => {
+    const s = requireSession(event);
+    const original = originalAssetPath(s.dir, src);
+    const name = originalDownloadName(original);
+    const target = await showSaveDialog({
+      title: 'Download original',
+      buttonLabel: 'Save',
+      defaultPath: name,
+    });
+    if (target.canceled || !target.filePath) return null;
+    reportOperation(event, operationId, `Copying ${name} to ${basename(target.filePath)}`);
+    await copyFileStreamed(original, target.filePath);
+    return target.filePath;
   });
 
   ipcMain.handle(IPC.displayList, () => {
@@ -1033,7 +1119,15 @@ function registerHandlers(): void {
       ? openSpeakerWindow(state, presenterDisplay.id, false)
       : null;
     audience.on('closed', () => {
-      if (state.present === audience) state.present = null;
+      if (state.present === audience) {
+        state.present = null;
+        // Leaving the show lands the editor where the show was, not where it
+        // started.
+        const ended = state.presentationState?.cursor.slide;
+        if (ended !== undefined && !state.editor.isDestroyed()) {
+          state.editor.webContents.send(IPC.presentEnded, ended);
+        }
+      }
       state.presentationDisplays = null;
       if (state.presenter && !state.presenter.isDestroyed()) state.presenter.close();
     });
@@ -1057,6 +1151,12 @@ function registerHandlers(): void {
     if (!state) return;
     state.presentationState = presentation;
     state.presenter?.webContents.send(IPC.presentState, presentation);
+  });
+  ipcMain.on(IPC.presentNotesEdit, (event, edit: { slideId: string; notes: string }) => {
+    const state = ownerOf(event.sender);
+    if (!state || event.sender !== state.presenter?.webContents) return;
+    if (typeof edit?.slideId !== 'string' || typeof edit.notes !== 'string') return;
+    if (!state.editor.isDestroyed()) state.editor.webContents.send(IPC.presentNotesEdit, edit);
   });
 
   ipcMain.handle(IPC.trimOpen, (event, payload: { src: string; elementId: string }) => {
@@ -1396,7 +1496,7 @@ function registerHandlers(): void {
   ipcMain.handle(IPC.videoPoster, async (event, req: VideoPosterRequest): Promise<VideoPosterResult> => {
     const s = requireSession(event);
     const input = resolveAsset(s.dir, req.src);
-    const name = await posterFor(input, req.time);
+    const name = await (req.print ? printStillFor : posterFor)(input, req.time);
     return { url: name ? `deck://${POSTER_HOST}/${encodeURIComponent(name)}` : null };
   });
 

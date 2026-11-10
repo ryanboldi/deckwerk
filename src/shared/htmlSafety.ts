@@ -24,6 +24,9 @@ export function sanitizeAuthoredHtml(source: string): {
   };
 
   for (const node of document.querySelectorAll('script, object, embed, iframe')) {
+    // A section's timeline block is JSON in a script of a type no browser
+    // runs: data the compile reads, kept only in exactly that form.
+    if (isTimelineBlock(node)) continue;
     report.removedScripts += 1;
     node.remove();
   }
@@ -73,6 +76,32 @@ export function sanitizeAuthoredHtml(source: string): {
 
   const doctype = document.doctype ? '<!doctype html>\n' : '';
   return { html: doctype + document.documentElement.outerHTML, report };
+}
+
+/**
+ * The textual counterpart of `sanitizeAuthoredHtml`'s script removal, for
+ * the collab server, which has no DOM: every script goes except a timeline
+ * block in exactly its exported form. The export writes `<` inside the block
+ * as `\u003c`, so a block holding any `<` is refused — a browser also ends a
+ * script at `</script/` or `</script ` where this match does not, and
+ * whatever followed such an early close would otherwise survive inside it.
+ */
+export function stripScriptsKeepingTimeline(source: string): string {
+  const open = '<script type="application/deckwerk-timeline">';
+  return source.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, (script) => (
+    script.startsWith(open) && !script.slice(open.length, script.lastIndexOf('</')).includes('<') ? script : ''
+  ));
+}
+
+/**
+ * `<script type="application/deckwerk-timeline">` and nothing else on the
+ * tag: a section's timeline as JSON (`htmlSlides.ts`), which no browser
+ * executes.
+ */
+function isTimelineBlock(node: Element): boolean {
+  return node.tagName.toLowerCase() === 'script'
+    && node.attributes.length === 1
+    && node.getAttribute('type') === 'application/deckwerk-timeline';
 }
 
 /**
@@ -153,12 +182,24 @@ const TAG_FORMAT_STYLES: Record<string, Array<[string, string]>> = {
   I: [['font-style', 'italic']],
   EM: [['font-style', 'italic']],
   U: [['text-decoration-line', 'underline']],
+  S: [['text-decoration-line', 'line-through']],
+  STRIKE: [['text-decoration-line', 'line-through']],
+  DEL: [['text-decoration-line', 'line-through']],
   // A superscript is raised *and* shrunk. Keeping only the baseline shift
   // would paste a full-size character sitting above the line, which reads as
   // a layout bug rather than as a superscript.
   SUP: [['vertical-align', 'super'], ['font-size', BASELINE_RUN_FONT_SIZE]],
   SUB: [['vertical-align', 'sub'], ['font-size', BASELINE_RUN_FONT_SIZE]],
 };
+
+/**
+ * A paragraph's own line spacing, as the Line spacing control writes it: a
+ * unitless ratio on a block. What Chromium copies when it restructures blocks
+ * is the computed value, which is always a length, and lands on runs too.
+ */
+function isLineSpacing(node: HTMLElement): boolean {
+  return node.matches('p, li, div') && /^\d*\.?\d+$/.test(node.style.lineHeight.trim());
+}
 
 /**
  * Drop the box-level declarations (see PASTE_LAYOUT_PROPERTIES) from every
@@ -170,16 +211,51 @@ const TAG_FORMAT_STYLES: Record<string, Array<[string, string]>> = {
  * hanging indent turns up as `text-indent: -1.4em` on an inline run. Node
  * identity is preserved (styles are edited, wrappers replaced by their own
  * children), so a live caret inside the text stays where it was.
+ *
+ * `keepLineSpacing` keeps a paragraph's own line spacing (see isLineSpacing):
+ * a Return in a paragraph with spacing 1.6 makes another one with spacing 1.6,
+ * and that is the author's, not Chromium's. Paste keeps none of it.
  */
-export function stripLayoutDeclarations(root: ParentNode): boolean {
+export function stripLayoutDeclarations(
+  root: ParentNode,
+  options: { keepLineSpacing?: boolean } = {},
+): boolean {
   let changed = false;
   for (const node of [...root.querySelectorAll<HTMLElement>('[style]')]) {
     if (node.matches(PASTE_LAYOUT_KEPT) || !node.style) continue;
     for (const property of PASTE_LAYOUT_PROPERTIES) {
       if (!node.style.getPropertyValue(property)) continue;
+      if (options.keepLineSpacing && property === 'line-height' && isLineSpacing(node)) continue;
       node.style.removeProperty(property);
       changed = true;
     }
+    if (node.getAttribute('style')?.trim()) continue;
+    node.removeAttribute('style');
+    if (node.tagName === 'SPAN' && node.attributes.length === 0) node.replaceWith(...node.childNodes);
+  }
+  return changed;
+}
+
+/**
+ * Drop the size auto-fit wrote on a box (`fitted`, the `font-size` on its
+ * `.text-content`) wherever a run below `root` repeats it, and unwrap a span
+ * that has nothing left to say.
+ *
+ * Chromium's block joins wrap the text they move in the computed style it had,
+ * and in an auto-fit box that includes the fitted size: Backspace at the start
+ * of a paragraph left the joined text at `font-size: 13.8px` while the box
+ * fitted itself to 16.5px, and saved it so. No author writes the exact
+ * fitted size, so a run that repeats it is the fit baked in by a join.
+ */
+export function stripFittedFontSize(root: ParentNode, fitted: string): boolean {
+  const size = Number.parseFloat(fitted);
+  if (!Number.isFinite(size) || !fitted.trim().endsWith('px')) return false;
+  let changed = false;
+  for (const node of [...root.querySelectorAll<HTMLElement>('[style]')]) {
+    const own = node.style.getPropertyValue('font-size').trim();
+    if (!own.endsWith('px') || Math.abs(Number.parseFloat(own) - size) > 0.05) continue;
+    node.style.removeProperty('font-size');
+    changed = true;
     if (node.getAttribute('style')?.trim()) continue;
     node.removeAttribute('style');
     if (node.tagName === 'SPAN' && node.attributes.length === 0) node.replaceWith(...node.childNodes);
@@ -217,6 +293,140 @@ export function restoreKatexSourceHtml(html: string): string {
   return template.innerHTML;
 }
 
+/**
+ * Drop solid backgrounds from pasted runs of text.
+ *
+ * Copying styled text makes Chromium write the background of the nearest
+ * painted ancestor onto the copied run: the editor's own tint on a box being
+ * edited, or the fill of the text box it came from. Pasted, that becomes a
+ * coloured slab behind the words inside another box. The editor has no
+ * run-level highlight to preserve, and a box's fill belongs to the box, so a
+ * pasted run keeps its colour and type but never a background. Gradient text
+ * (a background clipped to the glyphs) is paint of the letters and stays.
+ */
+function stripRunBackgrounds(root: DocumentFragment): void {
+  for (const node of [...root.querySelectorAll<HTMLElement>('[style*="background"]')].reverse()) {
+    const clip = node.style.getPropertyValue('background-clip')
+      || node.style.getPropertyValue('-webkit-background-clip');
+    if (/text/i.test(clip)) continue;
+    node.style.removeProperty('background-color');
+    const shorthand = node.style.getPropertyValue('background');
+    if (shorthand && !/gradient\(|url\(/i.test(shorthand)) node.style.removeProperty('background');
+    if (node.getAttribute('style')?.trim()) continue;
+    node.removeAttribute('style');
+    if (node.tagName === 'SPAN' && node.attributes.length === 0) node.replaceWith(...node.childNodes);
+  }
+}
+
+/**
+ * The longest `data:` URI an image inside text html may keep -- room for an
+ * inline icon or emoji, not for a photograph or a video.
+ *
+ * Text html is stored in deck.json and resent to every collaborator on every
+ * edit of its box. A clipboard holding `<img src="data:video/mp4;base64,...">`
+ * (10 MB) once landed in a slide title's html and made the deck 13.5 MB;
+ * every collaborator's editor crawled. Real media belongs in a media element,
+ * whose bytes live in `assets/`.
+ */
+export const INLINE_TEXT_DATA_URI_LIMIT = 64 * 1024;
+
+/** Elements whose only job is to show media, removed whole when their source is refused. */
+const TEXT_MEDIA_ELEMENTS = new Set([
+  'img', 'video', 'audio', 'source', 'track', 'picture', 'object', 'embed', 'image', 'iframe',
+]);
+const TEXT_MEDIA_URL_ATTRIBUTES = ['src', 'href', 'xlink:href', 'poster', 'srcset', 'data', 'background'];
+
+/** A `data:` URI that may not live in text html: not an image, or too large. */
+function refusedTextDataUri(uri: string): boolean {
+  const mime = /^data:([^;,]*)/i.exec(uri)?.[1]?.trim().toLowerCase() ?? '';
+  return !mime.startsWith('image/') || uri.length > INLINE_TEXT_DATA_URI_LIMIT;
+}
+
+/** Whether a value holds any refused `data:` URI (srcset and url() can hold several). */
+function refusesAnyDataUri(value: string): boolean {
+  if (!/data:/i.test(value)) return false;
+  // A URI runs to the next quote, bracket or whitespace (base64 has none).
+  const uris = value.match(/data:[^\s'")]*/gi) ?? [];
+  return uris.some(refusedTextDataUri);
+}
+
+/**
+ * Remove media bytes from text html, in place: any `data:` URI that is not an
+ * image, or is an image over `INLINE_TEXT_DATA_URI_LIMIT`, in a source
+ * attribute, a `srcset` or a style `url()`. An element that exists only to
+ * show that media (`img`, `video`, SVG `image`, ...) goes with it; anything
+ * else just loses the attribute or declaration. Small inline images, links,
+ * KaTeX, lists and tables are untouched. Returns whether anything changed.
+ *
+ * This is the backstop under every way text html is produced -- paste, drop,
+ * execCommand, a remote edit adopted into the DOM -- so it stays cheap on
+ * ordinary text: it only looks closer at markup that mentions `data:`.
+ */
+export function stripTextMediaPayloads(root: ParentNode): boolean {
+  let changed = false;
+  for (const node of [...root.querySelectorAll<Element>('*')]) {
+    // Already gone with a removed ancestor.
+    if (!node.parentNode) continue;
+    const tag = node.localName.toLowerCase();
+    let removed = false;
+    for (const name of TEXT_MEDIA_URL_ATTRIBUTES) {
+      const value = node.getAttribute(name);
+      if (value === null || !refusesAnyDataUri(value)) continue;
+      changed = true;
+      if (TEXT_MEDIA_ELEMENTS.has(tag) && name !== 'poster') {
+        node.remove();
+        removed = true;
+        break;
+      }
+      node.removeAttribute(name);
+    }
+    if (removed) continue;
+    const style = node.getAttribute('style');
+    if (style === null || !refusesAnyDataUri(style)) continue;
+    changed = true;
+    const declarations = (node as HTMLElement).style;
+    if (declarations) {
+      for (let index = declarations.length - 1; index >= 0; index -= 1) {
+        const property = declarations.item(index);
+        if (refusesAnyDataUri(declarations.getPropertyValue(property))) declarations.removeProperty(property);
+      }
+    }
+    // A declaration the CSS parser could not take apart goes with the attribute.
+    const left = node.getAttribute('style') ?? '';
+    if (!left.trim() || refusesAnyDataUri(left)) node.removeAttribute('style');
+  }
+  return changed;
+}
+
+/** What counts as media on a clipboard about to be pasted into text. */
+const PASTED_MEDIA = 'img, video, audio, picture, object, embed, image';
+
+/**
+ * Whether clipboard markup carries media (an image, video, audio, an embed,
+ * an SVG `<image>`) beside -- or instead of -- its text. KaTeX's render tree
+ * draws some glyphs with inline SVG; that is maths, not media, and it is
+ * recovered as TeX before anything is looked at.
+ */
+export function pastedHtmlHasMedia(html: string): boolean {
+  if (!/<(?:img|video|audio|picture|object|embed|image)\b/i.test(html)) return false;
+  const template = document.createElement('template');
+  template.innerHTML = restoreKatexSourceHtml(html);
+  return template.content.querySelector(PASTED_MEDIA) !== null;
+}
+
+/**
+ * Clipboard markup reduced to what a text box takes when the clipboard also
+ * carried media: the sanitized text -- runs, links, lists, tables, maths --
+ * with every picture, video, embed and drawing left out.
+ */
+export function textOnlyPastedHtml(html: string): string {
+  const template = document.createElement('template');
+  template.innerHTML = sanitizePastedTextHtml(html);
+  template.content.querySelectorAll(`${PASTED_MEDIA}, source, track, svg, canvas, iframe`)
+    .forEach((node) => node.remove());
+  return template.innerHTML;
+}
+
 export function sanitizePastedTextHtml(html: string): string {
   const template = document.createElement('template');
   // Copying rendered maths from the canvas puts KaTeX's generated render tree
@@ -241,7 +451,7 @@ export function sanitizePastedTextHtml(html: string): string {
   // (<strong><span style="font-weight:400">…) that no toggle could clean up.
   // Convert the tag dialect to the span dialect on the way in.
   for (const node of [...root.querySelectorAll<HTMLElement>(
-    'b, strong, i, em, u, sup, sub',
+    'b, strong, i, em, u, s, strike, del, sup, sub',
   )].reverse()) {
     const declarations = TAG_FORMAT_STYLES[node.tagName]!;
     const span = document.createElement('span');
@@ -253,6 +463,22 @@ export function sanitizePastedTextHtml(html: string): string {
     }
     span.append(...node.childNodes);
     node.replaceWith(span);
+  }
+  // `<u><s>both</s></u>` paints both lines, but as two spans the inner one's
+  // `text-decoration-line` would win once the editor merges nested runs, and
+  // one line would be lost. A run carries every line painted around it.
+  for (const node of root.querySelectorAll<HTMLElement>('[style*="text-decoration-line"]')) {
+    const own = node.style.getPropertyValue('text-decoration-line');
+    if (!own || own === 'none') continue;
+    const lines = new Set(own.split(/\s+/));
+    for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+      const painted = parent.style.getPropertyValue('text-decoration-line')
+        || parent.style.getPropertyValue('text-decoration');
+      for (const word of painted.split(/\s+/)) {
+        if (/^(?:underline|overline|line-through)$/.test(word)) lines.add(word);
+      }
+    }
+    node.style.setProperty('text-decoration-line', [...lines].join(' '));
   }
   // Word's pseudo-lists arrive as MsoListParagraph paragraphs whose "bullet"
   // is a literal glyph in the text. Strip the fake marker and the vendor
@@ -283,6 +509,7 @@ export function sanitizePastedTextHtml(html: string): string {
     if (!node.getAttribute('style')?.trim()) node.removeAttribute('style');
   }
   stripLayoutDeclarations(root);
+  stripRunBackgrounds(root);
   for (const node of root.querySelectorAll<HTMLElement>('*')) {
     for (const attribute of [...node.attributes]) {
       const name = attribute.name.toLowerCase();
@@ -299,5 +526,7 @@ export function sanitizePastedTextHtml(html: string): string {
       if (node.tagName === 'IMG') node.remove();
     }
   }
+  // Inline image bytes are kept above; media bytes are not.
+  stripTextMediaPayloads(root);
   return template.innerHTML;
 }

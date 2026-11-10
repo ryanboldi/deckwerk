@@ -1,4 +1,5 @@
 import {
+  LIST_HOLDER_ATTRIBUTE,
   LIST_MARKER_COLOR_ATTRIBUTE,
   LIST_MARKER_COLOR_PROPERTY,
 } from '@shared/paragraphs.js';
@@ -149,6 +150,24 @@ export function unbulletListItems(items: HTMLElement[]): HTMLElement[] {
     let number = Number.isFinite(declared) && declared > 0 ? declared : 1;
     const fragment = doc.createDocumentFragment();
     let chunk: HTMLElement | null = null;
+    // Whether the item just before was one being freed. No chunk is open at
+    // the start of the list either, and a sub-list there was freed with
+    // nothing: it stays where it is.
+    let afterFreed = false;
+    const free = (nestedList: Element) => {
+      for (const nested of [...nestedList.children] as HTMLElement[]) {
+        if (nested.tagName === 'LI') {
+          for (const paragraph of listItemParagraphs(nested)) {
+            fragment.appendChild(paragraph);
+            inserted.push(paragraph);
+          }
+        } else if (LIST_TAGS.test(nested.tagName)) {
+          // Chromium's indent nests stray lists inside stray lists; dropping
+          // the deeper one dropped its text with it (list fuzz seed 20261014).
+          free(nested);
+        }
+      }
+    };
     const newChunk = (): HTMLElement => {
       const next = doc.createElement(list.tagName.toLowerCase());
       for (const attr of [...list.attributes]) {
@@ -164,6 +183,7 @@ export function unbulletListItems(items: HTMLElement[]): HTMLElement[] {
       if (el && group.has(el)) {
         // The next kept item starts a new list after the gap.
         chunk = null;
+        afterFreed = true;
         for (const paragraph of listItemParagraphs(el)) {
           fragment.appendChild(paragraph);
           inserted.push(paragraph);
@@ -174,23 +194,18 @@ export function unbulletListItems(items: HTMLElement[]): HTMLElement[] {
         if (!chunk) chunk = newChunk();
         chunk.appendChild(el);
         number += 1;
+        afterFreed = false;
         continue;
       }
       if (el && LIST_TAGS.test(el.tagName)) {
         // A sub-list Chromium wrote as a sibling of a list's items belongs to
         // the item before it. That item keeps it — unless the item was the one
         // being freed, in which case its sub-items are freed with it.
-        if (chunk) {
-          chunk.appendChild(el);
-        } else {
-          for (const nested of [...el.children] as HTMLElement[]) {
-            if (nested.tagName !== 'LI') continue;
-            for (const paragraph of listItemParagraphs(nested)) {
-              fragment.appendChild(paragraph);
-              inserted.push(paragraph);
-            }
-          }
+        if (afterFreed) {
+          free(el);
           el.remove();
+        } else {
+          (chunk ??= newChunk()).appendChild(el);
         }
         continue;
       }
@@ -270,6 +285,9 @@ export function outdentListItem(item: HTMLElement): boolean {
   if (host.tagName === 'LI') host.after(item);
   else list.after(item);
   if (list.childElementCount === 0) list.remove();
+  // The item that only held the indented first item holds nothing now; left
+  // behind, it is an empty bullet above the item just outdented.
+  if (host.hasAttribute(LIST_HOLDER_ATTRIBUTE) && host.children.length === 0) host.remove();
   return true;
 }
 
@@ -340,9 +358,11 @@ export function mergeParagraphIntoList(
  * (created if it has none), or into the sub-list Chromium's indent left as
  * the item's *sibling*. A sub-list that followed the item in that sibling
  * shape belongs to it and moves with it, one level deeper and still beside
- * it. The first item of a list has nothing to hang under; it is wrapped in a
- * sub-list of its own, the shape Chromium writes for the same gesture, which
- * normalisation repairs on the way to the deck.
+ * it. The first item of a list has nothing to hang under; it hangs in a
+ * sub-list held by an item of its own (`LIST_HOLDER_ATTRIBUTE`), which draws
+ * no line. That is the shape the deck stores it in: built here as Chromium
+ * builds it, a bare sub-list in the list, it showed no marker while editing
+ * and grew an empty bullet when normalisation gave it an item on the way out.
  *
  * This replaces `execCommand('indent')`, whose handling of a *selection* was
  * Chromium's own: two items at different levels indented together came back
@@ -366,8 +386,11 @@ export function indentListItem(item: HTMLElement): boolean {
   const previous = item.previousElementSibling;
   let target: HTMLElement;
   if (!previous) {
+    const holder = doc.createElement('li');
+    holder.setAttribute(LIST_HOLDER_ATTRIBUTE, '');
     target = newList();
-    list.insertBefore(target, item);
+    holder.appendChild(target);
+    list.insertBefore(holder, item);
   } else if (LIST_TAGS.test(previous.tagName)) {
     target = previous as HTMLElement;
   } else if (previous.tagName === 'LI') {
@@ -396,4 +419,120 @@ export function parentListItem(item: HTMLElement): HTMLElement | null {
   if (host?.tagName === 'LI') return host;
   const before = list.previousElementSibling;
   return before?.tagName === 'LI' ? before as HTMLElement : null;
+}
+
+/** Blocks that are a line of their own; a table cell's lines are its own business. */
+const LINE_BLOCKS = 'li, p, div, h1, h2, h3, h4, h5, h6, blockquote, pre';
+
+/**
+ * Delete what a selection covers when it runs from one line into another,
+ * joining the two ends into one line: the line the selection started on,
+ * holding the rest of the line it ended on. That is what erasing or typing
+ * over such a selection means. Chromium's own deletion left the two ends on
+ * two lines when the selection crossed a line between two lists -- an empty
+ * bullet, or the typed letter, above the rest (list fuzz seed 20261023) --
+ * and between paragraphs it can leave the words loose at the top of the box,
+ * or wrap them in the fitted size of an auto-fit box (seed 2026101901).
+ *
+ * Returns the collapsed caret at the join, or null when the selection is not
+ * such a range (inside one line, in a table, or from an item into its own
+ * sub-item), which Chromium handles.
+ */
+export function deleteAcrossLines(body: HTMLElement, range: Range): Range | null {
+  if (range.collapsed) return null;
+  const lineOf = (node: Node): HTMLElement | null => {
+    const element = node instanceof Element ? node : node.parentElement;
+    const line = element?.closest<HTMLElement>(LINE_BLOCKS) ?? null;
+    return line && body.contains(line) && line !== body ? line : null;
+  };
+  const start = lineOf(range.startContainer);
+  const end = lineOf(range.endContainer);
+  if (!start || !end || start === end || start.contains(end) || end.contains(start)) return null;
+  if (start.closest('td, th') || end.closest('td, th')) return null;
+  const endParent = end.parentElement;
+  range.deleteContents();
+  // What is left of the end line joins the start line's own text, ahead of
+  // any sub-list the start line holds; the end line's sub-items become its.
+  const ownEnd = (line: HTMLElement): Node | null => (
+    [...line.childNodes].find((node) => node instanceof Element && LIST_TAGS.test(node.tagName)) ?? null
+  );
+  const lists = [...end.childNodes]
+    .filter((node) => node instanceof Element && LIST_TAGS.test(node.tagName));
+  const words = [...end.childNodes].filter((node) => !lists.includes(node))
+    .filter((node) => !(node instanceof HTMLElement && node.tagName === 'BR'));
+  const before = ownEnd(start);
+  // The `<br>` that held an emptied start line open must not stay between.
+  for (const node of [...start.childNodes]) {
+    if (node instanceof HTMLElement && node.tagName === 'BR' && node.nextSibling === before) node.remove();
+  }
+  const caret = start.ownerDocument.createRange();
+  const joinAt = before ? [...start.childNodes].indexOf(before as ChildNode) : start.childNodes.length;
+  const last = start.childNodes[joinAt - 1];
+  if (last instanceof Text) caret.setStart(last, last.data.length);
+  else caret.setStart(start, joinAt);
+  for (const node of words) start.insertBefore(node, before);
+  // A paragraph holds no list; the sub-items go on right after it.
+  if (start.tagName === 'LI') start.append(...lists);
+  else start.after(...lists);
+  end.remove();
+  if ((start.textContent ?? '') === '' && !start.querySelector('img, video, svg, embed, ul, ol')) {
+    start.replaceChildren(start.ownerDocument.createElement('br'));
+    caret.setStart(start, 0);
+  }
+  // Lists the deletion emptied go, up to the first one still holding items.
+  for (let node: HTMLElement | null = endParent; node && node !== body && body.contains(node);) {
+    const parent: HTMLElement | null = node.parentElement;
+    const empty = LIST_TAGS.test(node.tagName)
+      ? node.querySelector('li') === null
+      : node.tagName === 'LI' && node.hasAttribute(LIST_HOLDER_ATTRIBUTE) && node.children.length === 0;
+    if (!empty) break;
+    node.remove();
+    node = parent;
+  }
+  caret.collapse(true);
+  return caret;
+}
+
+/**
+ * Settle the items a deletion emptied. An item left holding nothing but
+ * sub-lists has lost its line -- forward Delete pulled its words up into the
+ * line above (list fuzz seeds 2026101901, 2026102101) -- and drew an empty
+ * bullet where that line had been: it becomes a holder, so its sub-items stay
+ * where they are. The one exception is the item the caret is in, which the
+ * author emptied and is still writing in. Holders and lists left with
+ * nothing at all go. Returns whether anything changed.
+ */
+export function settleEmptiedItems(body: HTMLElement, caret: Node | null): boolean {
+  let changed = false;
+  for (let again = true; again;) {
+    again = false;
+    for (const node of [...body.querySelectorAll<HTMLElement>('ul, ol, li')]) {
+      if (!body.contains(node)) continue;
+      const lost = LIST_TAGS.test(node.tagName)
+        ? node.querySelector('li') === null && (node.textContent ?? '') === ''
+        : node.hasAttribute(LIST_HOLDER_ATTRIBUTE) && node.children.length === 0
+          && (node.textContent ?? '').trim() === '';
+      if (lost) {
+        node.remove();
+        changed = again = true;
+      }
+    }
+  }
+  for (const item of [...body.querySelectorAll<HTMLElement>('li:not([data-list-holder])')]) {
+    const own = [...item.childNodes]
+      .filter((node) => !(node instanceof Element && LIST_TAGS.test(node.tagName)));
+    if (own.length === item.childNodes.length) continue;
+    const empty = own.every((node) => node instanceof Text
+      ? node.data.replace(/[\s​⁠]+/g, '') === ''
+      : node instanceof HTMLElement && !node.querySelector('br, img, video, svg, embed')
+        && node.tagName !== 'BR' && (node.textContent ?? '').replace(/[\s​⁠]+/g, '') === '');
+    if (!empty) continue;
+    const holdsCaret = caret !== null && (caret === item
+      || own.some((node) => node === caret || node.contains(caret)));
+    if (holdsCaret) continue;
+    for (const node of own) node.remove();
+    item.setAttribute(LIST_HOLDER_ATTRIBUTE, '');
+    changed = true;
+  }
+  return changed;
 }

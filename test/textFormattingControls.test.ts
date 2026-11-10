@@ -1,11 +1,16 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { emptyDeck, type Deck, type SlideElement } from '../src/shared/deck.js';
 import { defaultLayoutMasters } from '../src/shared/layoutMasters.js';
 import { applySlideLayout } from '../src/renderer/editor/slideLayouts.js';
 import { EditorCanvas } from '../src/renderer/editor/canvas.js';
 import { Inspector } from '../src/renderer/editor/inspector.js';
-import { wireCanvasInspector } from '../src/renderer/editor/shellWiring.js';
+import {
+  bindEditorKeys,
+  wireCanvasInspector,
+  type ClipboardActions,
+  type ShellDeps,
+} from '../src/renderer/editor/shellWiring.js';
 import { EditorStore } from '../src/renderer/editor/store.js';
 import { closePopover } from '../src/renderer/editor/ui.js';
 import {
@@ -210,6 +215,20 @@ describe('text formatting from the inspector controls', () => {
     document.body.replaceChildren();
   });
 
+  it('sizes a box to its text from the inspector, turning auto-fit off with it', () => {
+    const { store, inspectorHost } = setup([textElement('text-1', { autoFit: true })]);
+    const toggle = () => field(inspectorHost, 'Size box to text')
+      .querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    expect(toggle().checked).toBe(false);
+
+    toggle().click();
+    expect(store.slide!.elements[0]).toMatchObject({ autoSize: true, autoFit: false });
+    expect(toggle().checked).toBe(true);
+
+    toggle().click();
+    expect(store.slide!.elements[0]).not.toHaveProperty('autoSize');
+  });
+
   it('keeps the exhaustive formatting matrix synchronized with the shipped text and table controls', () => {
     const normal = setup([textElement('text-1', { html: '<p>First</p><p>Second</p>' })]);
     normal.canvas.beginTextEdit('text-1');
@@ -220,11 +239,12 @@ describe('text formatting from the inspector controls', () => {
       'Role', 'Font family', 'Font size', 'Font weight', 'Style', 'Colour',
     ]);
     expect(labels('.text-layout-options .field > span')).toEqual([
-      'Auto-fit text to box', 'Disable automatic line breaks', 'List',
-      'Align', 'Vertical', 'Paragraph spacing',
+      'Size box to text', 'Auto-fit text to box', 'Disable automatic line breaks', 'List',
+      'Indent', 'Align', 'Vertical', 'Paragraph spacing', 'Line spacing',
     ]);
-    expect(labels('.text-format-buttons button')).toEqual(['B', 'I', 'U', 'x²', 'x₂']);
-    expect(labels('.number-step-buttons button')).toEqual(['▲', '▼', '▲', '▼', '▲', '▼']);
+    expect(labels('.text-format-buttons button')).toEqual(['B', 'I', 'U', 'S', 'x²', 'x₂']);
+    expect(labels('.number-step-buttons button'))
+      .toEqual(['▲', '▼', '▲', '▼', '▲', '▼', '▲', '▼']);
 
     const table = setup([textElement('table-1', {
       html: '<table><tbody><tr><td>A</td><td>B</td></tr>'
@@ -245,6 +265,9 @@ describe('text formatting from the inspector controls', () => {
     ]);
     expect(tableLabels('.table-column-buttons button')).toEqual([
       'Insert before', 'Insert after', 'Delete column',
+    ]);
+    expect(tableLabels('.table-row-buttons button')).toEqual([
+      'Insert row above', 'Insert row below', 'Delete row',
     ]);
   });
 
@@ -316,13 +339,19 @@ describe('text formatting from the inspector controls', () => {
     type(picker.querySelector<HTMLInputElement>('input[aria-label="Hex color"]')!, '#3366cc');
     expect(textOf(store, 'text-1').style.color).toBe('#3366cc');
 
-    // Dragging the opacity slider previews live and commits when released.
+    // Dragging the opacity slider applies every step as it goes, and the
+    // whole drag is one undo step.
     const opacity = picker.querySelector<HTMLInputElement>('input[aria-label="Opacity"]')!;
+    opacity.value = '70';
+    opacity.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(textOf(store, 'text-1').style.color).toBe('rgba(51, 102, 204, 0.7)');
     opacity.value = '50';
     opacity.dispatchEvent(new Event('input', { bubbles: true }));
-    expect(textOf(store, 'text-1').style.color).toBe('#3366cc');
+    expect(textOf(store, 'text-1').style.color).toBe('rgba(51, 102, 204, 0.5)');
     opacity.dispatchEvent(new Event('change', { bubbles: true }));
     expect(textOf(store, 'text-1').style.color).toBe('rgba(51, 102, 204, 0.5)');
+    store.undo();
+    expect(textOf(store, 'text-1').style.color).toBe('#3366cc');
   });
 
   it('turns paragraphs into a bulleted list and back from the list dropdown', () => {
@@ -424,6 +453,81 @@ describe('text formatting from the inspector controls', () => {
     expect(textOf(store, 'text-1').html).toBe(original);
   });
 
+  /** Put a collapsed caret at `offset` into `node`, as a click would. */
+  function caretAt(node: Node, offset: number): void {
+    const caret = document.createRange();
+    caret.setStart(node, offset);
+    caret.collapse(true);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(caret);
+    document.dispatchEvent(new Event('selectionchange'));
+  }
+
+  const indentButton = (host: HTMLElement, direction: 'in' | 'out'): HTMLButtonElement =>
+    field(host, 'Indent').querySelector<HTMLButtonElement>(`button[data-direction="${direction}"]`)!;
+
+  it('steps a paragraph in and out with the Indent buttons and keeps the caret in it', () => {
+    const original = '<p>First</p><p>Second</p>';
+    const { store, canvas, canvasHost, inspectorHost } = setup([
+      textElement('text-1', { html: original }),
+    ]);
+    // Indent acts on lines, so it waits for a caret, as superscript does.
+    expect(indentButton(inspectorHost, 'in').disabled).toBe(true);
+    canvas.beginTextEdit('text-1');
+    expect(indentButton(inspectorHost, 'in').disabled).toBe(false);
+    caretAt(contentOf(canvasHost, 'text-1').querySelectorAll('p')[1].firstChild!, 3);
+
+    indentButton(inspectorHost, 'in').click();
+    indentButton(inspectorHost, 'in').click();
+    expect(textOf(store, 'text-1').html).toBe('<p>First</p><p data-indent="2">Second</p>');
+    expect(canvas.isEditing()).toBe(true);
+    expect(window.getSelection()!.anchorNode?.textContent).toBe('Second');
+
+    indentButton(inspectorHost, 'out').click();
+    expect(textOf(store, 'text-1').html).toBe('<p>First</p><p data-indent="1">Second</p>');
+    // Cmd/Ctrl+[ is the same command from the keyboard.
+    const chord = new KeyboardEvent('keydown', {
+      key: '[', code: 'BracketLeft', metaKey: true, bubbles: true, cancelable: true,
+    });
+    contentOf(canvasHost, 'text-1').dispatchEvent(chord);
+    expect(chord.defaultPrevented).toBe(true);
+    expect(textOf(store, 'text-1').html).toBe(original);
+    // A flush line has nowhere further out to go.
+    indentButton(inspectorHost, 'out').click();
+    expect(textOf(store, 'text-1').html).toBe(original);
+
+    store.undo();
+    expect(textOf(store, 'text-1').html).toBe('<p>First</p><p data-indent="1">Second</p>');
+  });
+
+  it('indents a one-line box by giving its line a paragraph to carry the indent', () => {
+    const { store, canvas, canvasHost, inspectorHost } = setup([
+      textElement('text-1', { html: 'Only <b>line</b>' }),
+    ]);
+    canvas.beginTextEdit('text-1');
+    caretAt(contentOf(canvasHost, 'text-1').firstChild!, 2);
+    indentButton(inspectorHost, 'in').click();
+    expect(textOf(store, 'text-1').html).toBe('<p data-indent="1">Only <b>line</b></p>');
+    expect(contentOf(canvasHost, 'text-1').textContent).toBe('Only line');
+  });
+
+  it('moves a list item a level with the Indent buttons, as Tab does', () => {
+    const { store, canvas, canvasHost, inspectorHost } = setup([
+      textElement('text-1', { html: '<ul><li>One</li><li>Two</li></ul>' }),
+    ]);
+    canvas.beginTextEdit('text-1');
+    caretAt(contentOf(canvasHost, 'text-1').querySelectorAll('li')[1].firstChild!, 1);
+
+    indentButton(inspectorHost, 'in').click();
+    expect(textOf(store, 'text-1').html).toBe('<ul><li>One<ul><li>Two</li></ul></li></ul>');
+    indentButton(inspectorHost, 'out').click();
+    expect(textOf(store, 'text-1').html).toBe('<ul><li>One</li><li>Two</li></ul>');
+    // At the outer level the bullet is all an item has left to give up.
+    indentButton(inspectorHost, 'out').click();
+    expect(textOf(store, 'text-1').html).toBe('<ul><li>One</li></ul><p>Two</p>');
+    expect(canvas.isEditing()).toBe(true);
+  });
+
   it.each([
     ['Bulleted', 'ul'],
     ['Numbered', 'ol'],
@@ -508,6 +612,7 @@ describe('text formatting from the inspector controls', () => {
     ['Bold (Cmd/Ctrl+B)', 'fontWeight', '700'],
     ['Italic (Cmd/Ctrl+I)', 'fontStyle', 'italic'],
     ['Underline (Cmd/Ctrl+U)', 'textDecorationLine', 'underline'],
+    ['Strikethrough (Cmd/Ctrl+Shift+X)', 'textDecorationLine', 'line-through'],
     ['Superscript (Cmd/Ctrl+Shift+=)', 'verticalAlign', 'super'],
     ['Subscript (Cmd/Ctrl+Shift+-)', 'verticalAlign', 'sub'],
   ] as const)('formats one selected word with the %s button and undoes it', (
@@ -1176,6 +1281,126 @@ describe('text formatting from the inspector controls', () => {
     expect([...cleared.querySelectorAll('td')].every((cell) => !cell.hasAttribute('style'))).toBe(true);
   });
 
+  it('inserts rows above and below the selected rows through the inspector, each one undo', () => {
+    const original = '<table><tbody>'
+      + '<tr style="height: 50px"><td style="background-color: rgb(255, 0, 0); border-bottom: 2px solid rgb(0, 0, 255)">A</td><td>B</td></tr>'
+      + '<tr><td>C</td><td>D</td></tr></tbody></table>';
+    const { store, canvas, canvasHost, inspectorHost } = setup([
+      textElement('text-1', { html: original, table: { columnWidths: [3, 1], autoHeight: true } }),
+    ]);
+    canvas.beginTextEdit('text-1');
+    // A row drag across the first row.
+    const cells = contentOf(canvasHost, 'text-1').querySelectorAll('td');
+    cells[0].dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 12 }));
+    cells[1].dispatchEvent(new PointerEvent('pointermove', {
+      bubbles: true, cancelable: true, pointerId: 12,
+    }));
+    document.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 12 }));
+    expect(canvas.tableSelectionInfo()).toMatchObject({ mode: 'row', row: 0, rowEnd: 0 });
+
+    const rowButton = (label: string) => [...inspectorHost.querySelectorAll<HTMLButtonElement>(
+      '.table-row-buttons button',
+    )].find((button) => button.textContent === label)!;
+    const savedRows = () => {
+      const saved = document.createElement('div');
+      saved.innerHTML = textOf(store, 'text-1').html;
+      return [...saved.querySelectorAll('tr')];
+    };
+
+    rowButton('Insert row below').click();
+    let rows = savedRows();
+    expect(rows.map((row) => [...row.cells].map((cell) => cell.textContent)))
+      .toEqual([['A', 'B'], ['', ''], ['C', 'D']]);
+    // The new row is dressed like the row it was inserted below.
+    expect(rows[1].style.height).toBe('50px');
+    expect(rows[1].cells[0].style.backgroundColor).toBe('rgb(255, 0, 0)');
+    expect(rows[1].cells[0].style.borderBottom).toBe('2px solid rgb(0, 0, 255)');
+    expect(textOf(store, 'text-1').table?.columnWidths).toEqual([3, 1]);
+    expect(canvas.tableSelectionInfo()).toMatchObject({ mode: 'cell', row: 1, rows: 3 });
+    expect(canvas.isEditing()).toBe(true);
+
+    // One undo step, back to the markup the table was authored with.
+    canvas.endTextEditing();
+    store.undo();
+    expect(textOf(store, 'text-1').html).toBe(original);
+
+    canvas.beginTextEdit('text-1');
+    contentOf(canvasHost, 'text-1').querySelectorAll('td')[3]
+      .dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    rowButton('Insert row above').click();
+    rows = savedRows();
+    expect(rows.map((row) => [...row.cells].map((cell) => cell.textContent)))
+      .toEqual([['A', 'B'], ['', ''], ['C', 'D']]);
+    expect(rows[1].style.height).toBe('');
+    expect(rows[1].cells[0].style.backgroundColor).toBe('');
+    expect(canvas.tableSelectionInfo()).toMatchObject({ mode: 'cell', row: 1, column: 1, rows: 3 });
+    canvas.endTextEditing();
+    store.undo();
+    expect(textOf(store, 'text-1').html).toBe(original);
+  });
+
+  it('deletes the selected table rows through the inspector, never the last one', () => {
+    const original = '<table><thead><tr><th>H1</th><th>H2</th></tr></thead><tbody>'
+      + '<tr><td rowspan="2">M</td><td>B</td></tr>'
+      + '<tr><td>D</td></tr></tbody></table>';
+    const { store, canvas, canvasHost, inspectorHost } = setup([
+      textElement('text-1', { html: original }),
+    ]);
+    const rowButton = (label: string) => [...inspectorHost.querySelectorAll<HTMLButtonElement>(
+      '.table-row-buttons button',
+    )].find((button) => button.textContent === label)!;
+    const savedTableOf = () => {
+      const saved = document.createElement('div');
+      saved.innerHTML = textOf(store, 'text-1').html;
+      return saved.querySelector('table')!;
+    };
+    const select = (from: number, to: number) => {
+      const all = contentOf(canvasHost, 'text-1').querySelectorAll('td, th');
+      all[from].dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 13 }));
+      all[to].dispatchEvent(new PointerEvent('pointermove', {
+        bubbles: true, cancelable: true, pointerId: 13,
+      }));
+      document.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 13 }));
+    };
+    canvas.beginTextEdit('text-1');
+
+    // Every row selected: deleting would leave no table.
+    select(0, 4);
+    expect(canvas.tableSelectionInfo()).toMatchObject({ row: 0, rowEnd: 2, rows: 3 });
+    expect(rowButton('Delete row').disabled).toBe(true);
+
+    // The middle row starts the merge: the merged cell moves down, one row shorter.
+    select(2, 3);
+    expect(rowButton('Delete row').disabled).toBe(false);
+    rowButton('Delete row').click();
+    let table = savedTableOf();
+    expect([...table.rows].map((row) => [...row.cells].map((cell) => cell.textContent)))
+      .toEqual([['H1', 'H2'], ['M', 'D']]);
+    expect(table.rows[1].cells[0].hasAttribute('rowspan')).toBe(false);
+    canvas.endTextEditing();
+    store.undo();
+    expect(textOf(store, 'text-1').html).toBe(original);
+
+    // Deleting the header row drops <thead> and leaves the body.
+    canvas.beginTextEdit('text-1');
+    select(0, 1);
+    rowButton('Delete row').click();
+    table = savedTableOf();
+    expect(table.tHead).toBeNull();
+    expect([...table.rows].map((row) => [...row.cells].map((cell) => cell.textContent)))
+      .toEqual([['M', 'B'], ['D']]);
+    expect(table.rows[0].cells[0].rowSpan).toBe(2);
+    expect(canvas.tableSelectionInfo()).toMatchObject({ mode: 'cell', row: 0, rows: 2 });
+
+    // One row left: Delete row is disabled.
+    select(2, 2);
+    rowButton('Delete row').click();
+    expect(savedTableOf().rows).toHaveLength(1);
+    expect(rowButton('Delete row').disabled).toBe(true);
+    rowButton('Delete row').click();
+    expect(savedTableOf().rows).toHaveLength(1);
+  });
+
   it('inserts and deletes the selected table column through the inspector', () => {
     const { store, canvas, canvasHost, inspectorHost } = setup([
       textElement('text-1', {
@@ -1547,6 +1772,107 @@ describe('text formatting from the inspector controls', () => {
     expect(nodeOf(canvasHost, 'text-1').dataset.paragraphSpacing).toBeUndefined();
   });
 
+  it('sets and clears the box line spacing as a ratio, showing the theme value when unset', () => {
+    const { store, canvasHost, inspectorHost } = setup([
+      textElement('text-1', { html: '<p>First</p><p style="line-height: 2">Second</p>' }),
+    ]);
+    const spacing = () => field(inspectorHost, 'Line spacing');
+    const input = () => spacing().querySelector<HTMLInputElement>('input')!;
+    expect(input().step).toBe('0.05');
+    expect(input().min).toBe('0.5');
+    expect(input().max).toBe('4');
+
+    type(input(), '1.6');
+    const element = textOf(store, 'text-1');
+    expect(element.style['line-height']).toBe('1.6');
+    expect(element.overrides).toContain('line-height');
+    // The box has one spacing afterwards: a paragraph's own goes with it.
+    expect(element.html).toBe('<p>First</p><p>Second</p>');
+    expect(contentOf(canvasHost, 'text-1').style.lineHeight).toBe('1.6');
+    expect(input().value).toBe('1.6');
+    expect(store.history().at(-1)?.label).toBe('Change line spacing');
+
+    // Out of range is clamped rather than stored.
+    type(input(), '9');
+    expect(textOf(store, 'text-1').style['line-height']).toBe('4');
+
+    spacing().querySelector<HTMLButtonElement>('.icon-button')!.click();
+    expect(textOf(store, 'text-1').style['line-height']).toBeUndefined();
+    expect(textOf(store, 'text-1').overrides ?? []).not.toContain('line-height');
+    expect(contentOf(canvasHost, 'text-1').style.lineHeight).toBe('');
+  });
+
+  it('sets line spacing on only the paragraphs a text selection touches', () => {
+    const original = '<p>First paragraph</p><p>Second paragraph</p><p>Third</p>';
+    const { store, canvas, canvasHost, inspectorHost } = setup([
+      textElement('text-1', { html: original }),
+    ]);
+    canvas.beginTextEdit('text-1');
+    const content = contentOf(canvasHost, 'text-1');
+    const paragraphs = () => [...content.querySelectorAll<HTMLParagraphElement>('p')];
+    const range = document.createRange();
+    range.setStart(paragraphs()[0].firstChild!, 6);
+    range.setEnd(paragraphs()[1].firstChild!, 3);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const input = field(inspectorHost, 'Line spacing').querySelector<HTMLInputElement>('input')!;
+    content.dispatchEvent(new FocusEvent('blur', { relatedTarget: input }));
+    type(input, '1.75');
+
+    expect(paragraphs().map((p) => p.style.lineHeight)).toEqual(['1.75', '1.75', '']);
+    expect(textOf(store, 'text-1').style['line-height']).toBeUndefined();
+    expect(field(inspectorHost, 'Line spacing').querySelector<HTMLInputElement>('input')!.value)
+      .toBe('1.75');
+    expect(canvas.isEditing()).toBe(true);
+    content.dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'z', ctrlKey: true, bubbles: true, cancelable: true,
+    }));
+    expect(textOf(store, 'text-1').html).toBe(original);
+  });
+
+  it('writes a size that covers whole paragraphs on the paragraphs, so their lines follow', () => {
+    const { store, canvas, canvasHost, inspectorHost } = setup([
+      textElement('text-1', {
+        html: '<p>First <b style="font-size: 30px">bold</b> line</p><p><br></p>'
+          + '<p>Second x<sup style="font-size: 0.7em">2</sup></p><p>Third line</p>',
+      }),
+    ]);
+    canvas.beginTextEdit('text-1');
+    const content = contentOf(canvasHost, 'text-1');
+    const blocks = () => [...content.querySelectorAll<HTMLParagraphElement>('p')];
+    // From the start of the first paragraph into the middle of the last.
+    const range = document.createRange();
+    range.setStart(blocks()[0].firstChild!, 0);
+    range.setEnd(blocks()[3].firstChild!, 5);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    document.dispatchEvent(new Event('selectionchange'));
+
+    const input = field(inspectorHost, 'Font size').querySelector<HTMLInputElement>('input')!;
+    content.dispatchEvent(new FocusEvent('blur', { relatedTarget: input }));
+    type(input, '14');
+
+    const saved = document.createElement('div');
+    saved.innerHTML = textOf(store, 'text-1').html;
+    const [first, empty, second, third] = [...saved.querySelectorAll<HTMLElement>('p')];
+    // Whole paragraphs (and the empty line between them) carry the size, and
+    // their runs no longer repeat it -- not even the bold run's old 30px.
+    expect(first.style.fontSize).toBe('14px');
+    expect(first.querySelectorAll('[style*="font-size"]')).toHaveLength(0);
+    expect(first.textContent).toBe('First bold line');
+    expect(empty.style.fontSize).toBe('14px');
+    expect(second.style.fontSize).toBe('14px');
+    // The superscript is a proportion of what it sits next to, and still is.
+    expect(second.querySelector<HTMLElement>('sup')!.style.fontSize).toBe('0.7em');
+    // Only "Third" of the last paragraph was selected: one word does not
+    // tighten the line it sits on, so the paragraph keeps its own size.
+    expect(third.style.fontSize).toBe('');
+    expect(third.querySelector<HTMLElement>('span')!.textContent).toBe('Third');
+    expect(third.querySelector<HTMLElement>('span')!.style.fontSize).toBe('14px');
+  });
+
   it('assigns the semantic type role that theme.css and Cast fonts target', () => {
     const { store, canvasHost, inspectorHost } = setup([textElement('text-1')]);
     const role = () => field(inspectorHost, 'Role').querySelector('select')!;
@@ -1613,6 +1939,21 @@ describe('text formatting across a multi-selection', () => {
     type(spacing(), '24');
     expect(['text-1', 'text-2'].map((id) => textOf(store, id).paragraphSpacing))
       .toEqual([24, 24]);
+  });
+
+  it('shows mixed line spacing across boxes, then sets one ratio on all of them', () => {
+    const { store, inspectorHost } = setup([
+      textElement('text-1', { style: { 'line-height': '1.2' } }),
+      textElement('text-2', { y: 400, style: { 'line-height': '1.5' } }),
+    ]);
+    const input = () => field(inspectorHost, 'Line spacing').querySelector<HTMLInputElement>('input')!;
+    expect(input().placeholder).toBe('Mixed');
+    expect(input().value).toBe('');
+
+    type(input(), '1.3');
+    expect(['text-1', 'text-2'].map((id) => textOf(store, id).style['line-height']))
+      .toEqual(['1.3', '1.3']);
+    expect(input().value).toBe('1.3');
   });
 
   it('bullets a whole multi-selection from the shared list dropdown', () => {
@@ -1692,6 +2033,71 @@ describe('inline run formatting while editing text', () => {
     expect(buttons('Bold (Cmd/Ctrl+B)').getAttribute('aria-pressed')).toBe('true');
     buttons('Bold (Cmd/Ctrl+B)').click();
     expect(textOf(store, 'text-1').style['font-weight']).toBe('400');
+  });
+
+  it('strikes through a whole box without taking the underline off the runs that had it', () => {
+    const { store, canvasHost, inspectorHost } = setup([textElement('text-1', {
+      html: '<p>Plain <u>underlined</u> words</p>',
+    })]);
+    const strike = () => inspectorHost.querySelector<HTMLButtonElement>(
+      '.text-format-buttons button[aria-label="Strikethrough (Cmd/Ctrl+Shift+X)"]',
+    )!;
+    expect(strike().disabled).toBe(false);
+    expect(strike().getAttribute('aria-pressed')).toBe('false');
+    strike().click();
+
+    const element = textOf(store, 'text-1');
+    // Only the line every character has is the box's.
+    expect(element.style['text-decoration']).toBe('line-through');
+    const saved = document.createElement('div');
+    saved.innerHTML = element.html;
+    expect(saved.querySelector('u')).toBeNull();
+    const lines = [...saved.querySelectorAll<HTMLElement>('[style]')]
+      .map((node) => [node.textContent, node.style.textDecorationLine]);
+    expect(lines).toEqual([
+      ['Plain ', 'line-through'],
+      ['underlined', 'underline line-through'],
+      [' words', 'line-through'],
+    ]);
+    expect(strike().getAttribute('aria-pressed')).toBe('true');
+    expect(contentOf(canvasHost, 'text-1').textContent).toBe('Plain underlined words');
+
+    strike().click();
+    const cleared = document.createElement('div');
+    cleared.innerHTML = textOf(store, 'text-1').html;
+    expect(textOf(store, 'text-1').style['text-decoration']).toBe('none');
+    expect([...cleared.querySelectorAll<HTMLElement>('[style]')]
+      .map((node) => node.style.textDecorationLine)).toEqual(['none', 'underline', 'none']);
+  });
+
+  it('toggles strikethrough on the selected box with Cmd/Ctrl+Shift+X instead of cutting it', () => {
+    const { store, canvas } = setup([textElement('text-1', { html: '<p>Struck</p>' })]);
+    const cut = vi.fn();
+    // The editor's key map listens on the window; keep it to this test.
+    const listeners: Array<[string, EventListenerOrEventListenerObject]> = [];
+    const add = window.addEventListener.bind(window);
+    const spy = vi.spyOn(window, 'addEventListener').mockImplementation(
+      (type: string, listener: EventListenerOrEventListenerObject, options?: unknown) => {
+        listeners.push([type, listener]);
+        add(type, listener, options as AddEventListenerOptions);
+      },
+    );
+    bindEditorKeys(
+      { store, canvas, rail: {}, save: vi.fn(), setStatusMessage: vi.fn() } as unknown as ShellDeps,
+      { cutToClipboard: cut } as unknown as ClipboardActions,
+    );
+    spy.mockRestore();
+    try {
+      const chord = new KeyboardEvent('keydown', {
+        key: 'X', metaKey: true, shiftKey: true, bubbles: true, cancelable: true,
+      });
+      document.body.dispatchEvent(chord);
+      expect(chord.defaultPrevented).toBe(true);
+      expect(cut).not.toHaveBeenCalled();
+      expect(textOf(store, 'text-1').style['text-decoration']).toBe('line-through');
+    } finally {
+      for (const [type, listener] of listeners) window.removeEventListener(type, listener);
+    }
   });
 });
 

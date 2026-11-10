@@ -14,9 +14,10 @@ import { refreshResponsiveToolbar } from '../src/renderer/editor/responsiveToolb
 
 describe('shared editor controls', () => {
   beforeEach(() => {
-    const dom = new JSDOM('<!doctype html><body></body>', { pretendToBeVisual: true });
+    const dom = new JSDOM('<!doctype html><body></body>', { pretendToBeVisual: true, url: 'http://localhost/' });
     Object.assign(globalThis, {
       window: dom.window,
+      localStorage: dom.window.localStorage,
       document: dom.window.document,
       Node: dom.window.Node,
       HTMLElement: dom.window.HTMLElement,
@@ -34,18 +35,42 @@ describe('shared editor controls', () => {
     expect(document.querySelector('[role="tooltip"]')?.textContent).toContain('Start here: Select slides.');
   });
 
-  it('opens an accessible DeckWerk About dialog from the toolbar wordmark', () => {
+  it('opens an accessible DeckWerk About dialog from the toolbar wordmark menu', () => {
     const brand = createDeckWerkButton();
     document.body.appendChild(brand);
-    expect(brand.textContent).toBe('DeckWerk');
-    expect(brand.getAttribute('aria-label')).toBe('About DeckWerk');
+    const wordmark = brand.querySelector<HTMLButtonElement>('.brand-button')!;
+    expect(wordmark.textContent).toBe('DeckWerk');
+    expect(wordmark.getAttribute('aria-haspopup')).toBe('menu');
 
-    brand.click();
+    wordmark.click();
+    const about = [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find((item) => item.textContent === 'About DeckWerk')!;
+    about.click();
+    expect(document.querySelector('[role="menu"]')).toBeNull();
     const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
     expect(dialog.getAttribute('aria-labelledby')).toBe('deckwerk-about-title');
     expect(dialog.textContent).toContain('Modern cross-platform slide editor by Vincent Sitzmann');
     dialog.querySelector<HTMLButtonElement>('button')!.click();
     expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it('offers the appearance as a radio group in the wordmark menu, System by default', () => {
+    localStorage.removeItem('deckwerk.uiTheme');
+    const brand = createDeckWerkButton();
+    document.body.appendChild(brand);
+    const open = () => brand.querySelector<HTMLButtonElement>('.brand-button')!.click();
+    const radios = () => [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')]
+      .map((item) => `${item.textContent}:${item.getAttribute('aria-checked')}`);
+
+    open();
+    const sizes = ['Small · 90%:false', 'Default · 100%:true', 'Large · 115%:false', 'Larger · 130%:false'];
+    expect(radios()).toEqual(['System:true', 'Light:false', 'Dark:false', ...sizes]);
+    [...document.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]')]
+      .find((item) => item.textContent === 'Light')!.click();
+    expect(document.documentElement.dataset.uiTheme).toBe('light');
+    open();
+    expect(radios()).toEqual(['System:false', 'Light:true', 'Dark:false', ...sizes]);
+    localStorage.removeItem('deckwerk.uiTheme');
   });
 
   it('gives toolbar menus roles and closes after an action', () => {
@@ -63,11 +88,14 @@ describe('shared editor controls', () => {
     for (const file of ['src/renderer/editor/main.ts', 'src/renderer/collab/main.ts']) {
       const source = readFileSync(join(process.cwd(), file), 'utf8');
       expect(source).toContain("barButton('New'");
-      expect(source).toContain("barButton('Open'");
+      // A plain button, or a split button whose main half is still one-click Open.
+      expect(source).toMatch(/barButton\('Open'|createToolbarSplitButton\('Open'/);
       expect(source).toContain("createToolbarPicker('Import…'");
       expect(source).toContain("label: 'Keynote…'");
-      expect(source).toContain("barIconButton('Text'");
+      expect(source).toContain('createTextInsertPicker({');
+      expect(source).not.toContain("barIconButton('Code'");
       expect(source).toContain('createShapeInsertPicker(store)');
+      expect(source).toContain('createPenButton(canvas)');
       expect(source).not.toContain("menuButton('File'");
       expect(source).not.toContain("menuButton('Insert'");
     }
@@ -188,7 +216,9 @@ describe('shared editor controls', () => {
     left.getBoundingClientRect = () => toolbar.classList.contains('toolbar-compact-file')
       ? rect(0, 120)
       : rect(0, toolbar.classList.contains('toolbar-hide-deck-name') ? 430 : 450);
-    center.getBoundingClientRect = () => deckControlsVisible ? rect(400, 220) : rect(0, 0);
+    center.getBoundingClientRect = () => deckControlsVisible
+      ? rect(400, toolbar.classList.contains('toolbar-compact-insert') ? 120 : 220)
+      : rect(0, 0);
     right.getBoundingClientRect = () => deckControlsVisible
       ? rect(660, toolbar.classList.contains('toolbar-compact-secondary') ? 100 : 240)
       : rect(0, 0);
@@ -201,6 +231,12 @@ describe('shared editor controls', () => {
     Object.defineProperty(toolbar, 'clientWidth', { configurable: true, value: 500 });
     refreshResponsiveToolbar(toolbar);
     expect(toolbar.classList.contains('toolbar-compact-secondary')).toBe(true);
+    expect(toolbar.classList.contains('toolbar-compact-insert')).toBe(false);
+
+    // Narrower still, Insert keeps its icons and drops its words.
+    Object.defineProperty(toolbar, 'clientWidth', { configurable: true, value: 420 });
+    refreshResponsiveToolbar(toolbar);
+    expect(toolbar.classList.contains('toolbar-compact-insert')).toBe(true);
 
     deckControlsVisible = false;
     refreshResponsiveToolbar(toolbar);

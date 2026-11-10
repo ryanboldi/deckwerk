@@ -1,18 +1,28 @@
 import type { Deck, Slide, SlideElement } from '@shared/deck.js';
-import { parseDeck } from '@shared/deck.js';
+import { DeckSchema, NEW_MEDIA_FIT, SlideSchema, parseDeck } from '@shared/deck.js';
+import { renameRetiredFields } from '@shared/fieldAliases.js';
+import { cloneJson, jsonEqual } from '@shared/jsonData.js';
 import { applyAgentOperations, type AgentOperation } from '@shared/agent.js';
 import { diffDecks } from '@shared/deckDiff.js';
+import { carryComments, withoutCommentOps } from '@shared/comments.js';
 import { applyOpsLenient } from '@shared/collabApply.js';
 import {
+  CLIPBOARD_FORMAT,
+  type ClipboardPayload,
   type ClipboardReadResult,
   type ClipboardWriteRequest,
+  collectAssetSrcs,
+  parseClipboardPayload,
+  matchSlidesToTheme,
   pinSlidesToTheme,
   remapElementIds,
   remapSlideIds,
+  rewriteAssetSrcs,
   slideThemeStylesDiffer,
 } from '@shared/clipboard.js';
 import { effectiveThemeStyle } from '@shared/themes.js';
 import { makeId } from '@shared/geometry.js';
+import { codeLines } from '@shared/codeBlocks.js';
 import { pastedTableData } from '@shared/paragraphs.js';
 import { classifyMediaName } from '@shared/media.js';
 import type {
@@ -79,6 +89,8 @@ interface UndoItem {
 }
 
 const HISTORY_LIMIT = 200;
+/** Rows trimmed off a full history log per fold into its base (see historyBaseLag). */
+const HISTORY_FOLD_BATCH = 50;
 
 export class EditorStore {
   /**
@@ -94,14 +106,51 @@ export class EditorStore {
   /** Signals that the independently persisted history needs a later flush. */
   onHistoryChange: (() => void) | null = null;
 
+  /**
+   * Why the deck may not be edited right now, or null. While set, every
+   * local edit (commit, drag, history replace or restore) is refused and
+   * reported through `onEditRefused`; renderer measurements and remote decks
+   * still land. The collab shell sets it while it shows the copy of a deck
+   * kept in the browser, opened without the server: anything edited there
+   * would be discarded when the server answers.
+   */
+  private editLock: string | null = null;
+  onEditRefused: ((reason: string) => void) | null = null;
+
+  setEditLock(reason: string | null): void {
+    this.editLock = reason;
+  }
+
+  get editLocked(): string | null {
+    return this.editLock;
+  }
+
+  /** True (and reported) when the edit about to happen must not. */
+  private refuseEdit(): boolean {
+    if (this.editLock === null) return false;
+    this.onEditRefused?.(this.editLock);
+    // Views that drew the attempt (a dragged box, typed text) draw the deck again.
+    this.emit();
+    return true;
+  }
+
   private state: EditorState;
   private listeners = new Set<Listener>();
   private historyListeners = new Set<() => void>();
   private undoStack: UndoItem[] = [];
   private redoStack: UndoItem[] = [];
   private historyLog: DeckHistoryItem[] = [];
-  /** Materialized state represented by historyLog[0]. */
+  /** Materialized state of historyLog[0], once `historyBaseLag` is applied. */
   private historyBase: Deck | null = null;
+  /**
+   * Operations of rows trimmed off the front of a full log, not yet folded
+   * into `historyBase`. A fold is a whole-deck apply (parse, clone,
+   * validate); paying it for every new row once the log is full made every
+   * collaborator's transaction O(deck) again, so trims are folded in batches
+   * and whenever the base is read out.
+   */
+  private historyBaseLag: AgentOperation[] = [];
+  private historyBaseLagRows = 0;
   /** One materialized cache for diffing the next history entry. */
   private historyTipDeck: Deck | null = null;
   /** The history row represented by `state.deck`, or null for an unrecorded state. */
@@ -112,6 +161,27 @@ export class EditorStore {
   /** Coalesces a drag into one undo entry instead of one per mousemove. */
   private txnBase: Deck | null = null;
   private txnLabel = 'Move or resize objects';
+  /**
+   * Incoming remote slide object → the store's equal, normalised slide.
+   *
+   * The collab bridge advances its shadow copy-on-write, so a slide nobody
+   * touched arrives as the same object transaction after transaction. Once
+   * one has been parsed and found equal to (or adopted as) a store slide, it
+   * never needs looking at again. Keyed by identity, never by content: both
+   * sides are immutable (applyOpsLenient never mutates its input, and store
+   * states are never mutated in place — undo and history already hold them).
+   */
+  private remoteSlides = new WeakMap<Slide, Slide>();
+  /** The same memo for deck properties: the last incoming set and its parse. */
+  private remoteProps: { from: Omit<Deck, 'slides'>; to: Omit<Deck, 'slides'> } | null = null;
+  private remoteDepth = 0;
+  /**
+   * Lines picked in a code block's gutter, for a build on just those lines.
+   * Not part of EditorState: it is a sub-selection of the one selected
+   * block, read through `codeLineSelection()`, which drops it the moment that
+   * block is no longer the selection.
+   */
+  private pickedCodeLines: { elementId: string; anchor: number; from: number; to: number } | null = null;
 
   constructor(deck: Deck, dir: string | null = null) {
     this.state = {
@@ -131,6 +201,16 @@ export class EditorStore {
   /** Whether pointer-driven edits are currently being grouped into one change. */
   isTransactionActive(): boolean {
     return this.txnBase !== null;
+  }
+
+  /**
+   * True while listeners are being told about a deck decided elsewhere
+   * (applyRemote), as opposed to an edit made here. A text box being edited
+   * merges the former into its live DOM; the latter is its own commit coming
+   * back (EditorCanvas.adoptRemoteEditedHtml).
+   */
+  isApplyingRemote(): boolean {
+    return this.remoteDepth > 0;
   }
 
   get slide(): Slide | undefined {
@@ -165,6 +245,8 @@ export class EditorStore {
     this.undoStack = [];
     this.redoStack = [];
     const persisted = opts.history;
+    this.historyBaseLag = [];
+    this.historyBaseLagRows = 0;
     try {
       this.historyBase = persisted?.base ? parseDeck(persisted.base) : null;
       this.historyLog = (persisted?.entries ?? []).slice(-HISTORY_LIMIT).map((item) => ({
@@ -227,6 +309,7 @@ export class EditorStore {
 
   /** Replace the document as one local, dirty, undoable transaction. */
   replaceWithHistory(deck: Deck, label: string): void {
+    if (this.refuseEdit()) return;
     const anchor = this.cursorAnchor();
     const previous = this.state.deck;
     this.state = { ...this.state, deck: parseDeck(deck), dirty: true };
@@ -249,7 +332,7 @@ export class EditorStore {
     opts: RemoteHistoryOptions = {},
   ): void {
     const anchor = this.cursorAnchor();
-    let next = parseDeck(deck);
+    let next = this.adoptRemoteDeck(deck);
     // Server acknowledgements normally contain the optimistic state already
     // on screen. Recording them again creates duplicate/misattributed rows and
     // makes the apparent current revision depend on network timing.
@@ -264,9 +347,10 @@ export class EditorStore {
     if (this.txnBase) {
       const inFlight = diffDecks(this.txnBase, this.state.deck);
       this.txnBase = next;
-      if (inFlight.length > 0) next = applyOpsLenient(next, inFlight).deck;
+      if (inFlight.length > 0) {
+        next = reshareDeck(this.state.deck, applyOpsLenient(next, inFlight).deck);
+      }
     }
-    shareUnchangedSlides(this.state.deck, next);
     this.state = { ...this.state, deck: next };
     this.restoreCursor(anchor);
     // Live typing arrives as a stream of same-label transactions; folding them
@@ -281,7 +365,12 @@ export class EditorStore {
       this.currentHistoryId = null;
       this.emitHistory();
     }
-    this.emit();
+    this.remoteDepth += 1;
+    try {
+      this.emit();
+    } finally {
+      this.remoteDepth -= 1;
+    }
   }
 
   /**
@@ -297,10 +386,9 @@ export class EditorStore {
    */
   resyncRemote(deck: Deck, dir: string): void {
     const anchor = this.cursorAnchor();
-    const next = parseDeck(deck);
+    const next = this.adoptRemoteDeck(deck);
     this.undoStack = [];
     this.redoStack = [];
-    shareUnchangedSlides(this.state.deck, next);
     this.state = { ...this.state, dir, deck: next, dirty: false };
     this.currentHistoryId = null;
     this.restoreCursor(anchor);
@@ -312,6 +400,56 @@ export class EditorStore {
     };
     this.emitHistory();
     this.emit();
+  }
+
+  /**
+   * A deck decided elsewhere, normalised as `parseDeck` would and reconciled
+   * with the current state (see `reshareDeck`), in time proportional to what
+   * differs from the current state rather than to the deck.
+   *
+   * Slides already in the current state, and remote slide objects met before,
+   * are taken as they are; only slides new to this store are parsed. The
+   * result never mutates `incoming`.
+   */
+  private adoptRemoteDeck(incoming: Deck): Deck {
+    const current = this.state.deck;
+    if (incoming === current) return current;
+    const raw = incoming as unknown as Record<string, unknown> | null;
+    // Not a parsed deck (a legacy file shape, or something malformed): the
+    // whole-deck parse is the only correct normalisation, and its error the
+    // right message.
+    if (!raw || typeof raw !== 'object' || !Array.isArray(raw.slides)
+      || Object.prototype.hasOwnProperty.call(raw, 'morphDuration')) {
+      return reshareDeck(current, parseDeck(incoming));
+    }
+    const inState = new Set(current.slides);
+    const currentById = new Map(current.slides.map((slide) => [slide.id, slide]));
+    const slides = incoming.slides.map((slide) => {
+      if (inState.has(slide)) return slide;
+      const known = this.remoteSlides.get(slide);
+      if (known) return known;
+      const parsed = SlideSchema.parse(renameRetiredFields(slide));
+      const before = currentById.get(parsed.id);
+      const adopted = before ? reshareSlide(before, parsed) : parsed;
+      this.remoteSlides.set(slide, adopted);
+      return adopted;
+    });
+    // Deck properties, likewise: as they are when they are the current
+    // state's, as adopted last time when they are the same objects as last
+    // time, parsed otherwise.
+    const { slides: _incomingSlides, ...props } = incoming;
+    const { slides: _currentSlides, ...currentProps } = current;
+    let adoptedProps: Omit<Deck, 'slides'>;
+    if (sameValues(props, currentProps)) {
+      adoptedProps = props;
+    } else if (this.remoteProps && sameValues(props, this.remoteProps.from)) {
+      adoptedProps = this.remoteProps.to;
+    } else {
+      const { slides: _none, ...parsed } = DeckSchema.parse(renameRetiredFields({ ...props, slides: [] }));
+      adoptedProps = parsed;
+      this.remoteProps = { from: props, to: parsed };
+    }
+    return reshareDeck(current, { ...adoptedProps, slides });
   }
 
   /** The slide the user is looking at, named by id rather than by position. */
@@ -349,10 +487,13 @@ export class EditorStore {
     } = {},
   ): void {
     const previous = this.state.deck;
-    const next = structuredClone(previous) as Deck;
-    fn(next);
-    shareUnchangedSlides(previous, next);
-    this.finishCommit(previous, next, opts);
+    // A deep copy that shares strings (immutable, so safe), then identity
+    // restored for everything the mutation left alone: O(deck structure), not
+    // O(deck bytes) — a deck holding a 10 MB inline image used to clone and
+    // stringify all of it on every live-typing push.
+    const draft = cloneJson(previous);
+    fn(draft);
+    this.finishCommit(previous, reshareDeck(previous, draft), opts);
   }
 
   private finishCommit(
@@ -379,6 +520,8 @@ export class EditorStore {
       this.emit();
       return;
     }
+
+    if (this.refuseEdit()) return;
 
     // Transient commits stream work in progress (live typing) to collaborators
     // without consuming undo slots or history entries; the coalesce key lets
@@ -426,6 +569,12 @@ export class EditorStore {
     if (!this.txnBase) return;
     const base = this.txnBase;
     this.txnBase = null;
+    // A gesture begun before the lock: put back what it moved.
+    if (this.editLock !== null && base !== this.state.deck) {
+      this.state = { ...this.state, deck: base };
+      this.refuseEdit();
+      return;
+    }
     // A drag that ended where it started shouldn't consume an undo slot.
     if (base !== this.state.deck) {
       const forward = diffDecks(base, this.state.deck);
@@ -447,11 +596,13 @@ export class EditorStore {
     label: string,
     forward = diffDecks(previous, next),
   ): void {
-    if (forward.length === 0) return;
+    // Comment changes are not undoable edits (shared/comments.ts).
+    const contentForward = withoutCommentOps(forward);
+    if (contentForward.length === 0) return;
     this.undoStack.push({
       label,
-      forward,
-      inverse: diffDecks(next, previous),
+      forward: contentForward,
+      inverse: withoutCommentOps(diffDecks(next, previous)),
     });
     if (this.undoStack.length > HISTORY_LIMIT) this.undoStack.shift();
     this.redoStack = [];
@@ -502,6 +653,7 @@ export class EditorStore {
   }
 
   persistedHistory(): DeckHistoryDocument {
+    this.foldHistoryBase();
     return {
       version: 2,
       base: this.historyBase,
@@ -510,9 +662,12 @@ export class EditorStore {
   }
 
   restoreHistory(id: number): boolean {
+    if (this.refuseEdit()) return false;
     const historyIndex = this.historyLog.findIndex((item) => item.id === id);
     const snapshot = this.historyLog[historyIndex];
-    const snapshotDeck = this.materializeHistoryIndex(historyIndex);
+    const materialized = this.materializeHistoryIndex(historyIndex);
+    // A version brings back content, never the comment threads it had then.
+    const snapshotDeck = materialized && carryComments(this.state.deck, materialized);
     if (!snapshot || !snapshotDeck || sameDeck(snapshotDeck, this.state.deck)) return false;
     const previous = this.state.deck;
     const slideIndex = Math.min(
@@ -659,6 +814,8 @@ export class EditorStore {
   }
 
   select(ids: string[], additive = false): void {
+    // A gutter pick belongs to the selection it was made in.
+    this.pickedCodeLines = null;
     const selection = additive ? new Set(this.state.selection) : new Set<string>();
     for (const id of ids) {
       if (additive && selection.has(id)) selection.delete(id);
@@ -671,6 +828,51 @@ export class EditorStore {
       slideSelection: new Set(currentSlide ? [currentSlide.id] : []),
       selection,
     };
+    this.emit();
+  }
+
+  /**
+   * The code lines picked in the selected block's gutter, or null. Only ever
+   * answers for a code block that is the whole selection, clamped to the
+   * lines it has now.
+   */
+  codeLineSelection(): { elementId: string; from: number; to: number } | null {
+    const picked = this.pickedCodeLines;
+    if (!picked) return null;
+    const { selection } = this.state;
+    if (selection.size !== 1 || !selection.has(picked.elementId)) return null;
+    const element = this.slide?.elements.find((candidate) => candidate.id === picked.elementId);
+    if (element?.type !== 'code') return null;
+    const count = codeLines(element.code).length;
+    const from = Math.min(picked.from, count);
+    const to = Math.min(picked.to, count);
+    return from >= 1 ? { elementId: picked.elementId, from, to } : null;
+  }
+
+  /**
+   * Pick a line in a code block's gutter; `extend` (Shift) stretches the pick
+   * from the line picked before to this one. Selects the block if needed.
+   */
+  selectCodeLines(elementId: string, line: number, extend = false): void {
+    const previous = this.codeLineSelection();
+    const anchor = extend && previous?.elementId === elementId ? this.pickedCodeLines!.anchor : line;
+    // select() drops any earlier pick, so it goes first.
+    if (this.state.selection.size !== 1 || !this.state.selection.has(elementId)) this.select([elementId]);
+    this.pickedCodeLines = { elementId, anchor, from: Math.min(anchor, line), to: Math.max(anchor, line) };
+    this.emit();
+  }
+
+  /** Pick a whole range of a block's lines at once (a build's lines, shown on the slide). */
+  setCodeLineRange(elementId: string, from: number, to: number): void {
+    if (this.state.selection.size !== 1 || !this.state.selection.has(elementId)) this.select([elementId]);
+    this.pickedCodeLines = { elementId, anchor: Math.min(from, to), from: Math.min(from, to), to: Math.max(from, to) };
+    this.emit();
+  }
+
+  /** Forget a gutter pick, e.g. on a click in the code rather than its gutter. */
+  clearCodeLines(): void {
+    if (!this.pickedCodeLines) return;
+    this.pickedCodeLines = null;
     this.emit();
   }
 
@@ -824,6 +1026,8 @@ export class EditorStore {
         // Coalescing the base row replaces its materialized state; it can never
         // carry operations because there is no preceding revision.
         this.historyBase = this.state.deck;
+        this.historyBaseLag = [];
+        this.historyBaseLagRows = 0;
         last.operations = [];
       } else if (previousTip) {
         last.operations.push(...incoming);
@@ -837,7 +1041,11 @@ export class EditorStore {
       return;
     }
     const operations = incoming;
-    if (this.historyLog.length === 0) this.historyBase = this.state.deck;
+    if (this.historyLog.length === 0) {
+      this.historyBase = this.state.deck;
+      this.historyBaseLag = [];
+      this.historyBaseLagRows = 0;
+    }
     this.historyLog.push({
       id: this.nextHistoryId++,
       label,
@@ -852,22 +1060,34 @@ export class EditorStore {
     if (this.historyLog.length > HISTORY_LIMIT) {
       const nextBase = this.historyLog[1];
       if (this.historyBase && nextBase) {
-        this.historyBase = applyAgentOperations(this.historyBase, nextBase.operations);
+        this.historyBaseLag.push(...nextBase.operations);
+        this.historyBaseLagRows += 1;
         nextBase.operations = [];
       }
       this.historyLog.shift();
+      if (this.historyBaseLagRows >= HISTORY_FOLD_BATCH) this.foldHistoryBase();
     }
     this.currentHistoryId = this.historyLog[this.historyLog.length - 1]?.id ?? null;
     this.emitHistory();
     this.onHistoryChange?.();
   }
 
+  /** Apply trimmed rows' operations to the history base (see historyBaseLag). */
+  private foldHistoryBase(): void {
+    if (this.historyBase && this.historyBaseLag.length > 0) {
+      this.historyBase = applyAgentOperations(this.historyBase, this.historyBaseLag);
+    }
+    this.historyBaseLag = [];
+    this.historyBaseLagRows = 0;
+  }
+
   /** Materialize one persisted revision with a single clone/apply boundary. */
   private materializeHistoryIndex(index: number): Deck | null {
     if (!this.historyBase || index < 0 || index >= this.historyLog.length) return null;
-    const operations = this.historyLog
-      .slice(1, index + 1)
-      .flatMap((entry) => entry.operations);
+    const operations = [
+      ...this.historyBaseLag,
+      ...this.historyLog.slice(1, index + 1).flatMap((entry) => entry.operations),
+    ];
     return operations.length > 0
       ? applyAgentOperations(this.historyBase, operations)
       : this.historyBase;
@@ -875,35 +1095,70 @@ export class EditorStore {
 }
 
 function sameDeck(left: Deck, right: Deck): boolean {
-  return left === right || JSON.stringify(left) === JSON.stringify(right);
+  return left === right || jsonEqual(left, right);
+}
+
+/** Whether two objects hold the same keys with identical (===) values. */
+function sameValues(left: object, right: object): boolean {
+  const a = left as Record<string, unknown>;
+  const b = right as Record<string, unknown>;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length
+    && keys.every((key) => Object.prototype.hasOwnProperty.call(b, key) && a[key] === b[key]);
 }
 
 /**
- * Whether two slides draw the same picture: everything but the speaker note
- * agrees. Typing in the notes drawer commits a fresh slide object per
- * keystroke, and views that only paint the slide must not treat that as a
- * change worth rebuilding for.
+ * Whether two slides draw the same picture: everything but the speaker notes
+ * and the comment threads (on the slide and on its objects) agrees. Typing in
+ * the notes drawer commits a fresh slide object per keystroke, a reply to a
+ * comment one per post, and views that only paint the slide must not treat
+ * either as a change worth rebuilding for: rebuilding the box a collaborator
+ * is typing in, because someone commented on it, would take their caret.
  */
-export function sameSlideIgnoringNotes(left: Slide, right: Slide): boolean {
+export function sameSlideDrawing(left: Slide, right: Slide): boolean {
   if (left === right) return true;
-  return JSON.stringify({ ...left, notes: '' }) === JSON.stringify({ ...right, notes: '' });
+  if (!jsonEqual(left, right, ['notes', 'comments', 'elements'])) return false;
+  if (left.elements.length !== right.elements.length) return false;
+  return left.elements.every((element, i) =>
+    element === right.elements[i] || jsonEqual(element, right.elements[i], ['comments']));
 }
 
-/** Whether two decks differ in nothing but their slides' speaker notes. */
-export function sameDeckIgnoringNotes(left: Deck, right: Deck): boolean {
+/**
+ * The objects of `right` that draw differently from `left`, when that is the
+ * only way the two slides' pictures differ: the slide itself, the set of
+ * objects and their paint order all agree. `null` when anything else changed.
+ * A view that paints the slide can then redraw just those objects.
+ */
+export function changedSlideObjects(left: Slide, right: Slide): Slide['elements'] | null {
+  if (!jsonEqual(left, right, ['notes', 'comments', 'elements'])) return null;
+  if (left.elements.length !== right.elements.length) return null;
+  const changed: Slide['elements'] = [];
+  for (let i = 0; i < left.elements.length; i++) {
+    const before = left.elements[i];
+    const after = right.elements[i];
+    if (before === after) continue;
+    if (before.id !== after.id || before.z !== after.z) return null;
+    if (!jsonEqual(before, after, ['comments'])) changed.push(after);
+  }
+  return changed;
+}
+
+/** Whether two decks differ in nothing but their slides' speaker notes and comments. */
+export function sameDeckDrawing(left: Deck, right: Deck): boolean {
   if (left === right) return true;
   if (left.slides.length !== right.slides.length) return false;
   for (let i = 0; i < left.slides.length; i++) {
-    if (!sameSlideIgnoringNotes(left.slides[i], right.slides[i])) return false;
+    if (!sameSlideDrawing(left.slides[i], right.slides[i])) return false;
   }
-  return JSON.stringify({ ...left, slides: null }) === JSON.stringify({ ...right, slides: null });
+  return jsonEqual(left, right, ['slides']);
 }
 
 /** A stable signature of what a run of operations touches, for coalescing. */
 function operationTargets(operations: AgentOperation[]): string {
   const ids = new Set<string>();
   for (const operation of operations) {
-    if ('elementId' in operation) ids.add(operation.elementId);
+    if (operation.op === 'updateComments') ids.add(`comments:${operation.elementId ?? operation.slideId}`);
+    else if ('elementId' in operation) ids.add(operation.elementId);
     else if ('elementIds' in operation) for (const id of operation.elementIds) ids.add(id);
     else if ('slideId' in operation) ids.add(`slide:${operation.slideId}`);
     else ids.add(`deck:${operation.op}`);
@@ -912,21 +1167,64 @@ function operationTargets(operations: AgentOperation[]): string {
 }
 
 /**
- * Restore object identity for slides an edit did not touch.
+ * Restore object identity for whatever an edit did not touch.
  *
- * `commit` deliberately gives mutation callbacks a fully independent clone,
- * but the canvas and slide rail use slide identity to retain expensive DOM and
+ * `commit` deliberately gives mutation callbacks a fully independent copy,
+ * and a remote deck arrives as objects the store has not seen, but the
+ * canvas and slide rail use slide identity to retain expensive DOM and
  * decoded media. Without this reconciliation, changing one layout in a large
  * imported deck rebuilds every thumbnail and can exhaust the renderer.
+ *
+ * Returns `next` with identity restored from `previous` wherever content
+ * agrees: a slide equal to the previous slide of the same id becomes that
+ * object; in a slide that did change, each unchanged element (by id) becomes
+ * the previous element; deck properties likewise. `next` itself is never
+ * mutated — a copy is made only where something is re-shared — so it may be
+ * a deck another owner holds (the collab bridge's shadow).
+ *
+ * Comparisons short-circuit on identity at every level, so reconciling two
+ * decks that already share most slides costs only what differs.
  */
-export function shareUnchangedSlides(previous: Deck, next: Deck): void {
+export function reshareDeck(previous: Deck, next: Deck): Deck {
+  if (previous === next) return next;
   const byId = new Map(previous.slides.map((slide) => [slide.id, slide]));
+  let slides: Slide[] | null = null;
   for (let i = 0; i < next.slides.length; i++) {
-    const candidate = byId.get(next.slides[i].id);
-    if (candidate && JSON.stringify(candidate) === JSON.stringify(next.slides[i])) {
-      next.slides[i] = candidate;
-    }
+    const slide = next.slides[i];
+    const before = byId.get(slide.id);
+    if (!before || before === slide) continue;
+    const shared = reshareSlide(before, slide);
+    if (shared === slide) continue;
+    slides ??= next.slides.slice();
+    slides[i] = shared;
   }
+  let props: Record<string, unknown> | null = null;
+  const after = next as unknown as Record<string, unknown>;
+  const prior = previous as unknown as Record<string, unknown>;
+  for (const key of Object.keys(after)) {
+    if (key === 'slides') continue;
+    const value = after[key];
+    if (value === prior[key] || typeof value !== 'object' || value === null) continue;
+    if (!jsonEqual(value, prior[key])) continue;
+    props ??= {};
+    props[key] = prior[key];
+  }
+  if (!slides && !props) return next;
+  return { ...next, ...props, slides: slides ?? next.slides } as Deck;
+}
+
+function reshareSlide(before: Slide, slide: Slide): Slide {
+  if (before === slide || jsonEqual(before, slide)) return before;
+  const byId = new Map(before.elements.map((element) => [element.id, element]));
+  let elements: SlideElement[] | null = null;
+  for (let i = 0; i < slide.elements.length; i++) {
+    const element = slide.elements[i];
+    const prior = byId.get(element.id);
+    if (!prior || prior === element || !jsonEqual(prior, element)) continue;
+    elements ??= slide.elements.slice();
+    elements[i] = prior;
+  }
+  return elements ? { ...slide, elements } : slide;
 }
 
 /**
@@ -962,23 +1260,112 @@ export function isInAppClipboardToken(text: string | null | undefined): boolean 
   return Boolean(fallbackClipboardToken && fallbackClipboard && text?.trim() === fallbackClipboardToken);
 }
 
+/**
+ * The browser client's bridge to copies made in *other* tabs (netApi.ts; the
+ * server side is clipboardStash.ts). The token a copy leaves on the OS
+ * clipboard names a copy the server keeps, so a paste in another tab — another
+ * deck, or this one after a reload, which empties the in-page fallback — can
+ * fetch it back and bring the assets it shows into its own deck.
+ */
+export interface WebClipboardBridge {
+  stashClipboard: (id: string, request: ClipboardWriteRequest) => Promise<void>;
+  fetchClipboard: (id: string) => Promise<{ sourceDeck: string; request: unknown } | null>;
+  /** This deck's src for `src` in `sourceDeck` (itself, in the same deck), or null. */
+  importDeckAsset: (sourceDeck: string, src: string) => Promise<string | null>;
+}
+
+function webClipboardBridge(): WebClipboardBridge | null {
+  if (typeof window === 'undefined') return null;
+  const api = window.api as Partial<WebClipboardBridge> | undefined;
+  return api?.stashClipboard && api.fetchClipboard && api.importDeckAsset
+    ? api as WebClipboardBridge
+    : null;
+}
+
+/**
+ * The server-side copy a clipboard token names, when it is a token some
+ * *other* page wrote (this page's own token pastes from memory).
+ */
+export function stashedClipboardId(text: string | null | undefined): string | null {
+  const trimmed = text?.trim() ?? '';
+  if (!trimmed.startsWith(IN_APP_CLIPBOARD_TOKEN_PREFIX) || isInAppClipboardToken(trimmed)) return null;
+  const id = trimmed.slice(IN_APP_CLIPBOARD_TOKEN_PREFIX.length);
+  return /^[A-Za-z0-9_-]{16,64}$/.test(id) ? id : null;
+}
+
+/** 128 random bits: the token is the only key to the server's copy. */
+function clipboardId(): string {
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) crypto.getRandomValues(bytes);
+  else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 async function writeSystemClipboard(request: ClipboardWriteRequest): Promise<void> {
   fallbackClipboard = request;
-  fallbackClipboardToken = `${IN_APP_CLIPBOARD_TOKEN_PREFIX}${Math.random().toString(36).slice(2)}`;
+  const id = clipboardId();
+  // Set before the first await: the `copy` event that writes it to the OS
+  // clipboard fires right after the keydown that started this copy.
+  fallbackClipboardToken = `${IN_APP_CLIPBOARD_TOKEN_PREFIX}${id}`;
+  const token = fallbackClipboardToken;
   try {
     if (typeof window !== 'undefined' && window.api?.writeClipboard) {
       await window.api.writeClipboard(request);
-    } else if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-      // Secure origins only; on plain HTTP the `copy` event in shellWiring
-      // writes the same token.
-      await navigator.clipboard.writeText(fallbackClipboardToken);
+    } else {
+      const bridge = webClipboardBridge();
+      const stashed = bridge?.stashClipboard(id, request).catch((err: unknown) => {
+        // This tab still pastes from memory; only other tabs miss out.
+        console.error('Could not share the copy with other tabs:', err);
+      });
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        // Secure origins only; on plain HTTP the `copy` event in shellWiring
+        // writes the same token.
+        await navigator.clipboard.writeText(token);
+      }
+      await stashed;
     }
   } catch (err) {
     console.error('Could not write the system clipboard:', err);
   }
 }
 
-async function readSystemClipboard(): Promise<ClipboardReadResult | ClipboardWriteRequest | null> {
+/** A copy made in another tab, still to be fetched from the server. */
+export interface StashedClipboard {
+  kind: 'stashed';
+  id: string;
+}
+
+/**
+ * Fetch a copy another tab parked on the server and make it this deck's: each
+ * asset it shows is copied over from the deck it came from (a no-op within one
+ * deck), and anything whose file could not be brought over is left out rather
+ * than pasted pointing at a file this deck lacks.
+ */
+async function resolveStashedClipboard(
+  id: string,
+): Promise<{ payload: ClipboardPayload; dropped: number } | null> {
+  const bridge = webClipboardBridge();
+  const stashed = await bridge?.fetchClipboard(id);
+  if (!bridge || !stashed || typeof stashed.request !== 'object' || stashed.request === null) return null;
+  // Another tab may run an older build: the deck schemas fill in what it
+  // did not know about and rename what it still calls by an old name.
+  const payload = parseClipboardPayload({ ...stashed.request, format: CLIPBOARD_FORMAT, version: 1 });
+  if (!payload) return null;
+  const map = new Map<string, string>();
+  for (const src of collectAssetSrcs(payload)) {
+    // Only deck-relative paths live in the other deck's folder.
+    if (/^[a-z][a-z0-9+.-]*:/i.test(src)) {
+      map.set(src, src);
+      continue;
+    }
+    const local = await bridge.importDeckAsset(stashed.sourceDeck, src);
+    if (local) map.set(src, local);
+  }
+  const dropped = rewriteAssetSrcs(payload, map, { dropUnmapped: true });
+  return { payload, dropped };
+}
+
+async function readSystemClipboard(): Promise<ClipboardReadResult | ClipboardWriteRequest | StashedClipboard | null> {
   if (typeof window !== 'undefined' && window.api?.readClipboard) {
     try {
       const payload = await window.api.readClipboard();
@@ -1003,6 +1390,8 @@ async function readSystemClipboard(): Promise<ClipboardReadResult | ClipboardWri
         }
       }
       if (isInAppClipboardToken(text)) return fallbackClipboard;
+      const stashed = stashedClipboardId(text);
+      if (stashed) return { kind: 'stashed', id: stashed };
       if (/<table\b/i.test(html) || text.includes('\t')) {
         return { kind: 'external-html', html, text };
       }
@@ -1073,6 +1462,13 @@ export interface PasteOptions {
   }) => Promise<SlidePasteThemeChoice | null>;
 }
 
+/** What a paste did, for the status bar. `notice` is said after it. */
+export interface PasteResult {
+  kind: 'elements' | 'slides';
+  count: number;
+  notice?: string;
+}
+
 /**
  * Paste whatever fragment is on the clipboard: elements land on the current
  * slide, slides land after it. Returns a summary for the status bar, or null
@@ -1080,14 +1476,49 @@ export interface PasteOptions {
  */
 export async function pasteFromClipboard(
   store: EditorStore,
-  providedPayload?: ClipboardReadResult | ClipboardWriteRequest | null,
+  providedPayload?: ClipboardReadResult | ClipboardWriteRequest | StashedClipboard | null,
   options: PasteOptions = {},
-): Promise<{ kind: 'elements' | 'slides'; count: number } | null> {
+): Promise<PasteResult | null> {
   const payload = providedPayload ?? await readSystemClipboard();
   if (!payload) return null;
+  if (payload.kind === 'stashed') return pasteStashedClipboard(store, payload.id, options);
+  return pasteFragment(store, payload, options);
+}
 
+/**
+ * Paste a copy made in another browser tab (see WebClipboardBridge), into
+ * this deck or — with its pictures, videos and pages copied across — into
+ * another one. A copy whose files could not all be brought over still pastes
+ * the rest, and says what it left out.
+ */
+export async function pasteStashedClipboard(
+  store: EditorStore,
+  id: string,
+  options: PasteOptions = {},
+): Promise<PasteResult | null> {
+  const resolved = await resolveStashedClipboard(id);
+  if (!resolved) {
+    return { kind: 'elements', count: 0, notice: 'Nothing pasted: that copy is no longer available. Copy it again.' };
+  }
+  const { payload, dropped } = resolved;
+  const notice = dropped > 0
+    ? `${dropped} picture${dropped === 1 ? '' : 's'} or video${dropped === 1 ? '' : 's'} could not be copied `
+      + `from the other presentation and ${dropped === 1 ? 'was' : 'were'} left out.`
+    : undefined;
+  if (payload.kind === 'elements' && payload.elements.length === 0) {
+    return { kind: 'elements', count: 0, notice };
+  }
+  const pasted = await pasteFragment(store, payload, options);
+  return pasted && notice ? { ...pasted, notice } : pasted;
+}
+
+async function pasteFragment(
+  store: EditorStore,
+  payload: ClipboardReadResult | ClipboardWriteRequest,
+  options: PasteOptions,
+): Promise<PasteResult | null> {
   if (payload.kind === 'external-image') {
-    return insertClipboardImage(store, payload.asset);
+    return insertClipboardMedia(store, payload.asset);
   }
 
   if (payload.kind === 'external-html') {
@@ -1141,6 +1572,7 @@ export async function pasteFromClipboard(
         : 'destination';
       if (choice === null) return null;
       if (choice === 'source') pinSlidesToTheme(slides, source);
+      else matchSlidesToTheme(slides, source);
     }
     for (const slide of slides) remapSlideIds(slide);
     const at = store.get().slideIndex + 1;
@@ -1200,15 +1632,18 @@ export async function pasteFromClipboard(
 export async function pasteInAppClipboard(
   store: EditorStore,
   options: PasteOptions = {},
-): Promise<{ kind: 'elements' | 'slides'; count: number } | null> {
+): Promise<PasteResult | null> {
   if (!fallbackClipboard) return null;
   return pasteFromClipboard(store, fallbackClipboard, options);
 }
 
 /** Native browser paste events expose image bytes even on plain HTTP origins,
  * where `navigator.clipboard.read()` is unavailable. Upload those bytes using
- * the same collaboration asset bridge as drag-and-drop. */
-export async function pasteImageFilesFromClipboard(
+ * the same collaboration asset bridge as drag-and-drop.
+ *
+ * A file copied in the file manager arrives the same way, as a File carrying
+ * its own name -- and that may be a video as well as an image. */
+export async function pasteMediaFilesFromClipboard(
   store: EditorStore,
   files: File[],
 ): Promise<{ kind: 'elements'; count: number } | null> {
@@ -1216,15 +1651,21 @@ export async function pasteImageFilesFromClipboard(
   // manager can hand over any format the importer accepts — including the
   // ones it has to re-encode. Matching PNG alone dropped those pastes with no
   // element and no error.
-  const image = files.find((file) => clipboardImageName(file) !== null);
-  if (!image || !window.api.importAssetFiles) return null;
-  const name = clipboardImageName(image) as string;
+  const media = files.find((file) => clipboardMediaName(file) !== null);
+  if (!media || !window.api.importAssetFiles) return null;
+  const name = clipboardMediaName(media) as string;
   const [asset] = await window.api.importAssetFiles([
     // The name is what tells the importer which format this is, so it has to
     // survive the hand-off; the bytes are re-wrapped only to rename them.
-    new File([image], name, { type: image.type }),
+    new File([media], name, { type: media.type }),
   ]);
-  return asset ? insertClipboardImage(store, asset) : null;
+  return asset ? insertClipboardMedia(store, asset) : null;
+}
+
+/** The name to import a pasted file under: a video keeps its own name. */
+function clipboardMediaName(file: { name: string; type: string }): string | null {
+  if (classifyMediaName(file.name) === 'video') return file.name;
+  return clipboardImageName(file);
 }
 
 /**
@@ -1247,11 +1688,11 @@ export function clipboardImageName(file: { name: string; type: string }): string
   return classifyMediaName(name) === 'image' ? name : null;
 }
 
-function insertClipboardImage(
+function insertClipboardMedia(
   store: EditorStore,
   asset: Extract<ClipboardReadResult, { kind: 'external-image' }>['asset'],
 ): { kind: 'elements'; count: number } {
-  const id = makeId('image');
+  const id = makeId(asset.kind);
   store.commit((deck) => {
     const slide = deck.slides[store.get().slideIndex];
     if (!slide) return;
@@ -1264,9 +1705,8 @@ function insertClipboardImage(
     );
     const w = Math.round(naturalW * scale);
     const h = Math.round(naturalH * scale);
-    slide.elements.push({
+    const base = {
       id,
-      type: 'image',
       x: Math.round((deck.canvas.w - w) / 2),
       y: Math.round((deck.canvas.h - h) / 2),
       w,
@@ -1277,11 +1717,24 @@ function insertClipboardImage(
       class: [],
       style: {},
       src: asset.src,
-      fit: 'contain',
-      alt: 'Pasted screenshot',
+      fit: NEW_MEDIA_FIT,
       sourceBox: null,
-    });
-  }, { label: 'Paste screenshot' });
+    };
+    // Same defaults as a video dropped onto the slide.
+    slide.elements.push(asset.kind === 'video'
+      ? {
+          ...base,
+          type: 'video',
+          autoplay: true,
+          loop: true,
+          muted: true,
+          controls: false,
+          start: 0,
+          end: null,
+          poster: null,
+        }
+      : { ...base, type: 'image', alt: 'Pasted screenshot' });
+  }, { label: asset.kind === 'video' ? 'Paste video' : 'Paste screenshot' });
   store.select([id]);
   return { kind: 'elements', count: 1 };
 }

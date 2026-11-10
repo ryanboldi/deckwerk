@@ -1,17 +1,23 @@
+import { curvedShadowClasses } from '@shared/shapeShadow.js';
 import { MIRRORED_TEXT_STYLE_PROPERTIES } from '@shared/deck.js';
 import type { Deck, MediaEffect, Slide, SlideElement } from '@shared/deck.js';
 import { fitScale } from '@shared/geometry.js';
+import { elementTransform } from '@shared/flip.js';
 import { fitAutoTextElement } from '@shared/autoFit.js';
 import { isPendingSrc, pendingName, pendingToken } from '@shared/media.js';
 import { gateVideoLoad } from './mediaLoadGate.js';
+import { videoMemory } from './videoMemory.js';
 import { previewPosterProvider } from './previewPosterProvider.js';
 import { prepareSlideLinks } from './links.js';
 import { quadraticPath, shapeSvg } from '@shared/shapeSvg.js';
 import { isMediaBorderPaint, typedPropertyOwnsCss } from '@shared/nativeCss.js';
 import { applyTableColumnWidths } from '@shared/paragraphs.js';
-import { isEmbeddableWebSrc } from '@shared/webBridge.js';
+import { isEmbeddableWebSrc, webReadinessAction } from '@shared/webBridge.js';
+import { syncWipe } from './wipe.js';
+import { renderCodeBody } from './codeRender.js';
 import renderMathInElement from 'katex/contrib/auto-render';
 import 'katex/dist/katex.min.css';
+import { katexTermOptions } from '@shared/equationTerms.js';
 
 /**
  * deck.json -> DOM.
@@ -50,6 +56,32 @@ export interface RenderOptions {
    * `mediaPreload: 'metadata'`.
    */
   deferVideoSrc?: boolean;
+  /**
+   * Pictures whose bytes the host is still fetching itself (the browser
+   * presentation's blob cache, mediaBlobCache.ts): such an `<img>` is built
+   * with no `src`, the URL parked in `data-deferred-src`, and the host gives
+   * it one once the bytes are in. Assigning the URL and taking it away again
+   * is not the same: WebKit starts the request the moment `src` is set, even
+   * on an element not yet in the document, and the picture crossed the wire
+   * twice, once for the element and once for the cache.
+   */
+  deferImageSrc?: (url: string) => boolean;
+  /**
+   * Decode pictures off the main thread (`decoding="async"`): the slide shows
+   * at once and each picture when it is ready. Every editor surface that is
+   * built as the author moves around sets it -- the canvas when it changes
+   * slides, the rail's miniatures, the Morph previews of this slide and the
+   * next. Decoded where they were painted, the full-size photographs of one
+   * such slide held Safari's main thread for 400-750 ms
+   * (editingLatencyBrowser.test.ts).
+   */
+  decodeImagesAsync?: boolean;
+}
+
+/** Give a picture its source, or park it for the host (`deferImageSrc`). */
+function assignImageSrc(image: HTMLImageElement, url: string, opts: RenderOptions): void {
+  if (opts.deferImageSrc?.(url)) image.dataset.deferredSrc = url;
+  else image.src = url;
 }
 
 export { quadraticPath };
@@ -115,8 +147,36 @@ export function applyVideoPlaybackState(
   // player's runtime loops start -> end instead, so the flag stays off whenever
   // an in- or out-point is set.
   video.loop = el.loop && el.start <= 0 && el.end === null;
-  if (el.poster) video.poster = opts.resolveSrc(el.poster);
+  // An element waiting for its bytes in memory shows the server's still.
+  const poster = el.poster ? opts.resolveSrc(el.poster) : video.dataset.stillPoster;
+  if (poster) video.poster = poster;
   else video.removeAttribute('poster');
+}
+
+/**
+ * The network URL an element shows, whatever it reads right now: a `blob:`
+ * URL standing in for it (videoMemory.ts), nothing yet, or a source the load
+ * gate parked.
+ */
+export function videoNetworkSrc(video: HTMLVideoElement): string {
+  return video.dataset.networkSrc ?? video.getAttribute('src') ?? video.dataset.gateAbortedSrc ?? '';
+}
+
+/**
+ * Give an element that is only showing its still a source now, because
+ * somebody wants to play or scrub it: its bytes in memory if they are there,
+ * else the network. Returns whether the element has a source.
+ */
+export function startVideoSource(video: HTMLVideoElement): boolean {
+  if (video.hasAttribute('src')) return true;
+  const url = video.dataset.networkSrc;
+  if (!url) return false;
+  delete video.dataset.memoryPending;
+  delete video.dataset.streamPending;
+  const held = videoMemory()?.objectUrl(url);
+  video.preload = 'auto';
+  video.src = held ?? url;
+  return true;
 }
 
 /**
@@ -147,7 +207,8 @@ export function applyMediaFitStyles(
   // media patch (the editor's in-place path calls it unconditionally), so it
   // covers a changed box and in-point as well as a changed fit or crop.
   if (el.type === 'video' && tag.tagName.toLowerCase() === 'video') {
-    tag.dataset.mediaKey = videoPresentationKey(el, tag.getAttribute('src') ?? '');
+    tag.dataset.mediaKey = videoPresentationKey(el, videoNetworkSrc(tag as HTMLVideoElement));
+    tag.dataset.assetSrc = el.src;
     // The poster-frame stamp is part of that same identity: a recovery pass
     // reads it to re-seek an element whose frame was dropped, and a stale
     // in-point here would restore the frame the clip no longer starts at.
@@ -238,7 +299,7 @@ export function renderElement(
   node.dataset.elementId = el.id;
   node.dataset.elementType = el.type;
 
-  applyElementBoxStyles(node, el);
+  applyElementBoxStyles(node, el, undefined, opts.resolveSrc);
 
   const body = renderBody(el, opts);
   if (
@@ -258,8 +319,8 @@ export function renderElement(
 }
 
 /**
- * Write the wrapper box -- geometry, opacity, rotation and the element's own
- * CSS -- onto a node.
+ * Write the wrapper box -- geometry, opacity, rotation, flips and the
+ * element's own CSS -- onto a node.
  *
  * Shared with the editor rather than private to `renderElement`, because the
  * editor patches existing nodes in place for non-structural changes instead of
@@ -270,12 +331,16 @@ export function renderElement(
  * One function, called by both paths, removes that whole failure mode.
  *
  * `previous` is the element as it was last rendered, when known: keys it had
- * and this one does not must be cleared from a reused node.
+ * and this one does not must be cleared from a reused node. `resolveSrc`
+ * points a deck-relative `url(assets/…)` in the element's own CSS (a
+ * background image, text filled with a picture) at the deck's files; without
+ * it the URL resolves against the app's page and the picture never loads.
  */
 export function applyElementBoxStyles(
   node: HTMLElement,
   el: SlideElement,
   previous?: SlideElement,
+  resolveSrc?: (src: string) => string,
 ): void {
   const s = node.style;
   if (previous) {
@@ -289,14 +354,16 @@ export function applyElementBoxStyles(
   s.width = `${el.w}px`;
   s.height = `${el.h}px`;
   s.opacity = String(el.opacity);
-  s.transform = el.rot ? `rotate(${el.rot}deg)` : '';
+  s.transform = elementTransform(el);
   for (const [k, v] of Object.entries(el.style)) {
     if (typedPropertyOwnsCss(el, k)) {
       s.removeProperty(k);
       continue;
     }
-    s.setProperty(k, v);
+    s.setProperty(k, resolveSrc && v.includes('url(') ? rewriteCssAssetUrls(v, resolveSrc) : v);
   }
+  // A curved (paper) shadow is drawn by player.css from these settings.
+  node.classList.toggle('shadow-curved', curvedShadowClasses(el.style).length > 0);
   // Shape paint lives in an SVG child, but CSS effects such as box-shadow live
   // on this positioned wrapper. Give that wrapper the same contour as the SVG
   // or a circular imported frame casts a square shadow and a rounded card casts
@@ -342,6 +409,8 @@ export function applyTextRenderState(
 
   if (el.noWrap) node.dataset.noWrap = 'true';
   else delete node.dataset.noWrap;
+  if (el.autoSize) node.dataset.autoSize = 'true';
+  else delete node.dataset.autoSize;
   if (el.noWrap && el.noWrapMode === 'condense') node.dataset.fitMode = 'condense';
   else delete node.dataset.fitMode;
 
@@ -397,7 +466,9 @@ export function applyTextRenderState(
 
   // noWrap implies the fit: with soft wrapping off, shrinking is the only way
   // an overlong line stays inside the box.
-  if (el.autoFit || el.noWrap) {
+  // A box sized to its text has nothing to shrink into: the box follows the
+  // text instead.
+  if ((el.autoFit || el.noWrap) && !el.autoSize) {
     node.dataset.autoFit = 'true';
     scheduleAutoFit(node);
   } else {
@@ -512,6 +583,9 @@ export function syncMediaFrame(
     if (radius) mediaBody.style.borderRadius = radius;
     else mediaBody.style.removeProperty('border-radius');
   }
+  // A before/after wipe is part of the picture's framing too, so it rides
+  // the same shared path (wipe.ts).
+  syncWipe(node, el, mediaBody);
 }
 
 function renderVisualEffects(
@@ -634,13 +708,20 @@ export function fitAutoText(root: ParentNode): void {
   }
 }
 
-/** Defer until the rendered node has been attached and therefore has layout. */
+/**
+ * Defer until the rendered node has been attached and therefore has layout.
+ *
+ * Only a box that opted in (`data-auto-fit`, set from autoFit or noWrap) is
+ * fitted, checked when the fit runs. Editing code schedules a fit after every
+ * list edit whatever the box, and fitting a fixed-size box shrank its text:
+ * taking an empty bullet off a box saved one line too short sent it to 6px.
+ */
 export function scheduleAutoFit(node: HTMLElement): void {
   if (pendingTextFits.has(node)) return;
   pendingTextFits.add(node);
   const run = () => {
     pendingTextFits.delete(node);
-    if (node.isConnected) fitAutoTextElement(node);
+    if (node.isConnected && node.dataset.autoFit === 'true') fitAutoTextElement(node);
   };
   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
   else setTimeout(run, 0);
@@ -683,6 +764,9 @@ function renderBody(el: SlideElement, opts: RenderOptions): HTMLElement | SVGEle
         ],
         throwOnError: false,
         strict: 'ignore',
+        // Equation terms (`\step{2}{…}`) render as classed spans that term
+        // builds and pulses address; nothing else KaTeX gates is trusted.
+        ...katexTermOptions(),
       });
       const walker = document.createTreeWalker(content, NodeFilter.SHOW_TEXT);
       while (walker.nextNode()) {
@@ -707,7 +791,8 @@ function renderBody(el: SlideElement, opts: RenderOptions): HTMLElement | SVGEle
         return pdf;
       }
       const img = document.createElement('img');
-      img.src = opts.resolveSrc(el.src);
+      if (opts.decodeImagesAsync) img.decoding = 'async';
+      assignImageSrc(img, opts.resolveSrc(el.src), opts);
       img.alt = el.alt;
       img.draggable = false;
 
@@ -776,6 +861,9 @@ function renderBody(el: SlideElement, opts: RenderOptions): HTMLElement | SVGEle
     case 'web':
       return renderWeb(el, opts);
 
+    case 'code':
+      return renderCodeBody(el);
+
     case 'unsupported': {
       // Visible on purpose: an import gap you can see and fix beats content
       // that vanished silently.
@@ -800,6 +888,10 @@ function renderBody(el: SlideElement, opts: RenderOptions): HTMLElement | SVGEle
  * Morph and layout previews) show the poster when there is one and otherwise
  * an inert frame — inert so the editor's own pointer handling keeps working
  * over it. The live frame only exists where the deck is being presented.
+ *
+ * A live frame is hidden until its page is ready (see `revealWhenReady`), with
+ * the poster laid over it meanwhile: a page that lays itself out from script
+ * otherwise flashes its raw, unpositioned state the moment the slide appears.
  */
 function renderWeb(
   el: Extract<SlideElement, { type: 'web' }>,
@@ -814,7 +906,7 @@ function renderWeb(
 
   if (preview && el.poster) {
     const poster = document.createElement('img');
-    poster.src = opts.resolveSrc(el.poster);
+    assignImageSrc(poster, opts.resolveSrc(el.poster), opts);
     poster.alt = el.title;
     poster.style.width = '100%';
     poster.style.height = '100%';
@@ -852,7 +944,113 @@ function renderWeb(
   // author wants clicks on the page to advance the deck instead.
   frame.style.pointerEvents = preview || !el.interactive ? 'none' : 'auto';
   box.appendChild(frame);
+  if (!preview) revealWhenReady(box, frame, el.poster ? opts.resolveSrc(el.poster) : null, el.title, opts);
   return box;
+}
+
+/**
+ * How long a live web page may stay hidden waiting to be ready. A page that
+ * never finishes loading (a stalled request inside it) or never releases a
+ * `deckwerk.ready(promise)` is shown anyway after this — as it is.
+ */
+export const WEB_REVEAL_TIMEOUT_MS = 5_000;
+
+/** Settles once a live web element is showing its page (see `revealWhenReady`). */
+const webReady = new WeakMap<Element, Promise<void>>();
+
+/**
+ * Resolves once the live web element rendered as `box` (its `.web-body`)
+ * shows its page — readied or timed out. Print readiness waits on this so a
+ * PDF page is not captured with the frame still hidden. Anything that is not
+ * a live web box resolves at once.
+ */
+export function whenWebElementReady(box: Element): Promise<void> {
+  return webReady.get(box) ?? Promise.resolve();
+}
+
+/**
+ * Keep a live frame hidden until its page is ready to be seen.
+ *
+ * Ready is the frame's `load` plus two animation frames, so whatever the
+ * page's load handlers lay out has been painted. A page can ask for longer
+ * through the bridge runtime: `deckwerk.ready(promise)` posts `hold-ready`
+ * while the page's scripts first run (before `load`) and `ready` when the
+ * promise settles. Pages without the runtime, or that never call it, get the
+ * default. Until then the poster, if there is one, covers the frame; the
+ * frame itself is `visibility: hidden`, which still loads and runs it. A
+ * timeout shows the page however far it got.
+ */
+function revealWhenReady(
+  box: HTMLElement,
+  frame: HTMLIFrameElement,
+  posterSrc: string | null,
+  title: string,
+  opts: RenderOptions,
+): void {
+  box.style.position = 'relative';
+  box.dataset.webReady = 'false';
+  frame.style.visibility = 'hidden';
+  let poster: HTMLImageElement | null = null;
+  if (posterSrc) {
+    poster = document.createElement('img');
+    poster.className = 'web-poster';
+    assignImageSrc(poster, posterSrc, opts);
+    poster.alt = title;
+    poster.setAttribute('aria-hidden', 'true');
+    poster.draggable = false;
+    Object.assign(poster.style, {
+      position: 'absolute', inset: '0', width: '100%', height: '100%',
+      objectFit: 'contain', display: 'block', pointerEvents: 'none',
+    });
+    box.appendChild(poster);
+  }
+
+  let held = false;
+  let loaded = false;
+  let painted = false;
+  let released = false;
+  let revealed = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let resolveReady!: () => void;
+  webReady.set(box, new Promise<void>((resolve) => { resolveReady = resolve; }));
+  const nextFrame = (callback: () => void): void => {
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => callback());
+    else setTimeout(callback, 16);
+  };
+
+  const reveal = (): void => {
+    if (revealed) return;
+    revealed = true;
+    clearTimeout(timer);
+    window.removeEventListener('message', onMessage);
+    frame.style.visibility = '';
+    poster?.remove();
+    box.dataset.webReady = 'true';
+    resolveReady();
+  };
+  const settle = (): void => {
+    if (painted && (!held || released)) reveal();
+  };
+  const onMessage = (event: MessageEvent): void => {
+    if (event.source === null || event.source !== frame.contentWindow) return;
+    const action = webReadinessAction(event.data);
+    if (action === 'hold-ready') held = true;
+    else if (action === 'ready') {
+      released = true;
+      settle();
+    }
+  };
+  window.addEventListener('message', onMessage);
+  frame.addEventListener('load', () => {
+    // A frame re-inserted into the document loads again; only the first counts.
+    if (loaded) return;
+    loaded = true;
+    nextFrame(() => nextFrame(() => {
+      painted = true;
+      settle();
+    }));
+  });
+  timer = setTimeout(reveal, WEB_REVEAL_TIMEOUT_MS);
 }
 
 /**
@@ -1006,6 +1204,11 @@ function renderVideo(
   const video = document.createElement('video');
   video.playsInline = true;
   video.dataset.mediaKey = videoPresentationKey(el, opts.resolveSrc(el.src));
+  // Which deck file this is: its URL may name content rather than a path.
+  video.dataset.assetSrc = el.src;
+  // Black only once decoding has failed (player.css): a black surface behind a
+  // working video shows as a dark hairline at its scaled edges on light slides.
+  video.addEventListener('error', () => video.classList.add('media-failed'));
   const preload = opts.mediaPreload ?? 'auto';
   // The preload hint must be in place before src: assigning src is what
   // starts resource selection, and it reads the hint of that moment.
@@ -1025,7 +1228,25 @@ function renderVideo(
   // Chromium has already put in NETWORK_NO_SOURCE, whose queued 'emptied'
   // the load gate would read as a freed slot.
   const deferSrc = preload === 'metadata' && opts.deferVideoSrc === true && previewPosterProvider() !== null;
-  if (deferSrc) {
+  // A browser whose media stack re-downloads a clip for every element reads
+  // it from memory instead (videoMemory.ts). Preview surfaces have stills.
+  const memory = preload === 'metadata' && opts.deferVideoSrc !== true ? videoMemory() : null;
+  const memoryMode = memory?.mode(src, el.src) ?? 'network';
+  if (memory && memoryMode !== 'network') {
+    video.dataset.networkSrc = src;
+    const still = memory.still(el.src, el.start > 0 ? el.start : 0);
+    if (still) video.dataset.stillPoster = still;
+    const held = memoryMode === 'memory' ? memory.objectUrl(src) : undefined;
+    if (held) {
+      video.preload = 'auto';
+      video.src = held;
+    } else if (memoryMode === 'memory') {
+      video.dataset.memoryPending = 'true';
+      memory.request(src);
+    } else {
+      video.dataset.streamPending = 'true';
+    }
+  } else if (deferSrc) {
     // No src, no fetch, no decoder: the still is cut elsewhere. Stashed where
     // the gate keeps an aborted source, so recovery and capture code that
     // already read that slot need no second path.
@@ -1035,7 +1256,7 @@ function renderVideo(
     video.src = src;
   }
   applyVideoPlaybackState(video, el, opts);
-  if (preload === 'metadata' && !deferSrc) {
+  if (preload === 'metadata' && !deferSrc && memoryMode === 'network') {
     // Preview surfaces mount many videos at once (one per rail thumbnail);
     // letting them all fetch together monopolises the origin's connections.
     // They start as 'none' — src set, nothing fetched — and the gate promotes

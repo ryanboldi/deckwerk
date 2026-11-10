@@ -1,10 +1,13 @@
 import { existsSync } from 'node:fs';
-import { copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { dirname, extname, join, relative, resolve } from 'node:path';
 import type { Deck, Slide } from '@shared/deck.js';
 import type { WebExportQuality } from '@shared/ipc.js';
 import { loadTheme, resolveAsset } from './deckStore.js';
 import { encodeImageWebp, probeImage, probeMedia, transcodeVideoForWeb } from './ffmpeg.js';
+import { copyFileStreamed } from './copyFileStreamed.js';
+import { exportPlayerDir, exportPlayerUnavailableReason } from './exportPlayer.js';
+import { writeFileNamed } from './writeFailure.js';
 
 /**
  * Export a deck as a self-contained folder that opens in any browser.
@@ -20,29 +23,16 @@ import { encodeImageWebp, probeImage, probeMedia, transcodeVideoForWeb } from '.
  * a web host without anyone in the audience noticing.
  */
 
-/** Where the export player bundle lives, in dev and when packaged. */
-function playerBundleDir(): string {
-  const candidates = [
-    join(import.meta.dirname, '../export'),
-    join(import.meta.dirname, '../../out/export'),
-    join(process.cwd(), 'out/export'),
-  ];
-  return candidates.find((dir) => existsSync(join(dir, 'player.js'))) ?? candidates[0];
-}
-
 /**
  * Why a web export cannot run right now, or null when it can.
  *
- * The export player is a build artefact rather than source, so a checkout that
- * has not run `npm run build:export` — or a server deployed without it — can
- * only find out by trying. Callers that hand the result straight to a browser
- * download need to know before they start writing bytes.
+ * The export player is a build artefact (src/main/exportPlayer.ts): a
+ * checkout builds its own on demand, but a server or app deployed without
+ * one can only find out by trying. Callers that hand the result straight to
+ * a browser download need to know before they start writing bytes.
  */
 export function webExportUnavailableReason(): string | null {
-  const playerJs = join(playerBundleDir(), 'player.js');
-  return existsSync(playerJs)
-    ? null
-    : `Export player bundle not found at ${playerJs}. Run: npm run build:export`;
+  return exportPlayerUnavailableReason();
 }
 
 export interface WebExportOptions {
@@ -54,6 +44,13 @@ export interface WebExportOptions {
    * rail number, which counts skipped ones.
    */
   dropSkipped?: boolean;
+  /**
+   * Copy only the media these slides (by id) show. Every slide stays in the
+   * page, so the player's slide numbers still match the deck's; the others
+   * simply have no files. For `slide-agent render`, which captures a few
+   * slides of a deck that may carry a gigabyte of media.
+   */
+  onlySlides?: ReadonlySet<string>;
   /** Re-encodes running at once. Two keeps libx264 busy without thrashing. */
   concurrency?: number;
 }
@@ -105,7 +102,7 @@ const PROFILES: Record<WebExportQuality, QualityProfile> = {
   },
 };
 
-const VIDEO_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.mpg', '.mpeg', '.wmv', '.ogv']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.m4v', '.mov', '.qt', '.webm', '.mkv', '.avi', '.mpg', '.mpeg', '.wmv', '.ogv']);
 /** Stills worth re-encoding. GIF and SVG stay as they are: one animates, one has no pixels. */
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff', '.heic', '.heif', '.avif']);
 
@@ -118,7 +115,7 @@ export async function exportDeck(
 ): Promise<WebExportResult> {
   const unavailable = webExportUnavailableReason();
   if (unavailable) throw new Error(unavailable);
-  const bundleDir = playerBundleDir();
+  const bundleDir = await exportPlayerDir();
   const playerJs = join(bundleDir, 'player.js');
   const quality = options.quality ?? 'original';
   const profile = PROFILES[quality];
@@ -126,12 +123,18 @@ export async function exportDeck(
   const exported: Deck = options.dropSkipped
     ? { ...deck, slides: deck.slides.filter((slide) => !slide.skipped) }
     : deck;
-  const wanted = referencedAssets(exported);
+  const wanted = referencedAssets(options.onlySlides
+    ? { ...exported, slides: exported.slides.filter((slide) => options.onlySlides!.has(slide.id)) }
+    : exported);
+  // theme.css names files no slide does: a webfont's `@font-face`, a paper
+  // texture. It ships as written, so those go across under their own names.
+  const theme = await loadTheme(deckDir, deck.theme);
+  const themeAssets = themeReferencedAssets(theme);
 
   // Progress is weighted by bytes: a 120 MB screen recording is most of the
   // wait, and a bar that ticked once per file would sit still for minutes on
   // it and then race through fifty small figures.
-  const sources = await measureSources(deckDir, wanted);
+  const sources = await measureSources(deckDir, new Set([...wanted, ...themeAssets]));
   const mediaBytes = [...sources.values()].reduce((sum, s) => sum + s.bytes, 0);
   // Five fixed steps share a nominal weight so an asset-free deck still moves.
   const fixedWeight = Math.max(1, mediaBytes / 20);
@@ -146,27 +149,38 @@ export async function exportDeck(
   doneWeight += fixedWeight;
 
   report('Copying player.js');
-  await copyFile(playerJs, join(outDir, 'player.js'));
+  await copyFileStreamed(playerJs, join(outDir, 'player.js'));
   doneWeight += fixedWeight;
+
+  // Code blocks highlight from a second script holding every grammar; a deck
+  // without code does not carry it (vite.export.config.ts).
+  const codeHighlightJs = join(bundleDir, 'code-highlight.js');
+  if (exported.slides.some((slide) => slide.elements.some((element) => element.type === 'code'))
+    && existsSync(codeHighlightJs)) {
+    report('Copying code-highlight.js');
+    await copyFileStreamed(codeHighlightJs, join(outDir, 'code-highlight.js'));
+  }
 
   // The player's structural CSS, then the deck's theme, in that order — the
   // theme must win, exactly as it does in the app.
   const playerCss = join(bundleDir, 'player.css');
   report('Writing player.css');
   const structural = existsSync(playerCss) ? await readFile(playerCss, 'utf8') : '';
-  await writeFile(join(outDir, 'player.css'), structural, 'utf8');
+  await writeFileNamed(join(outDir, 'player.css'), structural, 'utf8');
   doneWeight += fixedWeight;
 
   report(`Writing ${deck.theme}`);
-  const theme = await loadTheme(deckDir, deck.theme);
-  await writeFile(join(outDir, 'theme.css'), theme, 'utf8');
+  await writeFileNamed(join(outDir, 'theme.css'), theme, 'utf8');
   doneWeight += fixedWeight;
 
   // The folder exists even when every reference turned out to be unusable, so
   // a reader of the export sees "no assets" rather than "no assets folder".
-  if (wanted.size > 0) await mkdir(join(outDir, 'assets'), { recursive: true });
+  if (wanted.size > 0 || themeAssets.size > 0) await mkdir(join(outDir, 'assets'), { recursive: true });
   const renamed = new Map<string, string>();
   const trimmed = new Map<string, number>();
+  // What the slides' copies wrote in this run, so the theme's pass below can
+  // tell "a slide already shipped this" from "an earlier export left it here".
+  const written = new Set<string>();
   let exportedBytes = 0;
   const jobs = [...wanted].map((rel, index) => async () => {
     const source = sources.get(rel);
@@ -189,17 +203,33 @@ export async function exportDeck(
     );
     doneWeight += source.bytes;
     exportedBytes += outcome.bytes;
+    written.add(outcome.to);
     if (outcome.rel !== rel) renamed.set(rel, outcome.rel);
     if (outcome.trimmedFrom !== undefined) trimmed.set(rel, outcome.trimmedFrom);
   });
   await runPool(jobs, Math.max(1, options.concurrency ?? 2));
 
+  // Byte for byte, and only what a slide's copy did not already put there
+  // unchanged: a re-encoded picture leaves its original name free, and the
+  // theme still points at that name. A file an earlier export left in the
+  // folder is overwritten, or a re-export would keep shipping the old font.
+  for (const rel of themeAssets) {
+    const source = sources.get(rel);
+    const to = source ? join(outDir, source.within) : null;
+    if (!source || !to || written.has(to)) continue;
+    report(`Copying ${rel}`);
+    await mkdir(dirname(to), { recursive: true });
+    await copyFileStreamed(source.path, to);
+    doneWeight += source.bytes;
+    exportedBytes += source.bytes;
+  }
+
   report('Writing index.html');
   const rewritten = renamed.size > 0 || trimmed.size > 0
     ? rewriteAssetReferences(exported, renamed, trimmed)
     : exported;
-  await writeFile(join(outDir, 'index.html'), indexHtml(rewritten), 'utf8');
-  await writeFile(
+  await writeFileNamed(join(outDir, 'index.html'), indexHtml(rewritten), 'utf8');
+  await writeFileNamed(
     join(outDir, 'export.json'),
     JSON.stringify({
       title: deck.title,
@@ -274,14 +304,14 @@ async function exportAsset(
   renderedEdge: number,
   range: PlayedRange | null,
   progress: (verb: string, fraction: number) => void,
-): Promise<{ rel: string; bytes: number; trimmedFrom?: number }> {
+): Promise<{ rel: string; bytes: number; to: string; trimmedFrom?: number }> {
   const ext = extname(source.within).toLowerCase();
-  const copy = async (): Promise<{ rel: string; bytes: number }> => {
+  const copy = async (): Promise<{ rel: string; bytes: number; to: string }> => {
     progress('Copying', 0);
     const to = join(outDir, source.within);
     await mkdir(dirname(to), { recursive: true });
-    await copyFile(source.path, to);
-    return { rel, bytes: source.bytes };
+    await copyFileStreamed(source.path, to);
+    return { rel, bytes: source.bytes, to };
   };
 
   if (profile.video && VIDEO_EXTENSIONS.has(ext)) {
@@ -289,14 +319,14 @@ async function exportAsset(
     const target = withExtension(source.within, container);
     const encoded = await encodeVideo(source, join(outDir, target), profile.video, renderedEdge, range, progress);
     if (encoded !== null) {
-      return { rel: withExtension(rel, container), bytes: encoded, trimmedFrom: range?.start };
+      return { rel: withExtension(rel, container), bytes: encoded, to: join(outDir, target), trimmedFrom: range?.start };
     }
     return copy();
   }
   if (profile.image && IMAGE_EXTENSIONS.has(ext) && source.bytes >= profile.image.minBytes) {
     const target = withExtension(source.within, '.webp');
     const encoded = await encodeImage(source, join(outDir, target), profile.image, renderedEdge, progress);
-    if (encoded !== null) return { rel: withExtension(rel, '.webp'), bytes: encoded };
+    if (encoded !== null) return { rel: withExtension(rel, '.webp'), bytes: encoded, to: join(outDir, target) };
     return copy();
   }
   return copy();
@@ -469,8 +499,19 @@ export function referencedAssets(deck: Deck): Set<string> {
         collectFallbackAssets(el.html, wanted);
         collectFallbackAssets(el.css ?? '', wanted);
       }
+      // A picture can also live in the element's own CSS (a background image,
+      // text filled with a picture) or in a styled run of its text.
+      for (const value of Object.values(el.style)) collectFallbackAssets(value, wanted);
+      if (el.type === 'text') collectFallbackAssets(el.html, wanted);
     }
   }
+  return wanted;
+}
+
+/** The deck files theme.css refers to with `url(assets/…)` or `url(./assets/…)`. */
+export function themeReferencedAssets(css: string): Set<string> {
+  const wanted = new Set<string>();
+  for (const match of css.matchAll(CSS_ASSET_URL)) wanted.add(match[1]);
   return wanted;
 }
 
@@ -481,9 +522,11 @@ function collectFallbackAssets(source: string, wanted: Set<string>): void {
   }
 }
 
+const CSS_ASSET_URL = /url\(\s*["']?(?:\.\/)?(assets\/[^"')#?]+)(?:[?#][^"')]*)?["']?\s*\)/gi;
+
 const HTML_ASSET_PATTERNS = [
   /\b(?:src|poster)\s*=\s*["'](assets\/[^"'#?]+)(?:[?#][^"']*)?["']/gi,
-  /url\(\s*["']?(assets\/[^"')#?]+)(?:[?#][^"')]*)?["']?\s*\)/gi,
+  CSS_ASSET_URL,
 ];
 
 /**
@@ -516,7 +559,10 @@ export function rewriteAssetReferences(
   const rewriteSlide = <T extends Pick<Slide, 'background' | 'elements'>>(slide: T): T => ({
     ...slide,
     background: { ...slide.background, image: swap(slide.background.image) },
-    elements: slide.elements.map((el) => {
+    elements: slide.elements.map((original) => {
+      const el = Object.values(original.style).some((value) => value.includes('url('))
+        ? { ...original, style: Object.fromEntries(Object.entries(original.style).map(([k, v]) => [k, swapInSource(v)])) }
+        : original;
       if (el.type === 'image') return { ...el, src: swap(el.src) as string };
       if (el.type === 'video') {
         return {
@@ -530,6 +576,7 @@ export function rewriteAssetReferences(
       if (el.type === 'html') {
         return { ...el, html: swapInSource(el.html), css: el.css === undefined ? el.css : swapInSource(el.css) };
       }
+      if (el.type === 'text') return { ...el, html: swapInSource(el.html) };
       return el;
     }),
   });

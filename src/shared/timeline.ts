@@ -1,5 +1,24 @@
 import type { Slide, SlideElement, TimelineEntry } from './deck.js';
 import { countParagraphs } from './paragraphs.js';
+import {
+  DEFAULT_TERM_DURATION,
+  applyTermAction,
+  defaultEmphasisDuration,
+  initialTermStates,
+  isEmphasisType,
+  isTermBuild,
+  type EmphasisType,
+  termBuildLabels,
+  type TermState,
+} from './equationTerms.js';
+import {
+  applyLineAction,
+  formatLineRanges,
+  initialCodeLineStates,
+  isLineBuild,
+  lineBuildSteps,
+  type CodeLineState,
+} from './codeBlocks.js';
 
 /**
  * Timeline reasoning, shared by the player and the editor's timeline panel.
@@ -32,6 +51,77 @@ export function isParagraphBuild(entry: TimelineEntry, slide: Slide): boolean {
   );
 }
 
+/** How long a drawn-in line takes when its entry does not say. */
+export const DEFAULT_DRAW_DURATION = 600;
+/** How long a dissolve takes when its entry does not say (Keynote's default too). */
+export const DEFAULT_DISSOLVE_DURATION = 1000;
+/** How long a blur takes when its entry does not say. */
+export const DEFAULT_BLUR_DURATION = 1000;
+/** How long a pop takes when its entry does not say. */
+export const DEFAULT_POP_DURATION = 500;
+/** The size a pop grows from, and the size it overshoots to, when its entry does not say. */
+export const DEFAULT_POP_FROM = 0.6;
+export const DEFAULT_POP_PEAK = 1.06;
+
+/** The sizes a pop moves through: from `from`, up to `peak`, settling at 1. */
+export function popScales(entry: TimelineEntry): { from: number; peak: number } {
+  return {
+    from: entry.action.popFrom ?? DEFAULT_POP_FROM,
+    peak: entry.action.popPeak ?? DEFAULT_POP_PEAK,
+  };
+}
+
+/**
+ * The animated forms an `appear` or a `disappear` can take. `dissolve` fades
+ * any element in or out; `blur` fades it in out of a blur (or out into one);
+ * `draw` draws a line or arrow in from its start; `pop` (appear only) grows the
+ * element in from smaller, overshoots a little and settles.
+ */
+export type BuildEffect = 'draw' | 'dissolve' | 'blur' | 'pop' | 'terms' | 'emphasis';
+
+/** The effect an entry animates with, or null for an instant change. */
+export function buildEffect(entry: TimelineEntry, slide: Slide): BuildEffect | null {
+  const { type, value } = entry.action;
+  // A term fades in (or changes colour) and an emphasis swells or wobbles and
+  // settles; both take time, so an "after previous" build waits them out like
+  // any other.
+  if (type === 'terms') return type;
+  if (isEmphasisType(type)) return 'emphasis';
+  if ((value === 'dissolve' || value === 'blur') && (type === 'appear' || type === 'disappear')) {
+    return value;
+  }
+  if (value === 'pop' && type === 'appear') return 'pop';
+  if (isDrawBuild(entry, slide)) return 'draw';
+  return null;
+}
+
+/** Milliseconds an animated build takes. */
+export function effectDuration(entry: TimelineEntry, effect: BuildEffect): number {
+  return entry.action.duration
+    ?? (effect === 'terms' ? DEFAULT_TERM_DURATION
+      : effect === 'emphasis' ? defaultEmphasisDuration(entry.action.type as EmphasisType)
+      : effect === 'draw' ? DEFAULT_DRAW_DURATION
+      : effect === 'blur' ? DEFAULT_BLUR_DURATION
+      : effect === 'pop' ? DEFAULT_POP_DURATION : DEFAULT_DISSOLVE_DURATION);
+}
+
+/**
+ * An `appear` marked `draw` on a shape draws it in the way a pen would, as
+ * Keynote's Line Draw does: a line or arrow from its start to its end, and a
+ * rectangle, ellipse or drawn path along its outline, its fill following once
+ * the outline is complete. Anything else so marked is an ordinary appear:
+ * text and pictures have no stroke to follow.
+ */
+export function isDrawBuild(entry: TimelineEntry, slide: Slide): boolean {
+  if (entry.action.type !== 'appear' || entry.action.value !== 'draw') return false;
+  return findElement(slide, entry.action.target)?.type === 'shape';
+}
+
+/** Milliseconds a draw build takes. */
+export function drawDuration(entry: TimelineEntry): number {
+  return effectDuration(entry, 'draw');
+}
+
 /**
  * The timeline with by-paragraph entries fanned out into one unit per
  * paragraph, in document order — paragraphs cannot be reordered or split
@@ -43,6 +133,43 @@ export function isParagraphBuild(entry: TimelineEntry, slide: Slide): boolean {
 export function expandTimeline(slide: Slide): ExpandedEntry[] {
   const out: ExpandedEntry[] = [];
   for (const entry of slide.timeline) {
+    // A code block built line by line fans out the same way, one unit per
+    // line, each naming its lines so it can be run on its own
+    // (shared/codeBlocks.ts). A build that names its lines is one unit.
+    if (isLineBuild(entry, slide) && !entry.action.lines) {
+      const steps = lineBuildSteps(entry, slide);
+      if (steps.length > 0) {
+        steps.forEach((lines, index) => out.push({
+          id: index === 0 ? entry.id : `${entry.id}#l${index}`,
+          sourceId: entry.id,
+          part: null,
+          partCount: 1,
+          trigger: index === 0
+            ? entry.trigger
+            : { on: entry.trigger.on === 'click' ? 'click' : 'afterPrev', ref: null, delay: entry.trigger.delay },
+          action: { ...entry.action, lines: formatLineRanges(lines) },
+        }));
+        continue;
+      }
+    }
+    // An equation's terms fan out the same way, one unit per term label, each
+    // naming its term so it can be run on its own.
+    if (isTermBuild(entry) && !entry.action.term) {
+      const labels = termBuildLabels(entry, slide);
+      if (labels.length > 0) {
+        labels.forEach((term, index) => out.push({
+          id: index === 0 ? entry.id : `${entry.id}#t${index}`,
+          sourceId: entry.id,
+          part: null,
+          partCount: 1,
+          trigger: index === 0
+            ? entry.trigger
+            : { on: entry.trigger.on === 'click' ? 'click' : 'afterPrev', ref: null, delay: entry.trigger.delay },
+          action: { ...entry.action, term },
+        }));
+        continue;
+      }
+    }
     if (!isParagraphBuild(entry, slide)) {
       out.push({ ...entry, sourceId: entry.id, part: null, partCount: 1 });
       continue;
@@ -109,12 +236,19 @@ export interface SlideState {
   visible: Set<string>;
   /** Ids of video elements that should be playing. */
   playing: Set<string>;
-  /** Extra CSS classes applied by `addClass`/`removeClass` actions. */
+  /** Each element's classes at this step: its authored `class`, then `addClass`/`removeClass` on top. */
   classes: Map<string, Set<string>>;
   /** Seek positions in seconds requested by `seek` actions. */
   seeks: Map<string, number>;
   /** For by-paragraph targets: how many leading paragraphs are revealed. */
   parts: Map<string, number>;
+  /** For equations with term builds: which terms are still hidden, and term colours. */
+  terms: Map<string, TermState>;
+  /**
+   * For code blocks with line builds: which lines are still hidden, and the
+   * highlight or dim that holds. A block with none shows every line plainly.
+   */
+  lines: Map<string, CodeLineState>;
 }
 
 /**
@@ -136,7 +270,8 @@ export function resolveState(slide: Slide, step: number): SlideState {
         .filter((e) => e.type === 'video' && e.autoplay && !hidden.has(e.id))
         .map((e) => e.id),
     ),
-    classes: new Map(),
+    // Seeded with the authored classes so `removeClass` can take one away.
+    classes: new Map(slide.elements.map((e) => [e.id, new Set(e.class)])),
     seeks: new Map(),
     // Seeding every by-paragraph target at zero tells the renderers which
     // elements need per-paragraph reconciliation even before their first step.
@@ -145,6 +280,8 @@ export function resolveState(slide: Slide, step: number): SlideState {
         .filter((entry) => isParagraphBuild(entry, slide))
         .map((entry) => [entry.action.target, 0]),
     ),
+    terms: initialTermStates(slide),
+    lines: initialCodeLineStates(slide),
   };
 
   const steps = groupIntoSteps(slide);
@@ -195,6 +332,18 @@ export function applyAction(
     case 'removeClass':
       if (typeof value === 'string') classSet(state, target).delete(value);
       break;
+    case 'terms':
+      applyTermAction(state.terms, entry, slide);
+      break;
+    // An emphasis changes nothing it leaves behind: the state after it is
+    // the state before it, which is what makes it safe to jump over.
+    case 'pulse':
+    case 'jiggle':
+    case 'pop':
+      break;
+    case 'lines':
+      applyLineAction(state.lines, entry, slide);
+      break;
   }
 }
 
@@ -235,16 +384,32 @@ export function nextCursor(slides: Slide[], cur: Cursor): Cursor {
   return cur;
 }
 
+/** A step whose every build is an emphasis: stepping back over it changes nothing. */
+function isEmphasisStep(step: ExpandedEntry[] | undefined): boolean {
+  return Boolean(step?.length) && step!.every((entry) => isEmphasisType(entry.action.type));
+}
+
 /**
  * Go back one step, rolling onto the *last* step of the previous slide so that
  * stepping backwards over a slide boundary restores the fully-built state
- * rather than resetting it.
+ * rather than resetting it. Steps that only play an emphasis are stepped over.
  */
 export function prevCursor(slides: Slide[], cur: Cursor): Cursor {
-  if (cur.step > 0) return { slide: cur.slide, step: cur.step - 1 };
+  const slide = slides[cur.slide];
+  if (slide && cur.step > 0) {
+    // Undoing an emphasis changes nothing on screen, so a press that only
+    // stepped back over one would look ignored: keep going until the step
+    // undone is one that changed the picture. A slide whose steps so far were
+    // all emphasis has nothing to undo, and goes back to the previous slide.
+    const steps = groupIntoSteps(slide);
+    let step = cur.step - 1;
+    while (step > 0 && isEmphasisStep(steps[step + 1])) step -= 1;
+    if (step > 0 || !isEmphasisStep(steps[1])) return { slide: cur.slide, step };
+  }
   for (let i = cur.slide - 1; i >= 0; i--) {
     if (slides[i].skipped) continue;
     return { slide: i, step: stepCount(slides[i]) - 1 };
   }
-  return cur;
+  // The first slide: nothing before it, so its start, ready to play again.
+  return cur.step > 0 ? { slide: cur.slide, step: 0 } : cur;
 }

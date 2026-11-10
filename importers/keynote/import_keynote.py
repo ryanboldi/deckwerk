@@ -24,9 +24,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import functools
 import hashlib
 import html
+import io
 import json
 import math
 import os
@@ -50,7 +52,7 @@ try:
     from keynote_parser.codec import IWAFile
 except ImportError:  # pragma: no cover - environment problem, not a deck problem
     sys.stderr.write(
-        "keynote-parser is not installed. Run: pip install keynote-parser\n"
+        "keynote-parser is not installed. Run: npm run setup:importers\n"
     )
     raise SystemExit(2)
 
@@ -66,7 +68,22 @@ SLIDE_SPAN = (0.30, 0.94)
 # Without this, TIFFs pasted into a Keynote deck import as blank rectangles.
 RASTER_CONVERT = {".tiff", ".tif", ".bmp", ".tga", ".heic", ".heif"}
 WEB_SAFE_IMAGE = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif"}
-VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".m4a"}
+VIDEO_EXTS = {".mp4", ".mov", ".qt", ".m4v", ".webm", ".mkv", ".avi", ".m4a"}
+# `.qt` is QuickTime's old name for the container `.mov` names now. Chromium
+# and the deck's own media rules know only `.mov`, so it is written as that.
+RENAMED_VIDEO_EXTS = {".qt": ".mov"}
+# ISO base media files (MP4 and QuickTime) and the ffmpeg muxer each is
+# rewritten with. Their index, the `moov` box, is often written after the
+# media (screen recordings, most exports): a browser then has to fetch the
+# whole file before it can show a frame, so it is moved to the front on import.
+FASTSTART_MUXERS = {".mp4": "mp4", ".m4v": "mp4", ".m4a": "mp4", ".mov": "mov"}
+# Longest asset file stem kept, in UTF-8 bytes. Keynote keeps whatever name a
+# file arrived with, and a picture saved from the web can be named after its
+# whole URL, hex-encoded: 248 characters, so a tool that adds any suffix to
+# it (a `.h264.mp4`, a temporary `.<pid>.copy-tmp`) passes the 255-byte limit
+# on a file name and fails with ENAMETOOLONG. Longer stems are cut, and a
+# hash of the whole stem keeps two names that share a beginning apart.
+MAX_ASSET_STEM_BYTES = 80
 # Vector art pasted from a paper or a logo. A browser will not render these in
 # an <img>, so they are rasterised on import.
 PDF_EXTS = {".pdf", ".eps"}
@@ -87,6 +104,12 @@ ANIMATED_IMAGE_EXTS = {".gif", ".apng", ".webp"}
 WEB_SAFE_VIDEO_CODECS = {"h264", "vp8", "vp9", "av1", "theora"}
 
 DEFAULT_CANVAS = (1920.0, 1080.0)
+# TSD.GeometryArchive.flags: bits 1 and 2 mark the size and angle valid; 4 and
+# 8 are the Flip Horizontally / Flip Vertically commands. Unnamed in the
+# protos; read from a strip that is the same PDF as its neighbour, flags 7
+# instead of 3, and drawn mirrored by Keynote.
+GEOMETRY_HORIZONTAL_FLIP = 4
+GEOMETRY_VERTICAL_FLIP = 8
 
 
 @dataclass
@@ -188,13 +211,22 @@ def _human_bytes(count: float) -> str:
 
 
 class Package:
-    """Read-only access to a .key package, whether zipped or a directory."""
+    """Read-only access to a .key document, in every shape one travels in.
+
+    Keynote writes two formats. The single file is a zip holding Index/*.iwa,
+    Data/ and Metadata/. The package is a folder whose Index/*.iwa sit inside a
+    nested Index.zip instead; it arrives as that folder, or zipped up whole —
+    which is what macOS does when a package is uploaded through a browser or
+    fetched from a cloud drive — usually inside a "<name>.key/" folder and
+    with Finder's __MACOSX/ entries alongside. All of them read the same here.
+    """
 
     def __init__(self, path: Path):
         self.path = path
-        self._zip: zipfile.ZipFile | None = None
-        # Maps the name a package *should* have for each member to the name
-        # the container actually stores it under. Keynote writes UTF-8 file
+        self._zips: list[zipfile.ZipFile] = []
+        # Maps the name a package *should* have for each member to where it is
+        # actually stored: (the zip holding it, or None for a file under
+        # `path`, and the name it is stored under). Keynote writes UTF-8 file
         # names into the zip without setting the UTF-8 flag, so `zipfile`
         # decodes them as CP437 and a macOS screenshot called
         # "... 12.12.40\u202fPM.png" comes back as mojibake. Looked up by the
@@ -202,30 +234,64 @@ class Package:
         # silently falls back to the 256px thumbnail. Directory packages have
         # the mirror-image problem: HFS+/APFS hand back decomposed (NFD)
         # names while the protobuf holds composed (NFC) ones.
-        self._members: dict[str, str] = {}
+        self._members: dict[str, tuple[zipfile.ZipFile | None, str]] = {}
         if path.is_dir():
             for member in path.rglob("*"):
                 if member.is_file():
                     stored = str(member.relative_to(path))
-                    self._members[_canonical_name(stored)] = stored
+                    self._members[_canonical_name(stored)] = (None, stored)
         else:
-            self._zip = zipfile.ZipFile(path)
-            for info in self._zip.infolist():
-                self._members[_canonical_name(_zip_member_name(info))] = info.filename
+            self._add_zip(zipfile.ZipFile(path))
+        self._strip_bundle_folder()
+        index = self._members.pop("Index.zip", None)
+        if index is not None:
+            self._add_zip(zipfile.ZipFile(io.BytesIO(self._read(*index))), under="Index/")
         self.names = list(self._members)
+
+    def _add_zip(self, archive: zipfile.ZipFile, under: str = "") -> None:
+        self._zips.append(archive)
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            name = _canonical_name(_zip_member_name(info))
+            if under and not name.startswith(under):
+                name = under + name
+            self._members.setdefault(name, (archive, info.filename))
+
+    def _strip_bundle_folder(self) -> None:
+        """Drop the "<name>.key/" folder a zipped-up package sits in."""
+        names = [name for name in self._members if not name.startswith("__MACOSX/")]
+        if not names or any(name == "Index.zip" or name.startswith("Index/") for name in names):
+            return
+        tops = {name.split("/", 1)[0] for name in names}
+        if len(tops) != 1 or not all("/" in name for name in names):
+            return
+        prefix = tops.pop() + "/"
+        inner = {
+            name[len(prefix):]: member
+            for name, member in self._members.items()
+            if name.startswith(prefix)
+        }
+        # Only a folder that holds a document is the bundle's; a deck whose
+        # every member happens to live under Data/ keeps its paths.
+        if any(name == "Index.zip" or name.startswith("Index/") for name in inner):
+            self._members = inner
 
     def __contains__(self, name: str) -> bool:
         return _canonical_name(name) in self._members
 
     def read(self, name: str) -> bytes:
-        stored = self._members.get(_canonical_name(name), name)
-        if self._zip is not None:
-            return self._zip.read(stored)
+        default = (self._zips[0] if self._zips else None, name)
+        return self._read(*self._members.get(_canonical_name(name), default))
+
+    def _read(self, archive: zipfile.ZipFile | None, stored: str) -> bytes:
+        if archive is not None:
+            return archive.read(stored)
         return (self.path / stored).read_bytes()
 
     def close(self) -> None:
-        if self._zip is not None:
-            self._zip.close()
+        for archive in self._zips:
+            archive.close()
 
 
 def _zip_member_name(info: zipfile.ZipInfo) -> str:
@@ -363,7 +429,10 @@ def extract_text(objects: dict[int, Any], shape: Any) -> str:
     size, colour, gradient and alignment; theme.css remains available for
     deliberate restyling after import.
     """
-    for field_name in ("owned_storage", "deprecated_storage"):
+    # A slide's KN.NoteArchive keeps its text in `containedStorage`, the one
+    # field it has; read only the drawable fields, every talk's speaker notes
+    # imported empty.
+    for field_name in ("owned_storage", "deprecated_storage", "containedStorage"):
         # Placeholders wrap a ShapeInfoArchive, so the storage reference can sit
         # one or more levels up the `super` chain rather than on the drawable.
         reference = find_in_super_chain(shape, field_name)
@@ -379,6 +448,443 @@ def extract_text(objects: dict[int, Any], shape: Any) -> str:
         if chunks:
             return "\n".join(chunks)
     return ""
+
+
+# --- equations ------------------------------------------------------------------
+#
+# Insert > Equation makes a TSD.ImageArchive: Keynote's rendering as a PDF in
+# `data`, and what was typed in TSWP.EquationInfoArchive extensions on the
+# image — `equation_source_text` (LaTeX, or MathML when it was written in
+# MathML; `equation_source_old` in older saves) and `equation_text_properties`
+# (font, size, colour). Typed into a text box, the image is an attachment of
+# the storage at a U+FFFC (TSWP.DrawableAttachmentArchive); on its own it is
+# a drawable. Both become TeX, which text renders with KaTeX.
+
+EQUATION_SOURCE_FIELDS = ("equation_source_text", "equation_source_old")
+OBJECT_REPLACEMENT = "\ufffc"
+# An accent or font command whose argument is another command with its own
+# braced argument, unbraced: `\dot\mathbf{x}`.
+KATEX_UNBRACED_ARGUMENT = re.compile(
+    r"(\\(?:dot|ddot|dddot|hat|widehat|bar|vec|tilde|widetilde|check|breve|acute|grave|mathring"
+    r"|overline|underline|boldsymbol|bm|mathbf|mathrm|mathit|mathcal|mathbb|mathsf|mathtt|mathfrak))"
+    r"\s*(\\[A-Za-z]+\s*\{[^{}]*\})"
+)
+# KaTeX sets maths at 1.21em of the surrounding text; Keynote's equation font
+# size is the maths' own em.
+KATEX_SCALE = 1.21
+
+
+def _extension(obj: Any, name: str) -> Any | None:
+    try:
+        for field_descriptor, value in obj.ListFields():
+            if field_descriptor.is_extension and field_descriptor.name == name:
+                return value
+    except Exception:
+        return None
+    return None
+
+
+def equation_source(obj: Any) -> str | None:
+    """The LaTeX or MathML an equation image was typeset from; None for a picture."""
+    if obj is None or type_name(obj) != "ImageArchive":
+        return None
+    for name in EQUATION_SOURCE_FIELDS:
+        value = _extension(obj, name)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def equation_tex(source: str) -> tuple[str | None, str]:
+    """(TeX KaTeX can render, "") or (None, why it could not be converted)."""
+    text = source.strip()
+    if text.startswith("<"):
+        try:
+            text = mathml_to_tex(text)
+        except ValueError as exc:
+            return None, f"MathML {exc}"
+        kind = "MathML"
+    else:
+        kind = "LaTeX"
+        # A comment runs to the end of its line, which joining lines would
+        # stretch over the rest of the formula.
+        text = re.sub(r"(?<!\\)%[^\n]*", "", text)
+    # Text stores the formula between dollars on one line; TeX reads a line
+    # break as a space anyway.
+    text = re.sub(r"\s+", " ", text).strip()
+    # Keynote typesets `\dot\mathbf{x}`; KaTeX wants the accent's argument
+    # braced, `\dot{\mathbf{x}}`, and otherwise shows the source in red.
+    while True:
+        braced = KATEX_UNBRACED_ARGUMENT.sub(r"\1{\2}", text)
+        if braced == text:
+            break
+        text = braced
+    if not text:
+        return None, f"{kind} empty"
+    if re.search(r"(?<!\\)\$", text):
+        return None, f"{kind} with a dollar sign"
+    return text, ""
+
+
+# A slide number typed into text (Insert > Slide Number, or the theme's
+# slide-number box, a KN.PlaceholderArchive of kind kKindSlideNumberPlaceholder)
+# is a field: a U+FFFC whose attachment is a TSWP.NumberAttachmentArchive of
+# TextualAttachmentArchive kind kKindPageNumber, or in older saves a
+# KN.SlideNumberAttachmentArchive. DeckWerk has no slide-number field and a
+# number written in would go stale when slides move, so the field is removed.
+TEXTUAL_KIND_PAGE_NUMBER = 0  # TSWP.TextualAttachmentArchive.Kind.kKindPageNumber
+
+
+def is_slide_number_field(attachment: Any) -> bool:
+    name = type_name(attachment)
+    if name == "SlideNumberAttachmentArchive":
+        return True
+    if name == "NumberAttachmentArchive":
+        textual = attachment.super if _has(attachment, "super") else None
+        return textual is not None and int(getattr(textual, "kind", 0)) == TEXTUAL_KIND_PAGE_NUMBER
+    return False
+
+
+@dataclass
+class TextAttachment:
+    """One entry of a storage's attachment table: what sits at a U+FFFC."""
+
+    index: int
+    archive: Any | None  # the attachment archive (None: a dangling reference)
+    drawable: Any | None  # what a TSWP.DrawableAttachmentArchive places
+    tex: str | None  # an equation's TeX; None for anything else
+    why: str  # why an equation has no TeX
+    slide_number: bool = False
+
+    @property
+    def kind(self) -> str:
+        """A name for the report: the object placed, or the field itself."""
+        if self.drawable is not None:
+            return type_name(self.drawable)
+        return type_name(self.archive) if self.archive is not None else "<missing attachment>"
+
+
+def inline_equation_markup(objects: dict[int, Any], storage: Any) -> list[TextAttachment]:
+    """Every attachment of a storage, in text order.
+
+    Only an equation has TeX; the other attachments (a slide-number field, an
+    inline picture) come back without, as do equations that could not be
+    converted.
+    """
+    if storage is None or not _has(storage, "table_attachment"):
+        return []
+    out = []
+    for entry in sorted(storage.table_attachment.entries, key=lambda e: int(e.character_index)):
+        attachment = objects.get(int(entry.object.identifier)) if entry.object.identifier else None
+        drawable = None
+        if attachment is not None and _has(attachment, "drawable") and attachment.drawable.identifier:
+            drawable = objects.get(int(attachment.drawable.identifier))
+        source = equation_source(drawable)
+        tex, why = equation_tex(source) if source is not None else (None, "")
+        out.append(TextAttachment(
+            int(entry.character_index), attachment, drawable, tex, why,
+            slide_number=attachment is not None and is_slide_number_field(attachment),
+        ))
+    return out
+
+
+def attachment_positions(text: str, attachments: list[TextAttachment]) -> list[int]:
+    """Where in `text` each attachment's U+FFFC is.
+
+    The attachment table indexes the storage's own text. When that is the
+    text here, the indices are used as they are; otherwise (text split over
+    chunks) the n-th U+FFFC is the n-th attachment.
+    """
+    if all(a.index < len(text) and text[a.index] == OBJECT_REPLACEMENT for a in attachments):
+        return [a.index for a in attachments]
+    return [i for i, c in enumerate(text) if c == OBJECT_REPLACEMENT][: len(attachments)]
+
+
+def attachment_inserts(text: str, attachments: list[TextAttachment], render) -> dict[int, str]:
+    """What to write at each U+FFFC of `text`: an equation's TeX, rendered,
+    or nothing for a slide-number field. Every other attachment is left out,
+    so its U+FFFC stays in the text, a visible gap."""
+    if not attachments:
+        return {}
+    out = {}
+    for at, attachment in zip(attachment_positions(text, attachments), attachments):
+        if attachment.slide_number:
+            out[at] = ""
+        elif attachment.tex is not None:
+            out[at] = render(attachment.tex)
+    return out
+
+
+def inline_tex_html(tex: str) -> str:
+    return f"${html.escape(tex)}$"
+
+
+def _escape_text(text: str) -> str:
+    """HTML for literal text. A dollar is written `\\$`: text renders `$…$`
+    as maths, and an imported price would pair with the next one."""
+    return html.escape(text).replace("$", "\\$")
+
+
+def _escape_with_inserts(text: str, start: int, end: int, inserts: dict[int, str] | None) -> str:
+    """`_escape_text(text[start:end])`, with `inserts` written at their indices."""
+    if not inserts:
+        return _escape_text(text[start:end])
+    out: list[str] = []
+    at = start
+    for index in sorted(i for i in inserts if start <= i < end):
+        out.append(_escape_text(text[at:index]))
+        out.append(inserts[index])
+        at = index + 1
+    out.append(_escape_text(text[at:end]))
+    return "".join(out)
+
+
+# MathML operators with a TeX command KaTeX knows; anything else in an <mo>
+# is passed through as the character, which KaTeX renders as a symbol.
+MATHML_OPERATORS = {
+    "\u27f6": r"\longrightarrow", "\u2192": r"\rightarrow", "\u2190": r"\leftarrow",
+    "\u27f5": r"\longleftarrow", "\u2194": r"\leftrightarrow", "\u21d2": r"\Rightarrow",
+    "\u27f9": r"\Longrightarrow", "\u21d0": r"\Leftarrow", "\u21d4": r"\Leftrightarrow",
+    "\u21a6": r"\mapsto", "\u2264": r"\leq", "\u2265": r"\geq", "\u2260": r"\neq",
+    "\u2248": r"\approx", "\u223c": r"\sim", "\u2261": r"\equiv", "\u221d": r"\propto",
+    "\u00d7": r"\times", "\u00b7": r"\cdot", "\u22c5": r"\cdot", "\u2217": "*",
+    "\u2212": "-", "\u00b1": r"\pm", "\u2213": r"\mp", "\u2208": r"\in", "\u2209": r"\notin",
+    "\u2282": r"\subset", "\u2286": r"\subseteq", "\u222a": r"\cup", "\u2229": r"\cap",
+    "\u2211": r"\sum", "\u220f": r"\prod", "\u222b": r"\int", "\u221e": r"\infty",
+    "\u2207": r"\nabla", "\u2202": r"\partial", "\u2200": r"\forall", "\u2203": r"\exists",
+    "\u2026": r"\ldots", "\u22ef": r"\cdots", "\u2223": r"\mid", "\u2225": r"\|",
+    "\u2016": r"\|", "\u27e8": r"\langle", "\u27e9": r"\rangle", "{": r"\{", "}": r"\}",
+    "\u2218": r"\circ", "\u2297": r"\otimes", "\u2295": r"\oplus", "\u00ac": r"\neg",
+    "\u2227": r"\land", "\u2228": r"\lor", "\u2032": "'", "\u2033": "''",
+    # Invisible operators: function application, times, separator, plus.
+    "\u2061": "", "\u2062": "", "\u2063": "", "\u2064": "",
+}
+MATHML_ACCENTS = {
+    "^": r"\hat", "\u02c6": r"\hat", "\u0302": r"\hat", "~": r"\tilde", "\u02dc": r"\tilde",
+    "\u0303": r"\tilde", "\u00af": r"\bar", "\u203e": r"\overline", "\u0304": r"\bar",
+    "\u2192": r"\vec", "\u20d7": r"\vec", "\u02d9": r"\dot", "\u0307": r"\dot",
+    "\u00a8": r"\ddot", "\u0308": r"\ddot", "\u23de": r"\overbrace", "\u23df": r"\underbrace",
+    "_": r"\underline", "\u0332": r"\underline",
+}
+MATHML_VARIANTS = {
+    "bold": r"\mathbf", "bold-italic": r"\boldsymbol", "double-struck": r"\mathbb",
+    "script": r"\mathcal", "bold-script": r"\mathcal", "fraktur": r"\mathfrak",
+    "bold-fraktur": r"\mathfrak", "sans-serif": r"\mathsf", "bold-sans-serif": r"\mathsf",
+    "sans-serif-italic": r"\mathsf", "sans-serif-bold-italic": r"\mathsf",
+    "monospace": r"\mathtt", "normal": r"\mathrm",
+}
+# Unicode's styled letters (U+1D400…, ℝ, ℋ …), by the style in their names.
+MATH_LETTER_STYLES = [
+    ("MATHEMATICAL BOLD ITALIC", r"\boldsymbol"), ("MATHEMATICAL BOLD SCRIPT", r"\mathcal"),
+    ("MATHEMATICAL BOLD FRAKTUR", r"\mathfrak"), ("MATHEMATICAL SANS-SERIF", r"\mathsf"),
+    ("MATHEMATICAL DOUBLE-STRUCK", r"\mathbb"), ("MATHEMATICAL MONOSPACE", r"\mathtt"),
+    ("MATHEMATICAL FRAKTUR", r"\mathfrak"), ("MATHEMATICAL SCRIPT", r"\mathcal"),
+    ("MATHEMATICAL BOLD", r"\mathbf"), ("MATHEMATICAL ITALIC", ""),
+    ("DOUBLE-STRUCK", r"\mathbb"), ("SCRIPT", r"\mathcal"), ("BLACK-LETTER", r"\mathfrak"),
+]
+TEX_FUNCTIONS = {"sin", "cos", "tan", "log", "ln", "exp", "max", "min", "lim", "det", "arg", "sup", "inf", "dim"}
+TEX_SPECIALS = {"#": r"\#", "%": r"\%", "&": r"\&", "_": r"\_", "$": r"\$", "\\": r"\backslash ", "~": r"\sim "}
+
+
+def _math_letter(char: str) -> str | None:
+    """TeX for one of Unicode's styled mathematical letters, else None."""
+    if char == "\u210e":  # PLANCK CONSTANT, the italic h
+        return "h"
+    name = unicodedata.name(char, "")
+    for prefix, command in MATH_LETTER_STYLES:
+        if not name.startswith(prefix + " "):
+            continue
+        rest = name[len(prefix) + 1:]
+        if rest.startswith(("SMALL ", "CAPITAL ")) and len(rest.split()[-1]) == 1:
+            letter = rest.split()[-1]
+            plain = letter.lower() if rest.startswith("SMALL ") else letter
+        elif rest.startswith("DIGIT "):
+            plain = unicodedata.lookup(rest)
+        else:
+            greek = rest.replace("SMALL ", "SMALL LETTER ").replace("CAPITAL ", "CAPITAL LETTER ")
+            try:
+                plain = unicodedata.lookup(f"GREEK {greek}")
+            except KeyError:
+                return None
+        if command == r"\mathcal" and not plain.isupper():
+            return char  # TeX has script capitals only
+        return f"{command}{{{plain}}}" if command else plain
+    return None
+
+
+def _tex_join(parts: Iterable[str]) -> str:
+    """Concatenate TeX, keeping a command apart from a letter that follows it."""
+    out = ""
+    for part in parts:
+        if not part:
+            continue
+        if re.search(r"\\[A-Za-z]+$", out) and re.match(r"[A-Za-z0-9]", part):
+            out += " "
+        out += part
+    return out
+
+
+def mathml_to_tex(source: str) -> str:
+    """TeX for the MathML Keynote writes, or ValueError naming what has none.
+
+    Covers the presentation elements an equation editor produces: tokens,
+    rows, scripts, fractions, roots, accents, fences and tables. An
+    `<annotation encoding="application/x-tex">` is used as it is.
+    """
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(source)
+    except ET.ParseError as exc:
+        raise ValueError(f"does not parse ({exc})") from None
+
+    def tag(node: Any) -> str:
+        return node.tag.rsplit("}", 1)[-1]
+
+    def colour_of(node: Any) -> str | None:
+        value = (node.get("mathcolor") or "").strip().lower()
+        return None if value in ("", "#000000", "#000", "black") else value
+
+    tokens = [node for node in root.iter() if tag(node) in ("mi", "mn", "mo", "mtext", "ms")]
+    colours = {colour_of(node) for node in tokens}
+    # One colour throughout is said once, around the whole formula.
+    uniform = colours.pop() if len(colours) == 1 else None
+
+    def token_text(node: Any, operator: bool) -> str:
+        parts = []
+        for char in (node.text or "").strip():
+            if operator and char in MATHML_OPERATORS:
+                parts.append(MATHML_OPERATORS[char])
+            elif char in TEX_SPECIALS:
+                parts.append(TEX_SPECIALS[char])
+            elif not char.isascii() and (letter := _math_letter(char)) is not None:
+                parts.append(letter)
+            elif char in MATHML_OPERATORS and MATHML_OPERATORS[char].startswith("\\"):
+                parts.append(MATHML_OPERATORS[char])
+            else:
+                parts.append(char)
+        return _tex_join(parts)
+
+    def group(tex: str) -> str:
+        """A script's base: bare when it is one symbol, braced otherwise."""
+        if len(tex) == 1 or re.fullmatch(r"\\[A-Za-z]+", tex) or re.fullmatch(r"\\[A-Za-z]+\{[^{}]*\}", tex):
+            return tex
+        return f"{{{tex}}}"
+
+    def children(node: Any) -> list[Any]:
+        return list(node)
+
+    def row(nodes: list[Any]) -> str:
+        if (
+            len(nodes) >= 2
+            and tag(nodes[0]) == "mo" and tag(nodes[-1]) == "mo"
+            and (nodes[0].text or "").strip() in "([{|\u2016\u27e8"
+            and (nodes[-1].text or "").strip() in ")]}|\u2016\u27e9"
+            and (nodes[0].text or "").strip() and (nodes[-1].text or "").strip()
+            and "false" not in (nodes[0].get("stretchy"), nodes[-1].get("stretchy"))
+        ):
+            inner = _tex_join(convert(n) for n in nodes[1:-1])
+            return _tex_join([r"\left" + fence(nodes[0]), inner, r"\right" + fence(nodes[-1])])
+        return _tex_join(convert(n) for n in nodes)
+
+    def fence(node: Any) -> str:
+        char = (node.text or "").strip()
+        return {"{": r"\{", "}": r"\}", "\u27e8": r"\langle ", "\u27e9": r"\rangle ", "\u2016": r"\| "}.get(char, char)
+
+    def need(node: Any, count: int) -> list[Any]:
+        kids = children(node)
+        if len(kids) != count:
+            raise ValueError(f"<{tag(node)}> with {len(kids)} children")
+        return kids
+
+    def convert(node: Any) -> str:
+        name = tag(node)
+        if name in ("mi", "mn", "mo", "mtext", "ms"):
+            if name == "mtext" or name == "ms":
+                body = "".join(TEX_SPECIALS.get(c, c) for c in (node.text or "")).replace("{", r"\{").replace("}", r"\}")
+                tex = rf"\text{{{body}}}" if body.strip() else r"\ "
+            else:
+                tex = token_text(node, operator=name == "mo")
+                variant = node.get("mathvariant")
+                text = (node.text or "").strip()
+                if name == "mi" and len(text) > 1 and text.isascii() and text.isalpha() and variant in (None, "normal"):
+                    tex = f"\\{text}" if text in TEX_FUNCTIONS else rf"\mathrm{{{text}}}"
+                elif variant in MATHML_VARIANTS and tex and not tex.startswith("\\"):
+                    if not (variant == "normal" and name != "mi"):
+                        tex = f"{MATHML_VARIANTS[variant]}{{{tex}}}"
+        elif name in ("math", "mrow", "mstyle", "mpadded", "merror"):
+            tex = row(children(node))
+        elif name == "semantics":
+            for kid in children(node)[1:]:
+                if tag(kid) == "annotation" and (kid.get("encoding") or "").lower() in ("application/x-tex", "tex", "latex"):
+                    return (kid.text or "").strip()
+            kids = children(node)
+            if not kids:
+                raise ValueError("<semantics> without content")
+            tex = convert(kids[0])
+        elif name == "mphantom":
+            tex = rf"\phantom{{{row(children(node))}}}"
+        elif name == "mspace":
+            tex = r"\;"
+        elif name == "msub":
+            base, sub = need(node, 2)
+            tex = f"{group(convert(base))}_{{{convert(sub)}}}"
+        elif name == "msup":
+            base, sup = need(node, 2)
+            tex = f"{group(convert(base))}^{{{convert(sup)}}}"
+        elif name == "msubsup":
+            base, sub, sup = need(node, 3)
+            tex = f"{group(convert(base))}_{{{convert(sub)}}}^{{{convert(sup)}}}"
+        elif name == "mfrac":
+            top, bottom = need(node, 2)
+            tex = rf"\frac{{{convert(top)}}}{{{convert(bottom)}}}"
+        elif name == "msqrt":
+            tex = rf"\sqrt{{{row(children(node))}}}"
+        elif name == "mroot":
+            base, index = need(node, 2)
+            tex = rf"\sqrt[{convert(index)}]{{{convert(base)}}}"
+        elif name in ("mover", "munder"):
+            base, mark = need(node, 2)
+            symbol = (mark.text or "").strip() if tag(mark) == "mo" else ""
+            accent = MATHML_ACCENTS.get(symbol)
+            under = name == "munder"
+            if accent and (accent in (r"\underbrace", r"\underline")) == under:
+                tex = f"{accent}{{{convert(base)}}}"
+            elif under:
+                tex = rf"\underset{{{convert(mark)}}}{{{convert(base)}}}"
+            else:
+                tex = rf"\overset{{{convert(mark)}}}{{{convert(base)}}}"
+        elif name == "munderover":
+            base, below, above = need(node, 3)
+            core = convert(base)
+            if core in (r"\sum", r"\prod", r"\int", r"\lim", r"\bigcup", r"\bigcap"):
+                tex = f"{core}_{{{convert(below)}}}^{{{convert(above)}}}"
+            else:
+                tex = rf"\underset{{{convert(below)}}}{{\overset{{{convert(above)}}}{{{core}}}}}"
+        elif name == "mfenced":
+            opening, closing = node.get("open", "("), node.get("close", ")")
+            separator = (node.get("separators", ",").strip() or ",")[0]
+            inner = f"{separator} ".join(convert(kid) for kid in children(node))
+            tex = rf"\left{fence_char(opening)}{inner}\right{fence_char(closing)}"
+        elif name == "mtable":
+            rows = []
+            for line in children(node):
+                if tag(line) != "mtr":
+                    raise ValueError(f"<{tag(line)}> in a table")
+                rows.append(" & ".join(row(children(cell)) for cell in children(line)))
+            tex = r"\begin{matrix} " + r" \\ ".join(rows) + r" \end{matrix}"
+        else:
+            raise ValueError(f"<{name}>")
+        colour = colour_of(node)
+        if colour and colour != uniform:
+            tex = rf"\textcolor{{{colour}}}{{{tex}}}"
+        return tex
+
+    def fence_char(char: str) -> str:
+        return {"": ".", "{": r"\{", "}": r"\}", "\u27e8": r"\langle", "\u27e9": r"\rangle"}.get(char, char)
+
+    tex = convert(root)
+    return rf"\textcolor{{{uniform}}}{{{tex}}}" if uniform else tex
 
 
 # TSP path element type enum -> (SVG command, number of points consumed).
@@ -483,6 +989,45 @@ def editable_path_to_svg(source: Any) -> tuple[str, tuple[float, float, float, f
     return " ".join(parts), (min(xs), min(ys), max(xs), max(ys))
 
 
+def point_path_to_svg(source: Any) -> tuple[str, tuple[float, float, float, float]]:
+    """Outline of a parametric arrow (Keynote's point path source).
+
+    The source stores no path: only its kind, its natural size, and one
+    control point whose x is the head's length and whose y is the stem's
+    thickness as a fraction of the height. A head as long as the shape is
+    wide leaves just the head — the solid ▶ between two figures. Stars and
+    plus signs are not drawn here and come back empty.
+    """
+    kind = _enum_name(source, "type", int(source.type))
+    width = float(source.naturalSize.width)
+    height = float(source.naturalSize.height)
+    if width <= 0 or height <= 0:
+        return "", (0.0, 0.0, 0.0, 0.0)
+    double = kind == "kTSDDoubleArrow"
+    if kind not in ("kTSDRightSingleArrow", "kTSDLeftSingleArrow") and not double:
+        return "", (0.0, 0.0, 0.0, 0.0)
+    head = min(max(0.0, float(source.point.x)), width / 2 if double else width)
+    stem = min(1.0, max(0.0, float(source.point.y))) * height
+    top, bottom, mid = (height - stem) / 2, (height + stem) / 2, height / 2
+    if double:
+        points = [
+            (0, mid), (head, 0), (head, top), (width - head, top), (width - head, 0),
+            (width, mid), (width - head, height), (width - head, bottom),
+            (head, bottom), (head, height),
+        ]
+    else:
+        points = [
+            (0, top), (width - head, top), (width - head, 0), (width, mid),
+            (width - head, height), (width - head, bottom), (0, bottom),
+        ]
+        if kind == "kTSDLeftSingleArrow":
+            points = [(width - x, y) for x, y in points]
+    # Drop the stem's corners where the head covers the whole shape.
+    unique = list(dict.fromkeys((round(x, 2), round(y, 2)) for x, y in points))
+    data = "M " + " L ".join(f"{x:.2f} {y:.2f}" for x, y in unique) + " Z"
+    return data, (0.0, 0.0, width, height)
+
+
 def flip_svg_path(
     path_data: str,
     bounds: tuple[float, float, float, float],
@@ -511,6 +1056,30 @@ def flip_svg_path(
         out.append(f"{value:.2f}")
         axis ^= 1
     return " ".join(out)
+
+
+def _outset_for_stroke(box: dict[str, float], style: "ShapeStyle") -> dict[str, float]:
+    """The box of a native rectangle whose outline lands where Keynote's does.
+
+    Keynote centres a shape's stroke on its geometry, so half of it lies
+    outside the stored box. The editor draws a native rectangle's stroke
+    wholly inside the element box (shapeSvg insets it by half the width), so
+    taking Keynote's box as is shrinks every outline by one stroke width: a
+    5px frame drawn tight around a picture let the picture's edge show past
+    it. Growing the box by half the stroke on each side, about the same
+    centre so rotation is unaffected, puts the stroke back on the geometry.
+    Paths need none of this: their stroke is centred on the path already.
+    """
+    if style.stroke is None or style.stroke_width <= 0:
+        return box
+    half = style.stroke_width / 2
+    return {
+        **box,
+        "x": box["x"] - half,
+        "y": box["y"] - half,
+        "w": box["w"] + style.stroke_width,
+        "h": box["h"] + style.stroke_width,
+    }
 
 
 def is_axis_aligned_rectangle(path_msg: Any) -> bool:
@@ -867,11 +1436,53 @@ class TextStyle:
     font_size: float | None = None
     font_name: str | None = None
     bold: bool | None = None
+    italic: bool | None = None
     align: str = "left"
     valign: str = "middle"
     color: str | None = None
     gradient: str | None = None
     horizontal_padding: float = 8.0
+    # Character spacing as a fraction of the size (Keynote's "tracking").
+    tracking: float | None = None
+    # The paragraph's line spacing as Keynote states it: (mode, amount).
+    line_spacing: tuple[str, float] | None = None
+    space_before: float | None = None
+    space_after: float | None = None
+
+
+# The line height Keynote gives Helvetica Neue and its other system faces at
+# "1.0 lines": the face's ascent plus descent, ~1.2 of the size.
+KEYNOTE_LINE_HEIGHT = 1.2
+
+
+def line_height_css(spacing: tuple[str, float] | None, font_size: float | None) -> str:
+    """A unitless CSS line-height for a Keynote line spacing at a size.
+
+    Unitless, so it scales with the font when auto-fit shrinks the box.
+    """
+    natural = KEYNOTE_LINE_HEIGHT
+    if spacing is not None:
+        mode, amount = spacing
+        size = font_size or DEFAULT_FONT_SIZE
+        if mode == "kRelativeLineSpacing" and amount > 0:
+            natural = KEYNOTE_LINE_HEIGHT * amount
+        elif mode == "kExactLineSpacing" and amount > 0:
+            natural = amount / size
+        elif mode == "kMinimumLineSpacing":
+            natural = max(natural, amount / size)
+        elif mode == "kMaximumLineSpacing" and amount > 0:
+            natural = min(natural, amount / size)
+        elif mode == "kSpaceBetweenLineSpacing":
+            natural += max(0.0, amount) / size
+    return f"{natural:.4g}"
+
+
+def tracking_css(tracking: float | None) -> str:
+    """Keynote tracking as CSS letter-spacing; `normal` when there is none, so
+    a theme's title letter-spacing never tightens imported text."""
+    if not tracking:
+        return "normal"
+    return f"{tracking:.4g}em"
 
 
 def resolve_text_style(objects: dict[int, Any], shape: Any) -> TextStyle:
@@ -980,6 +1591,10 @@ def _read_char_properties(chars: Any, out: TextStyle) -> None:
         out.font_name = str(chars.font_name) or None
     if out.bold is None and chars.HasField("bold"):
         out.bold = bool(chars.bold)
+    if out.italic is None and chars.HasField("italic"):
+        out.italic = bool(chars.italic)
+    if out.tracking is None and chars.HasField("tracking"):
+        out.tracking = float(chars.tracking)
     if out.color is None and chars.HasField("font_color"):
         out.color = color_to_hex(chars.font_color)
     if out.gradient is None and chars.HasField("tsd_fill"):
@@ -1010,21 +1625,27 @@ def _read_para_style(objects: dict[int, Any], style_id: int, out: TextStyle) -> 
         if _has(style, "char_properties"):
             _read_char_properties(style.char_properties, out)
 
-        if not align_found and _has(style, "para_properties"):
+        if _has(style, "para_properties"):
             paras = style.para_properties
-            if paras.HasField("alignment"):
+            if not align_found and paras.HasField("alignment"):
                 # The enum serialises as a name like "TATvalue2".
                 digits = "".join(c for c in str(paras.alignment) if c.isdigit())
                 if digits:
                     out.align = ALIGNMENT_NAMES.get(int(digits), "left")
                     align_found = True
+            # An empty line_spacing message is Keynote's "1.0 lines".
+            if out.line_spacing is None and paras.HasField("line_spacing"):
+                spacing = paras.line_spacing
+                if spacing.HasField("amount"):
+                    mode = _enum_name(spacing, "mode", spacing.mode) if spacing.HasField("mode") else "kRelativeLineSpacing"
+                    out.line_spacing = (mode, float(spacing.amount))
+            if out.space_before is None and paras.HasField("space_before"):
+                out.space_before = float(paras.space_before)
+            if out.space_after is None and paras.HasField("space_after"):
+                out.space_after = float(paras.space_after)
 
-        if (
-            out.font_size is not None
-            and (out.color is not None or out.gradient is not None)
-            and align_found
-        ):
-            return
+        # Read to the root: line spacing and paragraph spacing usually live
+        # in the theme's styles, above the leaf that names size and colour.
         try:
             parent = style.super.parent
             current_id = int(parent.identifier) if parent.identifier else None
@@ -1059,23 +1680,53 @@ def _wrap_paragraphs(paragraphs: list[str]) -> str:
     return "".join(f"<p>{p or '<br>'}</p>" for p in paragraphs)
 
 
-def text_to_html(text: str) -> str:
-    """Escape imported text, then map Keynote's paragraph breaks onto markup."""
-    escaped = html.escape(_normalise_breaks(text))
-    return _wrap_paragraphs(escaped.split("\n"))
+def text_to_html(text: str, inserts: dict[int, str] | None = None) -> str:
+    """Escape imported text, then map Keynote's paragraph breaks onto markup.
+
+    `inserts` is markup to write in place of the character at an index (an
+    equation at its U+FFFC).
+    """
+    normalised = _normalise_breaks(text)
+    paragraphs: list[str] = []
+    pos = 0
+    for line in normalised.split("\n"):
+        paragraphs.append(_escape_with_inserts(normalised, pos, pos + len(line), inserts))
+        pos += len(line) + 1
+    return _wrap_paragraphs(paragraphs)
+
+
+def _enum_name(message: Any, field_name: str, value: int) -> str:
+    """The protobuf name of an enum value, e.g. "kSuperscript"."""
+    enum = message.DESCRIPTOR.fields_by_name[field_name].enum_type
+    found = enum.values_by_number.get(int(value)) if enum is not None else None
+    return found.name if found is not None else ""
+
+
+def _regular_face(font_name: str) -> str | None:
+    """The upright face of a bold PostScript name, e.g. HelveticaNeue-Bold.
+
+    Keynote un-bolds a run inside a bold paragraph by setting bold: false and
+    leaving the paragraph's face name alone. In CSS that face name still picks
+    the bold face wherever it is installed (Safari and Chrome on a Mac match
+    PostScript names), so the run needs the regular family named instead.
+    """
+    for suffix in ("-Bold", "-BoldMT", "-Heavy", "-Black"):
+        if font_name.endswith(suffix):
+            return font_name[: -len(suffix)] or None
+    return None
 
 
 def _char_run_css(
     objects: dict[int, Any], style_id: int | None, base: TextStyle
 ) -> dict[str, str]:
-    """CSS for one character-style run, as a delta against the box's base style.
+    """CSS for one character-style run, as a delta against its paragraph's style.
 
     Only the leaf style's own fields are read: a run's character style names
     exactly what differs from the paragraph (Keynote styles are thin
     variations), and walking the parent chain here would re-state box-level
-    defaults on every run. Values that merely repeat what the element already
-    carries inline are dropped, so an unstyled deck still imports with no
-    spans at all.
+    defaults on every run. Values that merely repeat what the paragraph already
+    carries are dropped, so an unstyled deck still imports with no spans at
+    all. Sizes are relative (em) so they shrink along with auto-fit.
     """
     css: dict[str, str] = {}
     style = objects.get(style_id) if style_id else None
@@ -1085,6 +1736,9 @@ def _char_run_css(
 
     if chars.HasField("bold") and bool(chars.bold) != bool(base.bold):
         css["font-weight"] = "700" if chars.bold else "400"
+        regular = _regular_face(base.font_name or "")
+        if not chars.bold and regular and not chars.HasField("font_name"):
+            css["font-family"] = _font_family_css(regular)
     # The element never carries font-style inline, so only true is a delta.
     if chars.HasField("italic") and chars.italic:
         css["font-style"] = "italic"
@@ -1101,7 +1755,16 @@ def _char_run_css(
     if chars.HasField("font_size"):
         size = float(chars.font_size)
         if size > 0 and size != base.font_size:
-            css["font-size"] = f"{size:.0f}px"
+            css["font-size"] = _relative_size(size, base.font_size)
+    if chars.HasField("tracking") and float(chars.tracking) != (base.tracking or 0.0):
+        css["letter-spacing"] = tracking_css(float(chars.tracking))
+    if chars.HasField("superscript"):
+        shift = _enum_name(chars, "superscript", chars.superscript)
+        if shift in ("kSuperscript", "kSubscript"):
+            # The editor's own superscript: raised and shrunk, relative to the
+            # text around it (htmlSafety.ts BASELINE_RUN_FONT_SIZE).
+            css["vertical-align"] = "super" if shift == "kSuperscript" else "sub"
+            css["font-size"] = "0.7em"
     # A colour span inside gradient-clipped text would punch through the clip,
     # so runs keep their colour only on solid-colour boxes.
     if base.gradient is None and chars.HasField("font_color"):
@@ -1111,74 +1774,435 @@ def _char_run_css(
     return css
 
 
-def styled_text_to_html(
-    objects: dict[int, Any], shape: Any, base: TextStyle
-) -> str | None:
-    """HTML for a shape's text with `<span>` runs for within-box styling.
+def _relative_size(size: float, base: float | None) -> str:
+    """A font size as a ratio to the size around it, so auto-fit scales it."""
+    if not base or base <= 0:
+        return f"{size:.0f}px"
+    return f"{size / base:.4g}em"
 
-    Slices the storage text at the `table_char_style` run boundaries and wraps
-    each styled run. Returns None when the box has no run-level deltas (or the
-    run table can't be trusted), letting the caller fall back to the plain
-    single-style path.
-    """
+
+def _style_attr(css: dict[str, str]) -> str:
+    """A ` style="…"` attribute, escaped: font families carry their own double
+    quotes, which would otherwise end the attribute and take the rest of the
+    run's styling with them."""
+    if not css:
+        return ""
+    return f' style="{html.escape("; ".join(f"{k}: {v}" for k, v in css.items()))}"'
+
+
+def _table_at(entries: list[tuple[int, Any]], index: int) -> Any:
+    """The value of a run table (sorted (start, value) pairs) at `index`."""
+    found = None
+    for start, value in entries:
+        if start > index:
+            break
+        found = value
+    return found
+
+
+def _storage_of(objects: dict[int, Any], shape: Any) -> Any | None:
     for field_name in ("owned_storage", "deprecated_storage"):
         reference = find_in_super_chain(shape, field_name)
         if reference is None:
             continue
         storage = objects.get(int(reference.identifier) if reference.identifier else -1)
-        if storage is None or not _has(storage, "table_char_style"):
-            continue
-        if not _has(storage, "text"):
-            continue
-        chunks = [t for t in storage.text if t]
-        # Run indices address one contiguous text stream; with more than one
-        # chunk the mapping is ambiguous, so styling is dropped rather than
-        # misplaced.
-        if len(chunks) != 1:
-            return None
-        text = _normalise_breaks(chunks[0]).rstrip()
-        if not text:
-            return None
-
-        entries = sorted(
-            storage.table_char_style.entries, key=lambda e: int(e.character_index)
-        )
-        runs: list[tuple[str, dict[str, str]]] = []
-        for pos, entry in enumerate(entries):
-            start = int(entry.character_index)
-            end = (
-                int(entries[pos + 1].character_index)
-                if pos + 1 < len(entries)
-                else len(text)
-            )
-            if start > len(text):
-                return None
-            if start >= end:
-                continue
-            style_id = int(entry.object.identifier) if entry.object.identifier else None
-            runs.append((text[start:end], _char_run_css(objects, style_id, base)))
-
-        if not runs or not any(css for _, css in runs):
-            return None
-
-        # Runs are sliced by character index and cut across paragraph breaks,
-        # so the split happens per run and the pieces are regrouped: a styled
-        # run spanning two paragraphs yields one span in each.
-        paragraphs: list[str] = [""]
-        for run_text, css in runs:
-            pieces = html.escape(run_text).split("\n")
-            for pos, piece in enumerate(pieces):
-                if pos:
-                    paragraphs.append("")
-                if not piece:
-                    continue
-                if css:
-                    style_attr = "; ".join(f"{k}: {v}" for k, v in css.items())
-                    paragraphs[-1] += f'<span style="{style_attr}">{piece}</span>'
-                else:
-                    paragraphs[-1] += piece
-        return _wrap_paragraphs(paragraphs)
+        if storage is not None and _has(storage, "text"):
+            return storage
     return None
+
+
+def _ref_entries(table: Any, carry: bool) -> list[tuple[int, int | None]]:
+    """A storage's object table as sorted (start, object id) pairs.
+
+    A paragraph-level entry without an object continues the previous one —
+    Keynote writes one entry per paragraph even when consecutive paragraphs
+    share a style — so `carry` fills it in. In the character table an empty
+    entry means "no character style": the paragraph's own style resumes.
+    """
+    out: list[tuple[int, int | None]] = []
+    previous: int | None = None
+    for entry in sorted(table.entries, key=lambda e: int(e.character_index)):
+        ident = int(entry.object.identifier) if entry.object.identifier else None
+        if ident is None and carry:
+            ident = previous
+        previous = ident
+        out.append((int(entry.character_index), ident))
+    return out
+
+
+def _para_decoration_css(objects: dict[int, Any], style_id: int | None) -> dict[str, str]:
+    """Underline and italic a paragraph style applies to all of its text.
+
+    The box-level style never carries these, so a paragraph style that names
+    them — an underlined heading line in a body placeholder — states them.
+    """
+    css: dict[str, str] = {}
+    seen: set[int] = set()
+    underline = italic = None
+    current = style_id
+    for _ in range(8):
+        if current is None or current in seen or current not in objects:
+            break
+        seen.add(current)
+        style = objects[current]
+        if _has(style, "char_properties"):
+            chars = style.char_properties
+            if underline is None and chars.HasField("underline"):
+                underline = int(chars.underline) != 0
+            if italic is None and chars.HasField("italic"):
+                italic = bool(chars.italic)
+        try:
+            parent = style.super.parent
+            current = int(parent.identifier) if parent.identifier else None
+        except AttributeError:
+            break
+    if underline:
+        css["text-decoration"] = "underline"
+    if italic:
+        css["font-style"] = "italic"
+    return css
+
+
+LIST_NUMBER_TYPES = (
+    ("RomanUpper", "upper-roman"),
+    ("RomanLower", "lower-roman"),
+    ("AlphaUpper", "upper-alpha"),
+    ("AlphaLower", "lower-alpha"),
+)
+
+
+def _list_label(objects: dict[int, Any], style_id: int | None, level: int) -> tuple[str, str | None] | None:
+    """("ol", list-style-type) or ("ul", None) for a list style at a level.
+
+    None for Keynote's "None" label: an ordinary paragraph. A variation that
+    does not restate the label arrays inherits them from its parent.
+    """
+    seen: set[int] = set()
+    current = style_id
+    for _ in range(8):
+        if current is None or current in seen or current not in objects:
+            return None
+        seen.add(current)
+        style = objects[current]
+        if _has(style, "label_types") and len(style.label_types) > level:
+            label = _enum_name(style, "label_types", style.label_types[level])
+            if label == "kNumber":
+                kind = None
+                if _has(style, "number_types") and len(style.number_types) > level:
+                    number = _enum_name(style, "number_types", style.number_types[level])
+                    kind = next((css for key, css in LIST_NUMBER_TYPES if key in number), None)
+                return ("ol", kind)
+            # kString is a character bullet ("•", "–"), what Keynote's bulleted
+            # lists use; kImage an image bullet. The enum has no kBullet.
+            if label in ("kString", "kImage"):
+                return ("ul", None)
+            return None
+        try:
+            parent = style.super.parent
+            current = int(parent.identifier) if parent.identifier else None
+        except AttributeError:
+            return None
+    return None
+
+
+def _list_indent(objects: dict[int, Any], style_id: int | None, level: int) -> float | None:
+    """How far, in points, Keynote indents a list level (`indents`, inherited)."""
+    seen: set[int] = set()
+    current = style_id
+    for _ in range(8):
+        if current is None or current in seen or current not in objects:
+            return None
+        seen.add(current)
+        style = objects[current]
+        if _has(style, "indents") and len(style.indents) > level:
+            return float(style.indents[level])
+        try:
+            parent = style.super.parent
+            current = int(parent.identifier) if parent.identifier else None
+        except AttributeError:
+            return None
+    return None
+
+
+def _para_spacing(objects: dict[int, Any], style_id: int | None) -> float:
+    """Space before plus after a paragraph style, in points, inherited."""
+    before = after = None
+    seen: set[int] = set()
+    current = style_id
+    for _ in range(8):
+        if current is None or current in seen or current not in objects:
+            break
+        seen.add(current)
+        style = objects[current]
+        if _has(style, "para_properties"):
+            paras = style.para_properties
+            if before is None and paras.HasField("space_before"):
+                before = float(paras.space_before)
+            if after is None and paras.HasField("space_after"):
+                after = float(paras.space_after)
+        try:
+            parent = style.super.parent
+            current = int(parent.identifier) if parent.identifier else None
+        except AttributeError:
+            break
+    return max(0.0, (before or 0.0) + (after or 0.0))
+
+
+# The hanging indent type.css gives every list item (`.text-body li`), which is
+# also the step one nested list sits inside its parent item.
+EDITOR_LIST_STEP_EM = 1.4
+
+
+def styled_text_to_html(
+    objects: dict[int, Any], shape: Any, base: TextStyle, inserts: dict[int, str] | None = None
+) -> str | None:
+    """HTML for a shape's text: paragraph styles, character runs and lists.
+
+    The element carries the first paragraph's style (`base`). A paragraph
+    whose own style differs — a title slide's 48pt author lines under an 80pt
+    title — states the difference on its block, and a character run (a bold
+    word, a superscript affiliation) on a `<span>` inside it, each relative
+    to what surrounds it. Keynote's numbered and bulleted paragraphs become
+    nested `<ol>`/`<ul>` at their list level, keeping explicit start numbers.
+
+    Returns None when the result would be the plain text anyway, or when the
+    run tables can't be trusted, letting the caller use the plain path.
+    """
+    storage = _storage_of(objects, shape)
+    if storage is None:
+        return None
+    chunks = [t for t in storage.text if t]
+    # Run indices address one contiguous text stream; with more than one chunk
+    # the mapping is ambiguous, so styling is dropped rather than misplaced.
+    if len(chunks) != 1:
+        return None
+    text = _normalise_breaks(chunks[0]).rstrip()
+    if not text:
+        return None
+
+    def table(name: str, carry: bool) -> list[tuple[int, int | None]]:
+        return _ref_entries(getattr(storage, name), carry) if _has(storage, name) else []
+
+    para_styles = table("table_para_style", carry=True)
+    char_styles = table("table_char_style", carry=False)
+    list_styles = table("table_list_style", carry=True)
+    levels = sorted(
+        (int(e.character_index), int(e.first))
+        for e in (storage.table_para_data.entries if _has(storage, "table_para_data") else [])
+    )
+    starts = {
+        int(e.character_index): int(e.first)
+        for e in (storage.table_para_starts.entries if _has(storage, "table_para_starts") else [])
+    }
+    if any(start > len(text) for start, _ in char_styles):
+        return None
+
+    first_style_id = _table_at(para_styles, 0)
+    resolved: dict[int | None, TextStyle] = {}
+
+    def paragraph_style(style_id: int | None) -> TextStyle:
+        """The paragraph's effective style; the first paragraph's is `base`."""
+        if style_id == first_style_id or style_id is None:
+            return base
+        if style_id not in resolved:
+            own = TextStyle()
+            _read_para_style(objects, style_id, own)
+            resolved[style_id] = TextStyle(
+                font_size=own.font_size or base.font_size,
+                font_name=own.font_name or base.font_name,
+                # The chain was read to its root: a bold it never names is
+                # not bold, whatever the first paragraph is.
+                bold=bool(own.bold),
+                align=own.align,
+                color=own.color or base.color,
+                gradient=base.gradient,
+                tracking=own.tracking or 0.0,
+                line_spacing=own.line_spacing,
+                space_before=own.space_before,
+                space_after=own.space_after,
+            )
+        return resolved[style_id]
+
+    blocks: list[str] = []
+    stack: list[tuple[str, int]] = []  # open lists, outermost first: (tag, level)
+    numbers: list[int] = []  # the number each open list last gave out
+    counters: dict[int, int] = {}  # Keynote's running count per level
+
+    def close_lists(to_level: int) -> None:
+        while stack and stack[-1][1] >= to_level:
+            tag, _ = stack.pop()
+            numbers.pop()
+            blocks[-1] += f"</li></{tag}>"
+
+    pos = 0
+    # Keynote adds one paragraph's space after to the next one's space
+    # before; CSS would collapse two margins into the larger, so the whole
+    # gap goes on the later paragraph as its margin-top.
+    gap_after = 0.0
+    for index, line in enumerate(text.split("\n")):
+        line_start, line_end = pos, pos + len(line)
+        pos = line_end + 1
+        style_id = _table_at(para_styles, line_start)
+        para = paragraph_style(style_id)
+
+        block_css: dict[str, str] = {}
+        if para is not base:
+            if para.font_size and para.font_size != base.font_size:
+                block_css["font-size"] = _relative_size(para.font_size, base.font_size)
+            if para.font_name and para.font_name != base.font_name:
+                block_css["font-family"] = _font_family_css(para.font_name)
+            weight = "700" if para.bold else _font_weight_css(para.font_name or "") or "400"
+            base_weight = "700" if base.bold else _font_weight_css(base.font_name or "") or "400"
+            if weight != base_weight:
+                block_css["font-weight"] = weight
+            if para.color and para.color != base.color and base.gradient is None:
+                block_css["color"] = para.color
+            if para.align != base.align:
+                block_css["text-align"] = para.align
+            if (para.tracking or 0.0) != (base.tracking or 0.0):
+                block_css["letter-spacing"] = tracking_css(para.tracking)
+            line_height = line_height_css(para.line_spacing, para.font_size)
+            if line_height != line_height_css(base.line_spacing, base.font_size):
+                block_css["line-height"] = line_height
+        para_size = para.font_size or base.font_size or DEFAULT_FONT_SIZE
+        gap = gap_after + ((para.space_before or 0.0) if index > 0 else 0.0)
+        gap_after = para.space_after or 0.0
+        decoration = _para_decoration_css(objects, style_id)
+        underlined = decoration.pop("text-decoration", None) is not None
+        para_italic = decoration.pop("font-style", None) == "italic"
+
+        boundaries = sorted(
+            {line_start, line_end}
+            | {start for start, _ in char_styles if line_start < start < line_end}
+        )
+        runs: list[tuple[str, dict[str, str], bool]] = []
+        slants: list[bool] = []
+        for run_start, run_end in zip(boundaries, boundaries[1:]):
+            run_id = _table_at(char_styles, run_start)
+            css = _char_run_css(objects, run_id, para)
+            css.pop("text-decoration", None)
+            css.pop("font-style", None)
+            chars = objects[run_id].char_properties if run_id in objects and _has(objects[run_id], "char_properties") else None
+            run_underlined = (
+                int(chars.underline) != 0 if chars is not None and chars.HasField("underline") else underlined
+            )
+            runs.append((_escape_with_inserts(text, run_start, run_end, inserts), css, run_underlined))
+            slants.append(bool(chars.italic) if chars is not None and chars.HasField("italic") else para_italic)
+        # Italic as for underline below: a paragraph style can slant the block
+        # while its runs set it upright again (a title Keynote draws upright
+        # over an italic paragraph style). The box states the first
+        # paragraph's slant; a block or run states only where it differs.
+        visible = [slant for (piece, _, _), slant in zip(runs, slants) if piece.strip()]
+        block_italic = bool(visible) and all(visible)
+        if block_italic != bool(base.italic):
+            block_css["font-style"] = "italic" if block_italic else "normal"
+        for (_, css, _), slant in zip(runs, slants):
+            if slant != block_italic:
+                css["font-style"] = "italic" if slant else "normal"
+        # An underline the paragraph style applies belongs on the block —
+        # unless a run switches it off again ("Token-matched" underlined, the
+        # rest of the heading not), which CSS cannot do inside an underlined
+        # block. Then each underlined run carries its own.
+        if runs and all(run_underlined for piece, _, run_underlined in runs if piece.strip()):
+            block_css["text-decoration"] = "underline"
+        else:
+            for _, css, run_underlined in runs:
+                if run_underlined:
+                    css["text-decoration"] = "underline"
+        inner = "".join(
+            f"<span{_style_attr(css)}>{piece}</span>" if css else piece for piece, css, _ in runs
+        )
+
+        label = _list_label(objects, _table_at(list_styles, line_start), _table_at(levels, line_start) or 0)
+        if label is not None and line.strip():
+            tag, number_type = label
+            level = _table_at(levels, line_start) or 0
+            # Keynote counts each level on across deeper paragraphs, numbered
+            # or not ("1. Encoder / its explanation / 2. Rollout"), and a
+            # paragraph can restart the count by hand.
+            number = starts.get(line_start, 0) or counters.get(level, 0) + 1
+            counters[level] = number
+            for deeper in [key for key in counters if key > level]:
+                del counters[deeper]
+            if stack and stack[-1][1] > level:
+                close_lists(level + 1)
+            if stack and stack[-1][1] == level and (stack[-1][0] != tag or number != numbers[-1] + 1):
+                # A different kind, or a number the open list would not reach
+                # by counting on: a new list at this level, beside it.
+                close_lists(level)
+            start = number
+            list_css: dict[str, str] = {}
+            if number_type:
+                list_css["list-style-type"] = number_type
+            if stack and stack[-1][1] < level:
+                # Keynote steps each level in by its own indent (36pt by
+                # default, 0.6em of 60pt body text); the editor's item indent
+                # alone steps 1.4em and pushes deep levels into wrapping. The
+                # nested list makes up the difference.
+                list_id = _table_at(list_styles, line_start)
+                here = _list_indent(objects, list_id, level)
+                above = _list_indent(objects, list_id, stack[-1][1])
+                size = para.font_size or base.font_size
+                if here is not None and above is not None and size:
+                    shift = (here - above) / size - EDITOR_LIST_STEP_EM
+                    if abs(shift) > 0.01:
+                        list_css["margin-left"] = f"{shift:.3g}em"
+            opening = f"<{tag}"
+            if tag == "ol" and start > 1:
+                opening += f' start="{start}"'
+            opening += f"{_style_attr(list_css)}>"
+            if not stack or stack[-1][1] < level:
+                if stack:
+                    blocks[-1] += opening
+                else:
+                    blocks.append(opening)
+                stack.append((tag, level))
+                numbers.append(number)
+                blocks[-1] += f"<li{_style_attr(block_css)}>{inner}"
+            else:
+                numbers[-1] = number
+                blocks[-1] += f"</li><li{_style_attr(block_css)}>{inner}"
+            continue
+
+        # A paragraph outside any list ends the count at its level and below;
+        # deeper ones (an explanation under a numbered item) do not.
+        # An empty line is skipped by the count, as Keynote numbers it.
+        plain_level = _table_at(levels, line_start) or 0
+        for ended in [key for key in counters if key >= plain_level and line.strip()]:
+            del counters[ended]
+        close_lists(0)
+        if gap > 0.05:
+            block_css["margin-top"] = f"{gap / para_size:.4g}em"
+        if block_css:
+            blocks.append(f"<p{_style_attr(block_css)}>{inner or '<br>'}</p>")
+        else:
+            blocks.append(inner)
+    close_lists(0)
+
+    while blocks and not re.sub(r"<[^>]+>", "", blocks[-1]).strip() and not blocks[-1].startswith(("<ol", "<ul")):
+        blocks.pop()
+    if len(blocks) <= 1 and not (blocks and blocks[0].startswith(("<p", "<ol", "<ul"))):
+        out = blocks[0] if blocks else ""
+    else:
+        out = "".join(
+            block if block.startswith(("<p", "<ol", "<ul")) else f"<p>{block or '<br>'}</p>"
+            for block in blocks
+        )
+    return None if out == text_to_html(text, inserts) else out
+
+
+def _face_css(style: TextStyle) -> dict[str, str]:
+    """Weight and slant, always stated.
+
+    The theme's role classes are bold (.role-title 700, .role-heading 600),
+    and a box classed by its size takes them on unless it says otherwise:
+    regular 60pt "Results" imported bold.
+    """
+    if style.bold:
+        weight = "700"
+    else:
+        weight = _font_weight_css(style.font_name or "") or "400"
+    return {"font-weight": weight, "font-style": "italic" if style.italic else "normal"}
 
 
 def _font_family_css(font_name: str) -> str:
@@ -1243,7 +2267,10 @@ class Importer:
     progress: Progress = field(default_factory=SilentProgress)
     _asset_cache: dict[int, str | None] = field(default_factory=dict)
     _instant_alpha_cache: dict[tuple[str, str], str | None] = field(default_factory=dict)
+    _mirror_cache: dict[tuple[str, bool, bool], str] = field(default_factory=dict)
     _counter: int = 0
+    #  Slide-number fields removed from text, for one warning at the end.
+    _dropped_slide_numbers: int = 0
 
     def next_id(self, prefix: str) -> str:
         self._counter += 1
@@ -1285,6 +2312,8 @@ class Importer:
             elif ext in PDF_EXTS:
                 name = _safe_name(Path(file_name).stem) + ".webp"
                 self.report.converted_images += 1
+            elif ext in VIDEO_EXTS:
+                name = _video_name(file_name)
             rel = f"assets/{name}"
             self._asset_cache[data_id] = rel
             return rel
@@ -1341,14 +2370,19 @@ class Importer:
 
         This is a *compatibility* transcode, unrelated to trimming: cropping and
         trimming stay non-destructive and CSS-based.
+
+        A playable MP4 or QuickTime movie whose index sits after its media is
+        rewritten with the index first (`_move_index_first`), in place: the
+        deck keeps one file per movie, the one its slides name.
         """
-        dest = assets / _safe_name(file_name)
+        dest = assets / _video_name(file_name)
         self.progress.emit(f"Extracting {file_name} ({_human_bytes(len(raw))})")
         if not dest.exists():
             dest.write_bytes(raw)
 
         codec = _video_codec(dest)
         if codec is None or codec in WEB_SAFE_VIDEO_CODECS:
+            self._move_index_first(dest, file_name)
             return f"assets/{dest.name}"
 
         target = assets / (_safe_name(Path(file_name).stem) + ".h264.mp4")
@@ -1389,6 +2423,46 @@ class Importer:
         dest.unlink(missing_ok=True)
         self.report.transcoded_videos += 1
         return f"assets/{target.name}"
+
+    def _move_index_first(self, dest: Path, file_name: str) -> None:
+        """Remux a movie whose `moov` follows its `mdat` so the index leads.
+
+        `ffmpeg -c copy -movflags +faststart` copies every sample as it is;
+        only the boxes move. The result replaces the file under its own name,
+        so nothing else in the deck changes and no second copy is left beside
+        it. A movie that cannot be remuxed is kept as it was: it plays, it
+        just cannot start before it has been downloaded.
+        """
+        muxer = FASTSTART_MUXERS.get(dest.suffix.lower())
+        if muxer is None or not _index_after_media(dest):
+            return
+        if shutil.which("ffmpeg") is None:
+            self.report.warnings.append(
+                f"{file_name} keeps its index at the end (ffmpeg was not found to move it), "
+                "so it cannot start playing before it has been downloaded."
+            )
+            return
+        self.progress.emit(f"Moving the index of {file_name} to the front")
+        temporary = dest.with_name(f"{dest.stem}.faststart-tmp{dest.suffix}")
+        common = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(dest)]
+        tail = ["-c", "copy", "-movflags", "+faststart", "-f", muxer, str(temporary)]
+        # Every stream first, timecode and second audio tracks included; a
+        # stream the muxer cannot carry fails that, and then the default
+        # selection (one video, one audio) is what plays anyway.
+        for mapping in (["-map", "0"], []):
+            try:
+                subprocess.run(common + mapping + tail, check=True, capture_output=True, timeout=600)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                continue
+            if temporary.exists() and temporary.stat().st_size > 0 and not _index_after_media(temporary):
+                os.replace(temporary, dest)
+                return
+            temporary.unlink(missing_ok=True)
+        self.report.warnings.append(
+            f"Could not move the index of {file_name} to the front; it plays, "
+            "but cannot start before it has been downloaded."
+        )
 
     def _rasterise_pdf(self, raw: bytes, file_name: str, assets: Path) -> str | None:
         """Render a PDF's first page to a lossless WebP.
@@ -1570,6 +2644,40 @@ class Importer:
             return src
         return derived
 
+    def _mirror_image(self, src: str, flip_h: bool, flip_v: bool) -> str:
+        """A mirrored copy of a deck asset, for Keynote's Flip commands."""
+        cache_key = (src, flip_h, flip_v)
+        if cache_key in self._mirror_cache:
+            return self._mirror_cache[cache_key]
+        source = Path(src)
+        suffix = "-flipped" + ("-h" if flip_h else "") + ("-v" if flip_v else "")
+        derived = f"assets/{source.stem}{suffix}{source.suffix}"
+        self._mirror_cache[cache_key] = derived
+        if self.dry_run:
+            return derived
+        destination = self.out_dir / derived
+        if destination.exists():
+            return derived
+        try:
+            from PIL import Image, ImageOps
+
+            with Image.open(self.out_dir / src) as opened:
+                bitmap = opened.copy()
+            if flip_h:
+                bitmap = ImageOps.mirror(bitmap)
+            if flip_v:
+                bitmap = ImageOps.flip(bitmap)
+            options = {"lossless": True} if source.suffix.lower() == ".webp" else {}
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            bitmap.save(destination, **options)
+        except Exception as exc:
+            self.report.warnings.append(
+                f"Could not flip {source.name}; it is shown unflipped: {exc}"
+            )
+            self._mirror_cache[cache_key] = src
+            return src
+        return derived
+
     # --- drawables ----------------------------------------------------------
 
     def convert_drawable(
@@ -1599,6 +2707,11 @@ class Importer:
             if kind == "MovieArchive":
                 return self._wrap(self._convert_movie(obj, box, z), kind, box, z)
             if kind == "ImageArchive":
+                source = equation_source(obj)
+                if source is not None:
+                    equation = self._convert_equation(obj, source, box, z)
+                    if equation is not None:
+                        return [equation]
                 return self._wrap(self._convert_image_el(obj, box, z), kind, box, z)
             if kind in ("ShapeInfoArchive", "PlaceholderArchive", "ConnectionLineArchive"):
                 return self._convert_shape(obj, box, z)
@@ -1644,16 +2757,15 @@ class Importer:
     def _convert_group(
         self, obj: Any, z: int, box: dict[str, float]
     ) -> list[dict[str, Any]]:
-        """Flatten a group, composing its origin into each child's position.
+        """Flatten a group, composing its frame into each child's geometry.
 
         v1 models no group container, so children are lifted to slide level.
-        Group *rotation* is not composed — a rotated group would need a full
-        transform stack — and is reported rather than silently mis-placed.
+        Children are stored in the group's unrotated space, and a rotated
+        group turns every child about the frame's centre: the word-vector
+        rows on the dictionary slides are columns of squares grouped and
+        turned a quarter, which flattened without the turn as tall columns
+        spilling out of their box.
         """
-        if abs(box["rot"]) > 0.01:
-            self.report.warnings.append(
-                "Rotated group flattened; child rotation may be wrong"
-            )
         out: list[dict[str, Any]] = []
         for i, child in enumerate(obj.children):
             out.extend(
@@ -1661,6 +2773,25 @@ class Importer:
                     int(child.identifier), z + i, (box["x"], box["y"])
                 )
             )
+        if abs(box["rot"]) > 0.01:
+            centre_x = box["x"] + box["w"] / 2
+            centre_y = box["y"] + box["h"] / 2
+            theta = math.radians(box["rot"])
+            cos, sin = math.cos(theta), math.sin(theta)
+
+            def turned(x: float, y: float) -> tuple[float, float]:
+                dx, dy = x - centre_x, y - centre_y
+                return centre_x + dx * cos - dy * sin, centre_y + dx * sin + dy * cos
+
+            for el in out:
+                cx, cy = turned(el["x"] + el["w"] / 2, el["y"] + el["h"] / 2)
+                el["x"] = round(cx - el["w"] / 2, 2)
+                el["y"] = round(cy - el["h"] / 2, 2)
+                el["rot"] = round(_normalise_angle(float(el.get("rot") or 0.0) + box["rot"]), 2)
+                # A curve's control point is in canvas space, not the box's.
+                if el.get("control"):
+                    px, py = turned(el["control"]["x"], el["control"]["y"])
+                    el["control"] = {"x": round(px, 2), "y": round(py, 2)}
         # Keynote diagrams commonly store nodes before their connecting lines,
         # but mask each connector below the filled node at paint time. Once the
         # group is flattened, reproduce that semantic layering: a native line
@@ -1716,6 +2847,58 @@ class Importer:
         self._apply_media_style(element, obj)
         return element
 
+    def _convert_equation(
+        self, obj: Any, source: str, box: dict[str, float], z: int
+    ) -> dict[str, Any] | None:
+        """An equation on its own: a text element holding `$$…$$`.
+
+        Keynote's picture is the formula's ink at its equation font size.
+        KaTeX's display block is taller than the ink — a line box, and an em
+        of margin above and below — so the box keeps the picture's width and
+        centre and grows to hold that block (measured in Chromium: KaTeX's
+        line is max(1.3 × ink, 1.2 em) tall). The type is the same em; KaTeX
+        sets about 15% wider than Keynote, so the auto-fit shrinks it to the
+        picture's width. Returns None when the source has no TeX, and the
+        picture Keynote rendered is imported instead.
+        """
+        tex, why = equation_tex(source)
+        if tex is None:
+            kind = why.split(" ", 1)[0]
+            self.report.unsupported[f"equation kept as a picture ({kind} not converted)"] += 1
+            shown = re.sub(r"\s+", " ", source)[:160]
+            self.report.warnings.append(f"An equation has no TeX ({why}) and is kept as a picture: {shown}")
+            return None
+        props = _extension(obj, "equation_text_properties")
+        size = float(getattr(props, "font_size", 0.0) or 0.0) if props is not None else 0.0
+        # Without a size, one that sets the formula about as tall as its picture.
+        em = size if size > 0 else box["h"] / 1.2
+        font_size = em / KATEX_SCALE
+        colour = color_to_hex(props.font_color) if props is not None and props.HasField("font_color") else None
+        framed = dict(box)
+        framed["h"] = max(box["h"] * 1.3, em * 1.2) + 2 * font_size
+        framed["y"] = box["y"] + box["h"] / 2 - framed["h"] / 2
+        element = self._base(framed, z, "text")
+        inline = {"font-size": f"{font_size:.0f}px", "line-height": "1.2"}
+        if colour:
+            inline["color"] = colour
+        element.update(
+            {
+                "html": f"$${html.escape(tex)}$$",
+                "autoFit": True,
+                "align": "center",
+                "valign": "middle",
+                "class": ["kn-text"],
+                "style": inline,
+                # Maths takes no role: a role's weight and tracking are for words.
+                "_kn_role": "base",
+            }
+        )
+        try:
+            element["opacity"] = resolve_media_style(self.objects, _ref(obj, "style")).opacity
+        except Exception:
+            pass
+        return element
+
     def _convert_image_el(
         self, obj: Any, box: dict[str, float], z: int
     ) -> dict[str, Any] | None:
@@ -1745,16 +2928,33 @@ class Importer:
         # times the size of the slide and anchored off-canvas — and using it as
         # the element box puts a giant, wrongly-placed picture on the slide.
         # The visible box is the mask; the image is then offset inside it.
+        #
+        # A flipped image is mirrored inside its frame, and so is its mask:
+        # the mask's stored position is measured on the unflipped picture.
+        # The deck has no flip, so the mirror is baked into the asset.
+        flags = int(getattr(find_geometry(obj), "flags", 0) or 0)
+        flip_h = bool(flags & GEOMETRY_HORIZONTAL_FLIP)
+        flip_v = bool(flags & GEOMETRY_VERTICAL_FLIP)
+        if flip_h or flip_v:
+            src = self._mirror_image(src, flip_h, flip_v)
         mask_geometry = self._mask_geometry(obj)
         mask_shape = self._mask_shape(obj, mask_geometry)
         source_box = None
         if mask_geometry is not None:
+            mask_x = float(mask_geometry.position.x)
+            mask_y = float(mask_geometry.position.y)
+            mask_w = float(mask_geometry.size.width)
+            mask_h = float(mask_geometry.size.height)
+            if flip_h:
+                mask_x = box["w"] - mask_x - mask_w
+            if flip_v:
+                mask_y = box["h"] - mask_y - mask_h
             visible = {
                 # Mask position is relative to the image's own origin.
-                "x": box["x"] + float(mask_geometry.position.x),
-                "y": box["y"] + float(mask_geometry.position.y),
-                "w": max(1.0, float(mask_geometry.size.width)),
-                "h": max(1.0, float(mask_geometry.size.height)),
+                "x": box["x"] + mask_x,
+                "y": box["y"] + mask_y,
+                "w": max(1.0, mask_w),
+                "h": max(1.0, mask_h),
                 "rot": box["rot"],
             }
             self.report.cropped_images += 1
@@ -1845,7 +3045,21 @@ class Importer:
         # Keynote shows one. Dropping it would lose a deliberate slot in the
         # layout; importing it as a zero-height shape would leave an invisible
         # sliver that cannot be selected.
-        if not text.strip() and _is_text_box(obj):
+        #
+        # A box sized to its content (stored 0×0) that holds no content has
+        # no extent in Keynote at all: it is the trace of a stray click with
+        # the text tool, invisible there, and would surface here as three
+        # tiny "Text" labels floating mid-slide.
+        if not text.strip() and _is_text_box(obj) and box["w"] <= 1 and box["h"] <= 1:
+            return out
+        # A box that holds only a slide number (the theme's slide-number box,
+        # bottom right) holds nothing once the field is gone: it is dropped,
+        # not kept as an empty slot. Its paint, if any, stays.
+        remaining, fields = self._without_slide_numbers(obj, text)
+        if fields and not remaining.strip():
+            self._dropped_slide_numbers += fields
+            text = ""
+        elif not text.strip() and _is_text_box(obj):
             style = resolve_text_style(self.objects, obj)
             font_size = style.font_size or DEFAULT_FONT_SIZE
             box = self._size_text_box(
@@ -1864,9 +3078,7 @@ class Importer:
             inline = {"font-size": f"{font_size:.0f}px"}
             if style.font_name:
                 inline["font-family"] = _font_family_css(style.font_name)
-                weight = _font_weight_css(style.font_name)
-                if weight:
-                    inline["font-weight"] = weight
+            inline.update(_face_css(style))
             element.update(
                 {
                     "html": PLACEHOLDER_TEXT,
@@ -1884,24 +3096,36 @@ class Importer:
         # bordered conviction box also owns its caption text. Empty-pattern
         # strokes were filtered while resolving the style, so ordinary text
         # boxes still do not acquire phantom borders here.
-        vector = self._convert_vector(obj, box, z)
+        #
+        # A filled text box sized to its content stores a 0×0 frame, and its
+        # fill covers the laid-out text — the white label that cuts the
+        # "Denoising" arrow line. Painted from the stored frame it shrinks to
+        # a 1px dot and the line runs straight through the words.
+        auto_sized = box["w"] <= 1 or box["h"] <= 1
+        text_style = resolve_text_style(self.objects, obj) if text.strip() else None
+        text_box = None
+        if text_style is not None:
+            text_box = self._size_text_box(
+                box,
+                text,
+                text_style.font_size or DEFAULT_FONT_SIZE,
+                text_style.align,
+                text_style.valign,
+                self._text_natural_size(obj),
+                text_style.font_name,
+                bool(text_style.bold),
+                text_style.horizontal_padding,
+            )
+        vector = self._convert_vector(
+            obj, text_box if auto_sized and text_box is not None else box, z
+        )
         if vector is not None:
             out.append(vector)
 
-        if text.strip():
-            style = resolve_text_style(self.objects, obj)
+        if text_style is not None and text_box is not None:
+            style = text_style
             font_size = style.font_size or DEFAULT_FONT_SIZE
-            box = self._size_text_box(
-                box,
-                text,
-                font_size,
-                style.align,
-                style.valign,
-                self._text_natural_size(obj),
-                style.font_name,
-                bool(style.bold),
-                style.horizontal_padding,
-            )
+            box = text_box
 
             # Layout-critical Keynote typography keeps wrapping and light-on-
             # dark labels faithful. Deleting these inline values hands control
@@ -1909,12 +3133,7 @@ class Importer:
             inline = {"font-size": f"{font_size:.0f}px"}
             if style.font_name:
                 inline["font-family"] = _font_family_css(style.font_name)
-            if style.bold:
-                inline["font-weight"] = "700"
-            elif style.font_name:
-                weight = _font_weight_css(style.font_name)
-                if weight:
-                    inline["font-weight"] = weight
+            inline.update(_face_css(style))
             if style.gradient:
                 inline.update(
                     {
@@ -1926,13 +3145,18 @@ class Importer:
                 )
             elif style.color:
                 inline["color"] = style.color
+            # Stated inline so the theme's role defaults (a title's tighter
+            # tracking and leading) never restyle text Keynote laid out.
+            inline["line-height"] = line_height_css(style.line_spacing, font_size)
+            inline["letter-spacing"] = tracking_css(style.tracking)
 
             element = self._base(box, z, "text")
             element["opacity"] = shape_paint.opacity
+            inserts = self._inline_equations(obj, text)
+            markup = styled_text_to_html(self.objects, obj, style, inserts) or text_to_html(text, inserts)
             element.update(
                 {
-                    "html": styled_text_to_html(self.objects, obj, style)
-                    or text_to_html(text),
+                    "html": markup,
                     "autoFit": True,
                     "align": style.align,
                     "valign": style.valign,
@@ -1940,9 +3164,65 @@ class Importer:
                     "style": inline,
                 }
             )
+            if "<li" in markup:
+                # The editor's lists gap their items by 0.15em unless the box
+                # names its own spacing; Keynote's paragraphs carry theirs
+                # explicitly (usually none), and five gaps of 9px are what
+                # pushed a numbered list into the figure below it.
+                storage = _storage_of(self.objects, obj)
+                first = _ref_entries(storage.table_para_style, carry=True) if storage is not None else []
+                element["paragraphSpacing"] = round(
+                    _para_spacing(self.objects, first[0][1] if first else None), 1
+                )
             out.append(element)
 
         return out
+
+    def _inline_equations(self, obj: Any, text: str) -> dict[int, str]:
+        """`$…$` for each equation in a shape's text, keyed by its U+FFFC, and
+        nothing for each slide-number field.
+
+        Whatever stays a U+FFFC — an equation with no TeX, a picture placed
+        in the text, a field DeckWerk has no equivalent for — is reported, so
+        the gap is not silent.
+        """
+        attachments = inline_equation_markup(self.objects, _storage_of(self.objects, obj))
+        for attachment in attachments:
+            if attachment.tex is not None:
+                continue
+            if attachment.slide_number:
+                self._dropped_slide_numbers += 1
+                continue
+            source = equation_source(attachment.drawable)
+            if source is None:
+                self.report.unsupported[f"inline {attachment.kind} in text"] += 1
+                continue
+            kind = attachment.why.split(" ", 1)[0]
+            self.report.unsupported[f"inline equation ({kind} not converted)"] += 1
+            shown = re.sub(r"\s+", " ", source)[:160]
+            self.report.warnings.append(
+                f"An equation in a text box has no TeX ({attachment.why}) and is left as U+FFFC: {shown}"
+            )
+        return attachment_inserts(text, attachments, inline_tex_html)
+
+    def _without_slide_numbers(self, obj: Any, text: str) -> tuple[str, int]:
+        """`text` with its slide-number fields taken out, and how many there were."""
+        attachments = inline_equation_markup(self.objects, _storage_of(self.objects, obj))
+        fields = {
+            at for at, attachment in zip(attachment_positions(text, attachments), attachments)
+            if attachment.slide_number
+        }
+        if not fields:
+            return text, 0
+        return "".join(c for i, c in enumerate(text) if i not in fields), len(fields)
+
+    def finish_report(self) -> None:
+        """Warnings that sum up the whole deck."""
+        if self._dropped_slide_numbers:
+            count = self._dropped_slide_numbers
+            self.report.warnings.append(
+                f"Dropped {count} slide-number field{'s' if count != 1 else ''}; DeckWerk has no slide-number field"
+            )
 
     def _size_text_box(
         self,
@@ -1981,9 +3261,12 @@ class Importer:
         # Vertical text: Keynote's anchor conventions for auto-sized geometry
         # change once a box is turned on its side.
         quarter_turn = abs(abs(rot) - 90.0) < 2.0
+        rotated = abs(rot) > 0.5
 
         if width_was_auto:
-            measured = _measure_text_width(
+            # An attachment (an equation, a picture) is one U+FFFC in the
+            # text but has its own width: Keynote's layout cache knows it.
+            measured = None if OBJECT_REPLACEMENT in text and natural_size is not None else _measure_text_width(
                 text, font_size, font_name, bold, horizontal_padding
             )
             if measured is not None:
@@ -1999,7 +3282,7 @@ class Importer:
             # left edge: centred labels use their horizontal centre and
             # right-aligned labels use their right edge. Fully-auto rotated
             # boxes are anchored differently and handled below instead.
-            if not (quarter_turn and height_was_auto):
+            if not (rotated and height_was_auto):
                 if align == "center":
                     out["x"] -= out["w"] / 2
                 elif align == "right":
@@ -2024,32 +3307,35 @@ class Importer:
             # Auto-height geometry stores the vertical alignment anchor: top,
             # centre, or bottom depending on the shape style. Rotated boxes
             # use their own anchors, applied below.
-            if not quarter_turn:
+            if not quarter_turn and not (rotated and width_was_auto):
                 if valign == "middle":
                     out["y"] = centre_y - out["h"] / 2
                 elif valign == "bottom":
                     out["y"] = centre_y - out["h"]
             self.report.autosized_boxes += 1
 
-        # Quarter-turned text stores its position under conventions of its own,
-        # reverse-engineered from the hand-authored vertical labels on
-        # reference.key slide 25 (all rotated 90° anticlockwise):
+        # A box sized to its text in both directions stores the point its text
+        # grows from — the alignment anchor, as for unrotated text above: the
+        # left, centre or right of the line, at the top, middle or bottom —
+        # and Keynote turns the laid-out box about that point. "Detail →"
+        # beside a grid (MilliVid slide 21: left, middle, 90° anticlockwise)
+        # landed on the grid when the anchor was taken as the top-left corner.
+        # For a left/top box the two agree, which is what the hand-authored
+        # vertical labels on reference.key slide 25 showed.
         #
-        #  * both dimensions auto: the stored position is where the *unrotated
-        #    frame's top-left corner* lands after rotating about the frame's
-        #    centre. Solved generally below, so it also reduces to the plain
-        #    top-left at rot 0.
-        #  * fixed width, auto height: the stored position is the frame's
-        #    top-left displaced by (h/2, h/2) — h being the laid-out height —
-        #    independent of the shape's valign (slide 25's labels carry
-        #    valign bottom yet anchor at h/2). Only observed at 90°
-        #    anticlockwise; assumed symmetric for clockwise.
-        if quarter_turn and width_was_auto and height_was_auto:
+        # A fixed-width box with auto height turned a quarter: the stored
+        # position is the frame's top-left displaced by (h/2, h/2) — h being
+        # the laid-out height — independent of the shape's valign (slide 25's
+        # labels carry valign bottom yet anchor at h/2). Only observed at 90°
+        # anticlockwise; assumed symmetric for clockwise.
+        if rotated and width_was_auto and height_was_auto:
+            local_x = {"center": 0.0, "right": -out["w"] / 2}.get(align, out["w"] / 2)
+            local_y = {"middle": 0.0, "bottom": -out["h"] / 2}.get(valign, out["h"] / 2)
             theta = math.radians(rot)
-            corner_dx = (-out["w"] / 2) * math.cos(theta) - (-out["h"] / 2) * math.sin(theta)
-            corner_dy = (-out["w"] / 2) * math.sin(theta) + (-out["h"] / 2) * math.cos(theta)
-            out["x"] = box["x"] - corner_dx - out["w"] / 2
-            out["y"] = box["y"] - corner_dy - out["h"] / 2
+            centre_x = box["x"] + local_x * math.cos(theta) - local_y * math.sin(theta)
+            centre_y = box["y"] + local_x * math.sin(theta) + local_y * math.cos(theta)
+            out["x"] = centre_x - out["w"] / 2
+            out["y"] = centre_y - out["h"] / 2
         elif quarter_turn and not width_was_auto and height_was_auto:
             out["x"] -= out["h"] / 2
             out["y"] -= out["h"] / 2
@@ -2191,7 +3477,7 @@ class Importer:
         ):
             source = pathsource.scalar_path_source
             if int(source.type) == 0:
-                element = self._base(box, z, "shape")
+                element = self._base(_outset_for_stroke(box, style), z, "shape")
                 element.update(
                     {
                         "shape": "rect",
@@ -2225,6 +3511,11 @@ class Importer:
             if field_name == "editable_bezier_path_source":
                 path_data, bounds = editable_path_to_svg(source)
                 break
+            if field_name == "point_path_source":
+                path_data, bounds = point_path_to_svg(source)
+                if path_data:
+                    break
+                continue
             # Some path sources wrap the real one in `super`.
             base = source.super if _has(source, "super") else source
             if not _has(base, "path"):
@@ -2298,7 +3589,7 @@ class Importer:
             and not style.arrow_end
             and is_axis_aligned_rectangle(path_msg)
         ):
-            element = self._base(box, z, "shape")
+            element = self._base(_outset_for_stroke(box, style), z, "shape")
             element.update(
                 {
                     "shape": "rect",
@@ -2633,6 +3924,30 @@ class Importer:
                 animation_type = str(build.attributes.animationAttributes.animation_type)
             except AttributeError:
                 continue
+            if animation_type == "Action":
+                move = _motion_path_offset(build)
+                if move is not None:
+                    duration = float(build.attributes.animationAttributes.duration or 1.0)
+                    timeline.append(
+                        {
+                            # Never written to a deck, so it takes no id from
+                            # the counter that numbers every object after it.
+                            "id": MOVE_ACTION,
+                            "trigger": {
+                                "on": "afterPrev" if automatic else "click",
+                                "ref": None,
+                                "delay": round(delay * 1000),
+                            },
+                            "action": {
+                                "type": MOVE_ACTION,
+                                "targets": list(targets),
+                                "dx": move[0],
+                                "dy": move[1],
+                                "duration": duration,
+                            },
+                        }
+                    )
+                continue
             action = (
                 "appear"
                 if animation_type == "In"
@@ -2665,7 +3980,18 @@ class Importer:
         if note_id is None or note_id not in self.objects:
             return ""
         try:
-            return extract_text(self.objects, self.objects[note_id])
+            note = self.objects[note_id]
+            text = extract_text(self.objects, note)
+            # Notes are plain text: an equation in them reads as its TeX.
+            storage_ref = find_in_super_chain(note, "containedStorage")
+            storage = self.objects.get(int(storage_ref.identifier)) if storage_ref is not None and storage_ref.identifier else None
+            # A slide-number field in them reads as nothing.
+            inserts = attachment_inserts(
+                text, inline_equation_markup(self.objects, storage), lambda tex: f"${tex}$"
+            )
+            for index in sorted(inserts, reverse=True):
+                text = text[:index] + inserts[index] + text[index + 1:]
+            return text
         except Exception:
             return ""
 
@@ -2675,6 +4001,160 @@ DEFAULT_FONT_SIZE = 36.0
 
 """Shown in an empty imported text box, mirroring what Keynote displays."""
 PLACEHOLDER_TEXT = "Text"
+
+
+# A Keynote "Move" build, held in a slide's timeline only until
+# `split_at_moves` turns it into a Morph; never written to a deck.
+MOVE_ACTION = "_move"
+
+
+def _motion_path_offset(build: Any) -> tuple[float, float] | None:
+    """How far a Move build carries its object: the motion path's end point
+    relative to its start. Morph moves in a straight line, so a curved path
+    keeps only where it ends."""
+    try:
+        source = build.attributes.action_motionPathSource
+        subpaths = list(source.editable_bezier_path_source.subpaths)
+    except AttributeError:
+        return None
+    nodes = [node for subpath in subpaths for node in subpath.nodes]
+    if len(nodes) < 2:
+        return None
+    start, end = nodes[0].nodePoint, nodes[-1].nodePoint
+    dx, dy = float(end.x) - float(start.x), float(end.y) - float(start.y)
+    if source.horizontalFlip:
+        dx = -dx
+    if source.verticalFlip:
+        dy = -dy
+    if abs(dx) < 0.01 and abs(dy) < 0.01:
+        return None
+    return round(dx, 2), round(dy, 2)
+
+
+def split_at_moves(slide: dict[str, Any], report: "Report | None" = None) -> list[dict[str, Any]]:
+    """Turn a slide's Keynote Move builds into Morphs to copies of the slide.
+
+    The editor's builds show and hide objects; only Morph, between two
+    slides, moves them. So the builds up to a Move stay on this slide, and
+    the slide continues on a copy that Morphs in from it: everything that is
+    on screen at that moment, with the moved objects in their new places,
+    followed by the builds that come after. Moves that follow the first one
+    automatically ride the same transition. Each object keeps one morphId
+    across the copies, so only what moved animates.
+
+    Left alone, a Move was dropped, and the objects that make room for it
+    built in on top of the one that should have moved out of their way.
+    """
+    if not any(entry["action"]["type"] == MOVE_ACTION for entry in slide["timeline"]):
+        return [slide]
+    for element in slide["elements"]:
+        element["morphId"] = element.get("morphId") or element["id"]
+
+    out: list[dict[str, Any]] = []
+    current = slide
+    part = 1
+    while True:
+        entries = current["timeline"]
+        first = next((i for i, e in enumerate(entries) if e["action"]["type"] == MOVE_ACTION), None)
+        if first is None:
+            out.append(current)
+            return out
+        last = first + 1
+        while (
+            last < len(entries)
+            and entries[last]["action"]["type"] == MOVE_ACTION
+            and entries[last]["trigger"]["on"] != "click"
+        ):
+            last += 1
+        before, moves, after = entries[:first], entries[first:last], entries[last:]
+
+        # What is on screen when the Move starts.
+        visibility = [e for e in before + after if e["action"]["type"] in ("appear", "disappear")]
+        decided: set[str] = set()
+        hidden: set[str] = set()
+        for entry in visibility:
+            target = entry["action"]["target"]
+            if target not in decided:
+                decided.add(target)
+                if entry["action"]["type"] == "appear":
+                    hidden.add(target)
+        visible = {element["id"] for element in current["elements"]} - hidden
+        shown_here = set(visible)
+        for entry in before:
+            kind, target = entry["action"]["type"], entry["action"].get("target")
+            if kind == "appear":
+                visible.add(target)
+                shown_here.add(target)
+            elif kind == "disappear":
+                visible.discard(target)
+        # Objects whose build comes after the Move belong to the copy only:
+        # here, with no build left to hide them, they would show from the start.
+        every_element = current["elements"]
+        current["elements"] = [e for e in every_element if e["id"] in shown_here]
+        current["timeline"] = before
+        out.append(current)
+
+        part += 1
+        suffix = f"-m{part}"
+        shift: dict[str, tuple[float, float]] = {}
+        for move in moves:
+            for target in move["action"]["targets"]:
+                dx, dy = shift.get(target, (0.0, 0.0))
+                shift[target] = (dx + move["action"]["dx"], dy + move["action"]["dy"])
+        appears_later = {
+            e["action"]["target"] for e in after
+            if e["action"]["type"] == "appear"
+        }
+        kept = [
+            element for element in every_element
+            if element["id"] in visible or element["id"] in appears_later
+        ]
+        ids = {element["id"]: element["id"] + suffix for element in kept}
+        elements = []
+        for element in kept:
+            moved = copy.deepcopy(element)
+            moved["id"] = ids[element["id"]]
+            dx, dy = shift.get(element["id"], (0.0, 0.0))
+            moved["x"] = round(moved["x"] + dx, 2)
+            moved["y"] = round(moved["y"] + dy, 2)
+            elements.append(moved)
+
+        timeline = []
+        for entry in after:
+            action = entry["action"]
+            if action["type"] == MOVE_ACTION:
+                targets = [ids[t] for t in action["targets"] if t in ids]
+                if not targets:
+                    continue
+                action = {**action, "targets": targets}
+            elif action.get("target") not in ids:
+                continue
+            else:
+                action = {**action, "target": ids[action["target"]]}
+            trigger = dict(entry["trigger"])
+            if trigger.get("ref"):
+                trigger["ref"] = ids.get(trigger["ref"])
+            timeline.append({"id": entry["id"] + suffix, "trigger": trigger, "action": action})
+
+        duration = max(move["action"]["duration"] for move in moves)
+        nxt = {
+            key: copy.deepcopy(value) for key, value in current.items()
+            if key not in ("elements", "timeline")
+        }
+        nxt.update(
+            {
+                "id": slide["id"] + suffix,
+                "elements": elements,
+                "timeline": timeline,
+                "morphFromPrevious": True,
+                "morphDuration": max(100, min(5000, round(duration * 1000))),
+            }
+        )
+        if report is not None:
+            report.warnings.append(
+                f"{slide['name']}: a Move build continues on the next slide as a Morph"
+            )
+        current = nxt
 
 
 def _normalise_angle(degrees: float) -> float:
@@ -2989,6 +4469,47 @@ def _video_codec(path: Path) -> str | None:
         return None
 
 
+def _video_name(file_name: str) -> str:
+    """The asset name a movie is written under: safe, and `.qt` as `.mov`."""
+    path = Path(file_name)
+    renamed = RENAMED_VIDEO_EXTS.get(path.suffix.lower())
+    return _safe_name(path.stem) + renamed if renamed else _safe_name(file_name)
+
+
+def _index_after_media(path: Path) -> bool:
+    """Whether an MP4/QuickTime file's top-level `moov` comes after its `mdat`.
+
+    Walks the top-level box headers only, so it costs a few reads however
+    large the movie. Anything that does not parse as boxes counts as fine:
+    there is nothing to move.
+    """
+    try:
+        with path.open("rb") as handle:
+            size_total = path.stat().st_size
+            at = 0
+            while at + 8 <= size_total:
+                handle.seek(at)
+                header = handle.read(16)
+                if len(header) < 8:
+                    return False
+                size = int.from_bytes(header[:4], "big")
+                kind = header[4:8]
+                if kind == b"moov":
+                    return False
+                if kind == b"mdat":
+                    return True
+                if size == 1 and len(header) >= 16:
+                    size = int.from_bytes(header[8:16], "big")
+                elif size == 0:
+                    return False
+                if size < 8:
+                    return False
+                at += size
+    except OSError:
+        return False
+    return False
+
+
 def _is_text_box(obj: Any) -> bool:
     """Whether a drawable is a text box rather than drawn vector art."""
     current = obj
@@ -3003,8 +4524,22 @@ def _is_text_box(obj: Any) -> bool:
 
 
 def _safe_name(name: str) -> str:
-    keep = "".join(c if c.isalnum() or c in "._-" else "-" for c in name)
-    return keep.strip("-") or "asset"
+    """A file name safe on every file system, its stem capped in length."""
+    keep = "".join(c if c.isalnum() or c in "._-" else "-" for c in name).strip("-") or "asset"
+    stem, dot, ext = keep.rpartition(".")
+    if not (dot and stem and ext.isascii() and ext.isalnum() and len(ext) <= 8):
+        stem, dot, ext = keep, "", ""
+    return _cap_stem(stem) + dot + ext
+
+
+def _cap_stem(stem: str) -> str:
+    """`stem`, or its first bytes and a hash of it when it is too long."""
+    encoded = stem.encode("utf-8")
+    if len(encoded) <= MAX_ASSET_STEM_BYTES:
+        return stem
+    digest = hashlib.sha1(encoded).hexdigest()[:8]
+    cut = encoded[: MAX_ASSET_STEM_BYTES - len(digest) - 1].decode("utf-8", "ignore").rstrip("-.")
+    return f"{cut}-{digest}"
 
 
 THEME_CSS = """/*
@@ -3071,7 +4606,15 @@ def import_key(
         progress.phase(f"Decoding {path.name}", OPEN_SPAN[1])
         objects = load_objects(pkg, report, progress)
         if not objects:
-            raise SystemExit(f"No readable .iwa streams in {path}")
+            streams = [name for name in pkg.names if name.endswith(".iwa")]
+            if streams:
+                detail = f"none of its {len(streams)} .iwa streams decoded ({'; '.join(report.warnings[:2])})"
+            else:
+                shown = sorted({name.split("/", 1)[0] for name in pkg.names})[:8]
+                detail = f"it holds no Keynote .iwa streams (top level: {', '.join(shown) or 'nothing'})"
+                if "index.apxl" in pkg or "index.apxl.gz" in pkg:
+                    detail += "; it is a Keynote '09 file, open and re-save it in a current Keynote"
+            raise SystemExit(f"Could not read {path.name}: {detail}")
 
         datas = data_file_table(objects)
         if not datas:
@@ -3112,7 +4655,7 @@ def import_key(
                 node = objects[int(node_ref.identifier)]
                 slide_obj = objects[int(node.slide.identifier)]
                 skipped = bool(getattr(node, "isSkipped", False))
-                slides.append(importer.convert_slide(slide_obj, index, skipped))
+                slides.extend(split_at_moves(importer.convert_slide(slide_obj, index, skipped), report))
             except Exception as exc:
                 # One unreadable slide must not cost the other ninety-five.
                 report.warnings.append(f"Slide {index + 1} failed: {exc}")
@@ -3128,6 +4671,7 @@ def import_key(
                     }
                 )
 
+        importer.finish_report()
         progress.phase("Classifying text roles", SLIDE_SPAN[1])
         _classify_text_roles(slides)
 
@@ -3160,7 +4704,35 @@ def import_key(
         pkg.close()
 
 
+def self_check() -> int:
+    """Import every module an import can reach, then exit.
+
+    Several of them are imported lazily and only warn when missing, so a broken
+    environment would otherwise surface as a failed or quietly degraded import
+    of somebody's deck. The collab server, `npm install` and build:importer run
+    this first and refuse to go on when it fails.
+    """
+    import importlib
+
+    missing = []
+    for module in ('keynote_parser.codec', 'PIL.Image', 'PIL.ImageChops', 'PIL.ImageFont', 'pymupdf', 'xml.etree.ElementTree'):
+        try:
+            importlib.import_module(module)
+        except ImportError as exc:
+            missing.append(f"{module} ({exc})")
+    if missing:
+        sys.stderr.write(
+            "The Keynote importer cannot load: " + "; ".join(missing)
+            + "\nRun: npm run setup:importers\n"
+        )
+        return 1
+    sys.stdout.write("ok\n")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv == ["--self-check"]:
+        return self_check()
     parser = argparse.ArgumentParser(description="Import a Keynote .key file.")
     parser.add_argument("input", type=Path, help="Path to a .key file or bundle")
     parser.add_argument("--out", type=Path, help="Deck folder to create")

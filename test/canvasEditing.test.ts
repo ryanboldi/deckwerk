@@ -2,7 +2,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { emptyDeck } from '../src/shared/deck.js';
+import { emptyDeck, type SlideElement } from '../src/shared/deck.js';
+import { DEFAULT_BRACE_DEPTH, braceTip } from '../src/shared/brace.js';
 import { THEMES, chooseDeckTheme, fullThemeSelection } from '../src/shared/themes.js';
 import {
   EditorCanvas,
@@ -153,6 +154,20 @@ function setup() {
   return { store, canvas, host };
 }
 
+/** A picture clear of setup()'s text and video, at 1200,300 400x300. */
+function imageElement() {
+  return {
+    id: 'image-1',
+    type: 'image' as const,
+    x: 1200, y: 300, w: 400, h: 300, rot: 0, z: 3, opacity: 1,
+    class: [], style: {},
+    src: 'assets/photo.png',
+    alt: '',
+    fit: 'cover' as const,
+    sourceBox: null,
+  };
+}
+
 /**
  * `bindEditorKeys` only reaches for `rail` on the `n` shortcut and `save` on
  * Cmd+S, so the keyboard tests can stub both and still drive the real handler.
@@ -289,6 +304,265 @@ describe('canvas zoom viewport', () => {
   });
 });
 
+/**
+ * setup()'s deck (a text box and a video) in a host with a real size, so the
+ * stage is placed and panning shows up in its position.
+ */
+function setupSizedViewport() {
+  const parts = setup();
+  parts.host.getBoundingClientRect = () => ({
+    x: 40, y: 20, left: 40, top: 20, right: 1320, bottom: 820,
+    width: 1280, height: 800, toJSON: () => ({}),
+  }) as DOMRect;
+  parts.canvas.recenter();
+  const stage = parts.host.querySelector<HTMLElement>('.stage')!;
+  return { ...parts, stage };
+}
+
+const stagePosition = (stage: HTMLElement) => ({
+  left: Number.parseFloat(stage.style.left),
+  top: Number.parseFloat(stage.style.top),
+});
+
+describe('canvas zoom and pan without a trackpad', () => {
+  beforeEach(() => document.body.replaceChildren());
+
+  const wheel = (host: HTMLElement, init: WheelEventInit) => {
+    const event = new WheelEvent('wheel', {
+      clientX: 600, clientY: 400, bubbles: true, cancelable: true, ...init,
+    });
+    host.dispatchEvent(event);
+    return event;
+  };
+
+  it('zooms one mouse-wheel notch by a tenth, however the wheel reports it', () => {
+    const notches: WheelEventInit[] = [
+      { deltaY: -100 }, // Chromium on Windows
+      { deltaY: -120 }, // Chromium on Linux
+      { deltaY: -53 }, // a high-DPI Linux display
+      { deltaY: -40 }, // Chromium on macOS: 40 px a tick
+      { deltaY: -3, deltaMode: WheelEvent.DOM_DELTA_LINE }, // Firefox
+      { deltaY: -1, deltaMode: WheelEvent.DOM_DELTA_PAGE },
+    ];
+    for (const notch of notches) {
+      const { canvas, host } = setupViewport();
+      const event = wheel(host, { ...notch, ctrlKey: true });
+      expect(event.defaultPrevented).toBe(true);
+      expect(canvas.zoomPercent(), JSON.stringify(notch)).toBe(110);
+      // Zooming out is the exact inverse, so one notch each way is home.
+      wheel(host, { ...notch, deltaY: -(notch.deltaY ?? 0), ctrlKey: true });
+      expect(canvas.zoomPercent(), JSON.stringify(notch)).toBe(100);
+    }
+  });
+
+  it('zooms out by the same ratio it zooms in, and compounds notches in one event', () => {
+    const { canvas, host } = setupViewport();
+    wheel(host, { deltaY: 100, ctrlKey: true });
+    expect(canvas.zoomPercent()).toBe(91); // 1 / 1.1
+    canvas.recenter();
+    wheel(host, { deltaY: -240, ctrlKey: true }); // two notches coalesced
+    expect(canvas.zoomPercent()).toBe(121);
+    canvas.recenter();
+    wheel(host, { deltaY: -6, deltaMode: WheelEvent.DOM_DELTA_LINE, ctrlKey: true });
+    expect(canvas.zoomPercent()).toBe(121);
+  });
+
+  it('keeps a trackpad pinch on its smooth curve', () => {
+    const { canvas, host } = setupViewport();
+    // A pinch frame: Chromium reports -100·ln(scale), a few fractional pixels.
+    wheel(host, { deltaY: -2.5, ctrlKey: true });
+    expect(canvas.zoomPercent()).toBe(Math.round(100 * Math.exp(0.025)));
+    wheel(host, { deltaY: 2.5, ctrlKey: true });
+    expect(canvas.zoomPercent()).toBe(100);
+  });
+
+  it('pans sideways with Shift and the wheel', () => {
+    const { host, stage } = setupViewport();
+    const before = stagePosition(stage);
+    const event = wheel(host, { deltaY: 40, shiftKey: true });
+    expect(event.defaultPrevented).toBe(true);
+    expect(stagePosition(stage).left).toBeCloseTo(before.left - 40);
+    expect(stagePosition(stage).top).toBeCloseTo(before.top);
+    // A platform that already turned Shift+wheel sideways is taken as it is.
+    wheel(host, { deltaX: 30, shiftKey: true });
+    expect(stagePosition(stage).left).toBeCloseTo(before.left - 70);
+    expect(stagePosition(stage).top).toBeCloseTo(before.top);
+  });
+
+  it('pans with a middle-button drag anywhere, touching nothing on the slide', () => {
+    const { store, host, stage } = setupSizedViewport();
+    const before = stagePosition(stage);
+    const target = host.querySelector<HTMLElement>('[data-element-id="text-1"]')!;
+    const down = new PointerEvent('pointerdown', {
+      button: 1, buttons: 4, clientX: 300, clientY: 200, bubbles: true, cancelable: true,
+    });
+    target.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(true);
+    expect(host.classList.contains('is-panning')).toBe(true);
+    target.dispatchEvent(new PointerEvent('pointermove', {
+      button: -1, buttons: 4, clientX: 340, clientY: 260, bubbles: true,
+    }));
+    target.dispatchEvent(new PointerEvent('pointermove', {
+      button: -1, buttons: 4, clientX: 380, clientY: 230, bubbles: true,
+    }));
+    const up = new PointerEvent('pointerup', {
+      button: 1, buttons: 0, clientX: 380, clientY: 230, bubbles: true, cancelable: true,
+    });
+    target.dispatchEvent(up);
+    // Linux pastes the primary selection on a middle click; this was a pan.
+    expect(up.defaultPrevented).toBe(true);
+    const aux = new MouseEvent('auxclick', { button: 1, bubbles: true, cancelable: true });
+    target.dispatchEvent(aux);
+    expect(aux.defaultPrevented).toBe(true);
+
+    expect(host.classList.contains('is-panning')).toBe(false);
+    expect(stagePosition(stage).left).toBeCloseTo(before.left + 80);
+    expect(stagePosition(stage).top).toBeCloseTo(before.top + 30);
+    expect(store.get().selection.size).toBe(0);
+    const text = store.slide!.elements.find((element) => element.id === 'text-1')!;
+    expect([text.x, text.y]).toEqual([100, 100]);
+  });
+
+  it('pans with a middle-button drag while text is being edited, and keeps the edit', () => {
+    const { canvas, host, stage } = setupSizedViewport();
+    canvas.beginTextEdit('text-1');
+    const before = stagePosition(stage);
+    host.dispatchEvent(new PointerEvent('pointerdown', {
+      button: 1, buttons: 4, clientX: 300, clientY: 200, bubbles: true, cancelable: true,
+    }));
+    host.dispatchEvent(new PointerEvent('pointermove', {
+      button: -1, buttons: 4, clientX: 290, clientY: 150, bubbles: true,
+    }));
+    host.dispatchEvent(new PointerEvent('pointerup', {
+      button: 1, buttons: 0, clientX: 290, clientY: 150, bubbles: true, cancelable: true,
+    }));
+    expect(stagePosition(stage).left).toBeCloseTo(before.left - 10);
+    expect(stagePosition(stage).top).toBeCloseTo(before.top - 50);
+    expect(canvas.editingElementId()).toBe('text-1');
+  });
+
+  it('pans with Space held and the primary button, touching nothing on the slide', () => {
+    const { store, host, stage } = setupSizedViewport();
+    const before = stagePosition(stage);
+    const target = host.querySelector<HTMLElement>('[data-element-id="text-1"]')!;
+    const space = (type: 'keydown' | 'keyup', repeat = false) => {
+      const event = new KeyboardEvent(type, {
+        key: ' ', code: 'Space', repeat, bubbles: true, cancelable: true,
+      });
+      document.body.dispatchEvent(event);
+      return event;
+    };
+    expect(space('keydown').defaultPrevented).toBe(true);
+    space('keydown', true);
+    expect(host.classList.contains('space-pan')).toBe(true);
+
+    target.dispatchEvent(new PointerEvent('pointerdown', {
+      button: 0, buttons: 1, clientX: 300, clientY: 200, bubbles: true, cancelable: true,
+    }));
+    expect(host.classList.contains('is-panning')).toBe(true);
+    target.dispatchEvent(new PointerEvent('pointermove', {
+      button: -1, buttons: 1, clientX: 250, clientY: 260, bubbles: true,
+    }));
+    target.dispatchEvent(new PointerEvent('pointerup', {
+      button: 0, buttons: 0, clientX: 250, clientY: 260, bubbles: true, cancelable: true,
+    }));
+    space('keyup');
+    expect(host.classList.contains('space-pan')).toBe(false);
+    expect(host.classList.contains('is-panning')).toBe(false);
+    expect(stagePosition(stage).left).toBeCloseTo(before.left - 50);
+    expect(stagePosition(stage).top).toBeCloseTo(before.top + 60);
+    expect(store.get().selection.size).toBe(0);
+    const text = store.slide!.elements.find((element) => element.id === 'text-1')!;
+    expect([text.x, text.y]).toEqual([100, 100]);
+
+    // With Space let go, a press selects again. (jsdom lays nothing out, so
+    // the hit test reads client coordinates straight as stage coordinates:
+    // this point is on the text box.)
+    target.dispatchEvent(new PointerEvent('pointerdown', {
+      button: 0, buttons: 1, clientX: 200, clientY: 100, bubbles: true, cancelable: true,
+    }));
+    target.dispatchEvent(new PointerEvent('pointerup', {
+      button: 0, buttons: 0, clientX: 200, clientY: 100, bubbles: true, cancelable: true,
+    }));
+    expect([...store.get().selection]).toEqual(['text-1']);
+  });
+
+  it('leaves Space to the text being edited and to focused fields', () => {
+    const { canvas, host } = setupSizedViewport();
+    canvas.beginTextEdit('text-1');
+    const body = bodyOf(host, 'text-1');
+    body.dispatchEvent(new KeyboardEvent('keydown', {
+      key: ' ', code: 'Space', bubbles: true, cancelable: true,
+    }));
+    expect(host.classList.contains('space-pan')).toBe(false);
+    canvas.endTextEditing(true);
+
+    const field = document.createElement('input');
+    document.body.append(field);
+    const inField = new KeyboardEvent('keydown', {
+      key: ' ', code: 'Space', bubbles: true, cancelable: true,
+    });
+    field.dispatchEvent(inField);
+    expect(inField.defaultPrevented).toBe(false);
+    expect(host.classList.contains('space-pan')).toBe(false);
+  });
+
+  it('zooms with Cmd/Ctrl = + - and fits with Cmd/Ctrl 0, in place of page zoom', () => {
+    const { canvas, host, stage } = setupViewport();
+    const store = new EditorStore(emptyDeck('Keys'), '/tmp/keys');
+    bindEditorKeys({ ...shellDeps(store), canvas }, noopClipboard());
+    const fitted = stagePosition(stage);
+    const press = (key: string, init: KeyboardEventInit = {}) => {
+      const event = new KeyboardEvent('keydown', {
+        key, ctrlKey: true, bubbles: true, cancelable: true, ...init,
+      });
+      document.body.dispatchEvent(event);
+      expect(event.defaultPrevented, key).toBe(true);
+    };
+    press('=');
+    expect(canvas.zoomPercent()).toBe(125);
+    press('+', { shiftKey: true });
+    expect(canvas.zoomPercent()).toBe(150);
+    press('-');
+    expect(canvas.zoomPercent()).toBe(125);
+    press('-', { ctrlKey: false, metaKey: true });
+    expect(canvas.zoomPercent()).toBe(100);
+    // Off the bar's 25% grid (after a wheel notch), a step lands back on it.
+    wheel(host, { deltaY: -100, ctrlKey: true });
+    expect(canvas.zoomPercent()).toBe(110);
+    press('=');
+    expect(canvas.zoomPercent()).toBe(125);
+    wheel(host, { deltaY: 100, clientX: 900, clientY: 100, ctrlKey: true });
+    press('0');
+    expect(canvas.zoomPercent()).toBe(100);
+    expect(stagePosition(stage).left).toBeCloseTo(fitted.left);
+    expect(stagePosition(stage).top).toBeCloseTo(fitted.top);
+  });
+
+  it('zooms with the unshifted keys while editing text, and keeps Shift for superscript', () => {
+    const { store, canvas, host } = setupSizedViewport();
+    bindEditorKeys({ ...shellDeps(store), canvas }, noopClipboard());
+    canvas.beginTextEdit('text-1');
+    const body = bodyOf(host, 'text-1');
+    const html = body.innerHTML;
+    const zoomIn = new KeyboardEvent('keydown', {
+      key: '=', ctrlKey: true, bubbles: true, cancelable: true,
+    });
+    body.dispatchEvent(zoomIn);
+    expect(zoomIn.defaultPrevented).toBe(true);
+    expect(canvas.zoomPercent()).toBe(125);
+    expect(canvas.editingElementId()).toBe('text-1');
+    expect(body.innerHTML).toBe(html);
+
+    const superscript = new KeyboardEvent('keydown', {
+      key: '+', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true,
+    });
+    body.dispatchEvent(superscript);
+    expect(superscript.defaultPrevented).toBe(true);
+    expect(canvas.zoomPercent()).toBe(125);
+  });
+});
+
 describe('inline text editing', () => {
   beforeEach(() => {
     document.body.replaceChildren();
@@ -336,6 +610,135 @@ describe('inline text editing', () => {
     const saved = store.slide!.elements.find((element) => element.id === 'text-1')!;
     expect(saved.type === 'text' && saved.html).toBe('<p>$$E=mc^2$$</p>');
     expect(bodyOf(host, 'text-1').querySelector('.katex-display')).not.toBeNull();
+  });
+
+  it('does not store the fitted size a join copies onto text in an auto-fit box', () => {
+    // Found by the list fuzz's short auto-fit box: Backspace at the start of a
+    // paragraph, and Chromium wraps the joined text in the box's fitted size.
+    const { store, canvas, host } = setup();
+    store.select(['text-1']);
+    store.updateSelected((el) => {
+      if (el.type === 'text') {
+        el.html = '<p>gamma</p><p>delta</p>';
+        el.autoFit = true;
+      }
+    });
+    canvas.beginTextEdit('text-1');
+    const body = bodyOf(host, 'text-1');
+    // What a fit leaves on the box, then what Chromium's join leaves in it.
+    body.style.fontSize = '13.8px';
+    body.dataset.fittedFontSize = '13.8';
+    body.innerHTML = '<p>gamma<span style="font-size: 13.8px;">delta</span>'
+      + '<span style="font-size: 20px;">authored</span></p>';
+    body.dispatchEvent(new InputEvent('input', { inputType: 'deleteContentBackward', bubbles: true }));
+    body.dispatchEvent(new FocusEvent('blur'));
+
+    const saved = store.slide!.elements.find((element) => element.id === 'text-1')!;
+    expect(saved.type === 'text' && saved.html)
+      .toBe('<p>gammadelta<span style="font-size: 20px;">authored</span></p>');
+  });
+
+  it('does not store the fitted size a join copies when typing replaces a selection into a sub-item', () => {
+    // Found by the nightly list fuzz (seed 2026103001): typing over a
+    // selection from an item into its own sub-item is an insertText that
+    // Chromium carries out, and its join wraps the moved text in the box's
+    // fitted size just as Backspace does.
+    const { store, canvas, host } = setup();
+    store.select(['text-1']);
+    store.updateSelected((el) => {
+      if (el.type === 'text') {
+        el.html = '<ul><li>gamma<ul><li>delta</li></ul></li></ul>';
+        el.autoFit = true;
+      }
+    });
+    canvas.beginTextEdit('text-1');
+    const body = bodyOf(host, 'text-1');
+    body.style.fontSize = '13.8px';
+    body.dataset.fittedFontSize = '13.8';
+    const [outer, inner] = [...body.querySelectorAll('li')].map((item) => item.firstChild!);
+    const range = document.createRange();
+    range.setStart(outer, 2);
+    range.setEnd(inner, 2);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    const typing = new InputEvent('beforeinput', { inputType: 'insertText', data: 'x', bubbles: true, cancelable: true });
+    body.dispatchEvent(typing);
+    // The editor leaves this join to Chromium; what Chromium's join leaves.
+    expect(typing.defaultPrevented).toBe(false);
+    body.innerHTML = '<ul><li>gax<span style="font-size: 13.8px;">lta</span></li></ul>';
+    body.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: 'x', bubbles: true }));
+    body.dispatchEvent(new FocusEvent('blur'));
+
+    const saved = store.slide!.elements.find((element) => element.id === 'text-1')!;
+    expect(saved.type === 'text' && saved.html).toBe('<ul><li>gaxlta</li></ul>');
+  });
+
+  it('does not store the fitted size a cut carried to the clipboard', () => {
+    // Found by the list fuzz's short auto-fit box: text cut while the box was
+    // fitted to 13.2px reached the clipboard wearing 13.2px, and pasted back
+    // after the box refitted to 14.6px it stayed at 13.2px.
+    const { store, canvas, host } = setup();
+    store.select(['text-1']);
+    store.updateSelected((el) => {
+      if (el.type === 'text') {
+        el.html = '<p>alpha</p><p>beta</p>';
+        el.autoFit = true;
+      }
+    });
+    canvas.beginTextEdit('text-1');
+    const body = bodyOf(host, 'text-1');
+    body.style.fontSize = '13.2px';
+    body.dataset.fittedFontSize = '13.2';
+    const range = document.createRange();
+    range.selectNodeContents(body.querySelector('p')!);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    body.dispatchEvent(new Event('cut', { bubbles: true }));
+
+    // The box refits; then the paste lands what Chromium serialized.
+    body.style.fontSize = '14.6px';
+    body.dataset.fittedFontSize = '14.6';
+    const paste = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, 'clipboardData', {
+      value: { getData: (type: string) => (type === 'text/plain' ? 'alpha' : '<p style="font-size: 13.2px;">alpha</p>') },
+    });
+    body.dispatchEvent(paste);
+    body.innerHTML = '<p>beta</p><p style="font-size: 13.2px;">alpha</p>';
+    body.dispatchEvent(new InputEvent('input', { inputType: 'insertFromPaste', bubbles: true }));
+    // A later paste of other text keeps whatever size it brings.
+    const other = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(other, 'clipboardData', {
+      value: { getData: (type: string) => (type === 'text/plain' ? 'gamma' : '') },
+    });
+    body.dispatchEvent(other);
+    body.innerHTML += '<p><span style="font-size: 13.2px;">gamma</span></p>';
+    body.dispatchEvent(new InputEvent('input', { inputType: 'insertFromPaste', bubbles: true }));
+    body.dispatchEvent(new FocusEvent('blur'));
+
+    const saved = store.slide!.elements.find((element) => element.id === 'text-1')!;
+    expect(saved.type === 'text' && saved.html)
+      .toBe('<p>beta</p><p>alpha</p><p><span style="font-size: 13.2px;">gamma</span></p>');
+  });
+
+  it('never stores data: media in a text element, whatever put it in the DOM', () => {
+    // The backstop under every input path (paste, drop, execCommand): a
+    // 10 MB data: video pasted into a title once made deck.json 13.5 MB.
+    const { store, canvas, host } = setup();
+    store.select(['text-1']);
+    canvas.beginTextEdit('text-1');
+    const body = bodyOf(host, 'text-1');
+    const video = `data:video/mp4;base64,${'A'.repeat(200_000)}`;
+    body.innerHTML = `<p>Title<img src="${video}"><video src="${video}"></video></p>`;
+    // Not a paste: no paste repair runs, only the commit.
+    body.dispatchEvent(new InputEvent('input', { inputType: 'insertHTML', bubbles: true }));
+    body.dispatchEvent(new FocusEvent('blur'));
+
+    const saved = store.slide!.elements.find((element) => element.id === 'text-1')!;
+    expect(saved.type).toBe('text');
+    if (saved.type !== 'text') return;
+    expect(saved.html).not.toContain('data:');
+    expect(saved.html.length).toBeLessThan(1_000);
+    expect(saved.html).toContain('Title');
   });
 
   it('heals generated KaTeX already persisted by an old paste on edit entry', () => {
@@ -705,7 +1108,7 @@ describe('inline text editing', () => {
     expect((saved as { html: string }).html).toBe(body.innerHTML);
   });
 
-  it('selects table rows and columns, colours cells, and edits columns', () => {
+  it('selects table rows and columns, colours cells, and edits columns and rows', () => {
     const { store, canvas, host } = setup();
     store.select(['text-1']);
     store.updateSelected((element) => {
@@ -732,6 +1135,15 @@ describe('inline text editing', () => {
     expect(canvas.tableSelectionInfo()?.columns).toBe(3);
     canvas.deleteTableColumn();
     expect(canvas.tableSelectionInfo()?.columns).toBe(2);
+
+    canvas.insertTableRow(true);
+    expect(canvas.tableSelectionInfo()).toMatchObject({ row: 1, rows: 3 });
+    canvas.insertTableRow(false);
+    expect(canvas.tableSelectionInfo()).toMatchObject({ row: 1, rows: 4 });
+    canvas.deleteTableRow();
+    expect(canvas.tableSelectionInfo()?.rows).toBe(3);
+    html = (store.slide!.elements.find((element) => element.id === 'text-1') as { html: string }).html;
+    expect(html.match(/<tr/g)).toHaveLength(3);
   });
 
   it('never stores the editor-only table selection highlight', () => {
@@ -844,7 +1256,7 @@ describe('inline text editing', () => {
     expect(inspectorHost.querySelector('.insp-title')?.textContent).toBe('text');
     expect([...inspectorHost.querySelectorAll('.insp-type-sections .insp-subtitle')]
       .map((heading) => heading.textContent))
-      .toEqual(['Typography', 'Paragraph']);
+      .toEqual(['Typography', 'Paragraph', 'Box', 'Text shadow']);
     expect(headings).not.toContain('Style');
     expect(inspectorHost.textContent).not.toContain('CSS classes');
     expect(inspectorHost.textContent).not.toContain('Inline style');
@@ -1614,6 +2026,69 @@ describe('inline text editing', () => {
     expect(canvas.isPlaying('video-1')).toBe(true);
   });
 
+  it('plays the video on a pointer double-click without a native dblclick (Safari)', () => {
+    const { canvas, host } = setup();
+    const stage = host.querySelector<HTMLElement>('.stage')!;
+    stage.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 1920, height: 1080 }) as DOMRect;
+    const press = () => {
+      const at = { clientX: 300, clientY: 400, bubbles: true, button: 0, pointerId: 1 };
+      host.dispatchEvent(new PointerEvent('pointerdown', at));
+      host.dispatchEvent(new PointerEvent('pointerup', at));
+    };
+
+    press();
+    expect(canvas.isPlaying('video-1')).toBe(false);
+    press();
+    expect(canvas.isPlaying('video-1')).toBe(true);
+
+    // Chromium also dispatches dblclick for the same pair; it must not pause.
+    host.dispatchEvent(
+      new MouseEvent('dblclick', { clientX: 300, clientY: 400, bubbles: true }),
+    );
+    expect(canvas.isPlaying('video-1')).toBe(true);
+  });
+
+  it('crops a picture when it is double-clicked, and leaves the crop on the next', () => {
+    const { store, canvas, host } = setup();
+    store.commit((deck) => deck.slides[0].elements.push(imageElement()));
+    const stage = host.querySelector<HTMLElement>('.stage')!;
+    stage.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 1920, height: 1080 }) as DOMRect;
+    const dblclick = () => host.dispatchEvent(
+      new MouseEvent('dblclick', { clientX: 1300, clientY: 400, bubbles: true }),
+    );
+
+    dblclick();
+    expect(canvas.maskingElement()).toBe('image-1');
+    expect([...store.get().selection]).toEqual(['image-1']);
+    dblclick();
+    expect(canvas.maskingElement()).toBeNull();
+  });
+
+  it('crops a picture on a pointer double-click without a native dblclick (Safari)', () => {
+    const { store, canvas, host } = setup();
+    store.commit((deck) => deck.slides[0].elements.push(imageElement()));
+    const stage = host.querySelector<HTMLElement>('.stage')!;
+    stage.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 1920, height: 1080 }) as DOMRect;
+    const press = () => {
+      const at = { clientX: 1300, clientY: 400, bubbles: true, button: 0, pointerId: 1 };
+      host.dispatchEvent(new PointerEvent('pointerdown', at));
+      host.dispatchEvent(new PointerEvent('pointerup', at));
+    };
+
+    press();
+    expect(canvas.maskingElement()).toBeNull();
+    press();
+    expect(canvas.maskingElement()).toBe('image-1');
+    // Chromium also dispatches dblclick for the same pair; it must not leave.
+    host.dispatchEvent(
+      new MouseEvent('dblclick', { clientX: 1300, clientY: 400, bubbles: true }),
+    );
+    expect(canvas.maskingElement()).toBe('image-1');
+  });
+
   it('marks videos with a small editor-only corner badge', () => {
     const { host } = setup();
     const video = host.querySelector<HTMLElement>('[data-element-id="video-1"]')!;
@@ -2301,8 +2776,8 @@ describe('native line endpoint editing', () => {
     const inspectorHost = document.createElement('aside');
     document.body.appendChild(inspectorHost);
     new Inspector(inspectorHost, store);
-    const arrowStyle = [...inspectorHost.querySelectorAll<HTMLElement>('.insp-group')]
-      .find((section) => section.querySelector('h4')?.textContent === 'Arrow style')!;
+    const arrowStyle = [...inspectorHost.querySelectorAll<HTMLElement>('.insp-option-section')]
+      .find((section) => section.querySelector('h4')?.textContent === 'Stroke')!;
     const widthField = [...arrowStyle.querySelectorAll<HTMLLabelElement>('label')]
       .find((label) => label.querySelector('span')?.textContent === 'WIDTH')!;
     const width = widthField.querySelector<HTMLInputElement>('input')!;
@@ -2395,18 +2870,21 @@ describe('same-kind multi-selection properties', () => {
     expect(optionSections.map((section) => section.querySelector('h4')?.textContent))
       .toEqual([
         'Playback',
+        'Compare',
         'Mask',
         'Border',
         'Effects',
       ]);
     expect(optionSections[0].querySelectorAll('.video-checkbox-grid > .field-check')).toHaveLength(4);
+    // Exactly two clips selected can be stacked as a before/after wipe.
+    expect(optionSections[1].textContent).toContain('Arrange as wipe');
     // Keep-aspect-ratio clips like the mask does, so it lives in that section.
-    expect(optionSections[1].textContent).toContain('Keep aspect ratio');
-    expect(optionSections[1].textContent).toContain('Corner radius');
-    expect(optionSections[1].textContent).toContain('Circular mask');
-    expect(optionSections[2].textContent).toContain('Color');
-    expect(optionSections[2].textContent).toContain('Width');
-    expect(optionSections[2].textContent).not.toContain('Corner radius');
+    expect(optionSections[2].textContent).toContain('Keep aspect ratio');
+    expect(optionSections[2].textContent).toContain('Corner radius');
+    expect(optionSections[2].textContent).toContain('Circular mask');
+    expect(optionSections[3].textContent).toContain('Color');
+    expect(optionSections[3].textContent).toContain('Width');
+    expect(optionSections[3].textContent).not.toContain('Corner radius');
     const autoplay = [...videoGroup.querySelectorAll<HTMLLabelElement>('label')]
       .find((label) => label.querySelector('span')?.textContent === 'Autoplay')!
       .querySelector<HTMLInputElement>('input')!;
@@ -2417,6 +2895,96 @@ describe('same-kind multi-selection properties', () => {
       .toEqual([true, true]);
     expect(videoGroup.textContent).not.toContain('Edit mask');
     expect(videoGroup.textContent).not.toContain('Trim');
+  });
+});
+
+describe('curly braces', () => {
+  beforeEach(() => document.body.replaceChildren());
+
+  function stageAtOne(host: HTMLElement): void {
+    host.querySelector<HTMLElement>('.stage')!.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 1920, height: 1080 }) as DOMRect;
+  }
+
+  function pointer(target: EventTarget, type: string, x: number, y: number): void {
+    target.dispatchEvent(new PointerEvent(type, {
+      clientX: x, clientY: y, bubbles: true, pointerId: 1, button: 0,
+    }));
+  }
+
+  const current = (store: ReturnType<typeof setup>['store'], id: string) =>
+    store.slide!.elements.find((el) => el.id === id) as Extract<SlideElement, { type: 'shape' }>;
+
+  it('is offered by the Shape menu and inserted with two endpoints and a point handle', () => {
+    const { store, host } = setup();
+    const picker = createShapeInsertPicker(store);
+    document.body.appendChild(picker);
+    picker.querySelector<HTMLButtonElement>('.shape-menu-trigger')!.click();
+    const item = [...picker.querySelectorAll<HTMLButtonElement>('.shape-menu-item')]
+      .find((button) => button.textContent === 'Curly brace')!;
+    item.click();
+    const brace = store.selectedElements()[0];
+    expect(brace).toMatchObject({ type: 'shape', shape: 'brace', braceDepth: DEFAULT_BRACE_DEPTH });
+    expect(host.querySelectorAll('.handle-endpoint')).toHaveLength(2);
+    const tip = host.querySelector<HTMLElement>('.handle-brace-tip')!;
+    const expected = braceTip(brace as Extract<SlideElement, { type: 'shape' }>);
+    expect(Number.parseFloat(tip.style.left) + brace.x).toBeCloseTo(expected.x, 1);
+    expect(Number.parseFloat(tip.style.top) + brace.y).toBeCloseTo(expected.y, 1);
+    expect(host.querySelector(`[data-element-id="${brace.id}"] svg > path`)!.getAttribute('d'))
+      .toContain(' A ');
+  });
+
+  it('sets depth and radius from the point handle, and flips across the chord', () => {
+    const { store, host } = setup();
+    stageAtOne(host);
+    const brace = insertLine(store, 'brace');
+    const tip = braceTip(brace);
+    const handle = host.querySelector<HTMLElement>('.handle-brace-tip')!;
+    pointer(handle, 'pointerdown', tip.x, tip.y);
+    // Off the bisector: only the component along the normal counts.
+    pointer(host, 'pointermove', tip.x + 90, tip.y + 50);
+    expect(current(store, brace.id).braceDepth).toBe(DEFAULT_BRACE_DEPTH + 50);
+    expect(host.querySelector(`[data-element-id="${brace.id}"] svg > path`)!.getAttribute('d'))
+      .toContain(`A ${(DEFAULT_BRACE_DEPTH + 50) / 2} `);
+    // Dragged to the other side of the chord, the brace points the other way.
+    pointer(host, 'pointermove', tip.x, brace.y + brace.h / 2 - 30);
+    pointer(host, 'pointerup', tip.x, brace.y + brace.h / 2 - 30);
+    expect(current(store, brace.id).braceDepth).toBe(-30);
+    // One gesture, one undo entry.
+    store.undo();
+    expect(current(store, brace.id).braceDepth).toBe(DEFAULT_BRACE_DEPTH);
+  });
+
+  it('drags an endpoint with snapping, and the point follows the new midpoint', () => {
+    const { store, host } = setup();
+    stageAtOne(host);
+    const brace = insertLine(store, 'brace');
+    const handle = host.querySelector<HTMLElement>('.handle-endpoint[data-endpoint="end"]')!;
+    const { end } = lineEndpoints(brace);
+    pointer(handle, 'pointerdown', end.x, end.y);
+    // The video's right edge is x=740; 4px past it snaps onto it.
+    pointer(host, 'pointermove', 744, 900);
+    expect(host.querySelectorAll('.guide-x')).toHaveLength(1);
+    pointer(host, 'pointerup', 744, 900);
+    const changed = current(store, brace.id);
+    // Within the rounding a rotated line's integer box allows.
+    expect(Math.abs(lineEndpoints(changed).end.x - 740)).toBeLessThan(1);
+    expect(changed.braceDepth).toBe(DEFAULT_BRACE_DEPTH);
+    const { start, end: moved } = lineEndpoints(changed);
+    const tip = braceTip(changed);
+    expect(Math.hypot(tip.x - start.x, tip.y - start.y))
+      .toBeCloseTo(Math.hypot(tip.x - moved.x, tip.y - moved.y), 6);
+    const drawn = host.querySelector<HTMLElement>('.handle-brace-tip')!;
+    expect(Number.parseFloat(drawn.style.left) + changed.x).toBeCloseTo(tip.x, 1);
+  });
+
+  it('is hit along its drawn curve, not across its whole span', () => {
+    const { store } = setup();
+    const brace = insertLine(store, 'brace');
+    const tip = braceTip(brace);
+    expect(elementContainsPoint(brace, tip, 2)).toBe(true);
+    // Halfway between the chord and the point, beside the point: empty space.
+    expect(elementContainsPoint(brace, { x: tip.x - 120, y: tip.y }, 2)).toBe(false);
   });
 });
 
@@ -2441,7 +3009,7 @@ describe('quadratic curved arrows', () => {
       `[data-element-id="${arrow.id}"] svg > path`,
     )!;
     expect(path.getAttribute('d')).toContain(' Q ');
-    expect(path.getAttribute('marker-end')).toContain('arrowhead-');
+    expect(host.querySelectorAll(`[data-element-id="${arrow.id}"] svg > path.arrowhead`)).toHaveLength(1);
     expect(host.querySelector('.handle-curve-control')).not.toBeNull();
   });
 
@@ -2583,7 +3151,7 @@ describe('object creation and manipulation', () => {
     trigger.focus();
     trigger.click();
     const item = [...wrap.querySelectorAll<HTMLButtonElement>('.shape-menu-item')].find(
-      (el) => el.textContent === 'Curved arrow',
+      (el) => el.textContent === 'Arrow',
     )!;
     item.click();
 
@@ -2592,7 +3160,7 @@ describe('object creation and manipulation', () => {
     const [id] = [...store.get().selection];
     expect(store.slide!.elements.find((el) => el.id === id)).toMatchObject({
       shape: 'arrow',
-      control: expect.any(Object),
+      arrowEnd: true,
     });
     store.deleteSelection();
     expect(store.slide!.elements.some((el) => el.id === id)).toBe(false);
@@ -2605,8 +3173,36 @@ describe('object creation and manipulation', () => {
     expect(text.html).toBe('New text');
     expect(text.class).toContain('placeholder');
     expect([...store.get().selection]).toEqual([text.id]);
-    // A new box fits its text rather than spilling out of itself.
-    expect(text.autoFit).toBe(true);
+    // A toolbar box is a label: it hugs its text instead of being a column.
+    expect(text.autoSize).toBe(true);
+    expect(text.autoFit).toBeUndefined();
+    // Centred, so a label grows evenly about where it was put.
+    expect(text.align).toBe('center');
+  });
+
+  it('turns a sized-to-text box into an ordinary one when a handle resizes it', () => {
+    const { store, host } = setupRow();
+    store.commit((deck) => {
+      const c = deck.slides[0].elements.find((el) => el.id === 'c')!;
+      if (c.type === 'text') c.autoSize = true;
+    });
+    store.select(['c']);
+    const handle = host.querySelector<HTMLElement>('.handle-e[data-element-id="c"]')!;
+    handle.dispatchEvent(new PointerEvent('pointerdown', {
+      clientX: 900, clientY: 550, bubbles: true, pointerId: 1, button: 0,
+    }));
+    host.dispatchEvent(new PointerEvent('pointermove', {
+      clientX: 1000, clientY: 550, bubbles: true, pointerId: 1, button: 0,
+    }));
+    host.dispatchEvent(new PointerEvent('pointerup', {
+      clientX: 1000, clientY: 550, bubbles: true, pointerId: 1, button: 0,
+    }));
+    const c = store.slide!.elements.find((el) => el.id === 'c')!;
+    expect(c.w).toBe(200);
+    expect(c.type === 'text' && c.autoSize).toBeFalsy();
+    store.undo();
+    const restored = store.slide!.elements.find((el) => el.id === 'c')!;
+    expect(restored.type === 'text' && restored.autoSize).toBe(true);
   });
 
   it('inserts a native table and chooses its size from the toolbar grid', () => {
@@ -3549,6 +4145,36 @@ describe('spacing and sizing guides', () => {
   });
 });
 
+describe('moves while a press is held', () => {
+  beforeEach(() => document.body.replaceChildren());
+
+  /** A pointermove as a mouse reports it: jsdom's shim has no pointerType. */
+  const mouseMove = (x: number, y: number, buttons: number) => {
+    const event = new PointerEvent('pointermove', {
+      clientX: x, clientY: y, bubbles: true, pointerId: 1, button: -1, buttons,
+    });
+    Object.defineProperty(event, 'pointerType', { value: 'mouse' });
+    return event;
+  };
+
+  it('does not drag the pressed object on a hover that reports no button held', () => {
+    const { store, host } = setupRow();
+    host.dispatchEvent(new PointerEvent('pointerdown', {
+      clientX: 850, clientY: 550, bubbles: true, pointerId: 1, button: 0, buttons: 1,
+    }));
+    // The window system's move for a pointer that is not pressing, far away.
+    host.dispatchEvent(mouseMove(1300, 900, 0));
+    expect(store.slide!.elements.find((el) => el.id === 'c')).toMatchObject({ x: 800, y: 500 });
+
+    // The same move with the button held is a drag (soundness control).
+    host.dispatchEvent(mouseMove(1300, 900, 1));
+    expect(store.slide!.elements.find((el) => el.id === 'c')!.x).toBeGreaterThan(800);
+    host.dispatchEvent(new PointerEvent('pointerup', {
+      clientX: 1300, clientY: 900, bubbles: true, pointerId: 1, button: 0,
+    }));
+  });
+});
+
 describe('pointer-ups on chrome laid over the canvas', () => {
   it('does not end a transaction another control owns', () => {
     const { store, host } = setup();
@@ -3574,5 +4200,154 @@ describe('pointer-ups on chrome laid over the canvas', () => {
     store.beginTransaction('Move or resize objects');
     host.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, button: 0 }));
     expect(store.isTransactionActive()).toBe(false);
+  });
+});
+
+describe('resizing pictures and videos', () => {
+  beforeEach(() => document.body.replaceChildren());
+
+  /** Drag `id`'s south-east handle by (dx, dy) on a 1:1 stage. */
+  function dragCorner(id: string, dx: number, dy: number, shiftKey = false) {
+    const { store, host } = setup();
+    store.commit((deck) => {
+      deck.slides[0].elements.push(imageElement());
+      // A cropped video: free to resize before, which surprised people.
+      const video = deck.slides[0].elements.find((e) => e.id === 'video-1');
+      if (video?.type === 'video') video.sourceBox = { x: -20, y: -10, w: 680, h: 380 };
+    });
+    host.querySelector<HTMLElement>('.stage')!.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 1920, height: 1080 }) as DOMRect;
+    store.select([id]);
+    const el = store.slide!.elements.find((e) => e.id === id)!;
+    const start = { x: el.x + el.w, y: el.y + el.h };
+    const handle = host.querySelector<HTMLElement>(`.handle-se[data-element-id="${id}"]`)!;
+    const event = (type: string, x: number, y: number) => new PointerEvent(type, {
+      clientX: x, clientY: y, bubbles: true, pointerId: 1, button: 0, shiftKey,
+    });
+    handle.dispatchEvent(event('pointerdown', start.x, start.y));
+    host.dispatchEvent(event('pointermove', start.x + dx, start.y + dy));
+    host.dispatchEvent(event('pointerup', start.x + dx, start.y + dy));
+    return store.slide!.elements.find((e) => e.id === id)!;
+  }
+
+  it('keeps a video in proportion by default, even a cropped one, and frees it with Shift', () => {
+    expect(dragCorner('video-1', 160, 20)).toMatchObject({ w: 800, h: 450 });
+    expect(dragCorner('video-1', 160, 20, true)).toMatchObject({ w: 800, h: 380 });
+  });
+
+  it('keeps a picture in proportion by default and frees it with Shift', () => {
+    expect(dragCorner('image-1', 200, 10)).toMatchObject({ w: 600, h: 450 });
+    expect(dragCorner('image-1', 200, 10, true)).toMatchObject({ w: 600, h: 310 });
+  });
+
+  it('keeps the pointer on the box\'s edge wherever a corner is dragged', () => {
+    // The picture is 400x300 with its south-east corner at (1600, 600), so
+    // the anchor is (1200, 300). Snapping may pull the box off the pointer by
+    // up to its 6px reach (plus a pixel of rounding), never more.
+    const reach = 7;
+    const offsets = [-500, -380, -260, -140, -20, 100, 220, 340];
+    for (const dx of offsets) {
+      for (const dy of offsets) {
+        const px = 1600 + dx;
+        const py = 600 + dy;
+        const box = dragCorner('image-1', dx, dy);
+        const where = `pointer (${px}, ${py}) -> ${JSON.stringify({ x: box.x, y: box.y, w: box.w, h: box.h })}`;
+        expect([box.x, box.y], where).toEqual([1200, 300]);
+        if (px <= 1200 || py <= 300) {
+          // Past the anchor on either axis: as small as it goes, in proportion.
+          expect([box.w, box.h], where).toEqual([11, 8]);
+          continue;
+        }
+        const right = box.x + box.w;
+        const bottom = box.y + box.h;
+        expect(px, where).toBeLessThanOrEqual(right + reach);
+        expect(py, where).toBeLessThanOrEqual(bottom + reach);
+        expect(Math.min(Math.abs(right - px), Math.abs(bottom - py)), where).toBeLessThanOrEqual(reach);
+        expect(box.w / box.h, where).toBeCloseTo(4 / 3, 1);
+        // Freed with Shift, the corner is under the pointer, or at the minimum.
+        const free = dragCorner('image-1', dx, dy, true);
+        expect(Math.abs(free.x + free.w - Math.max(px, 1208)), where).toBeLessThanOrEqual(reach);
+        expect(Math.abs(free.y + free.h - Math.max(py, 308)), where).toBeLessThanOrEqual(reach);
+      }
+    }
+  });
+
+  it('still resizes a text box freely, with Shift to keep its proportions', () => {
+    expect(dragCorner('text-1', 200, 60)).toMatchObject({ w: 800, h: 180 });
+    // 60 of 120 is more of the height than 200 of 600 is of the width, so
+    // the height leads and the box reaches the pointer.
+    expect(dragCorner('text-1', 200, 60, true)).toMatchObject({ w: 900, h: 180 });
+  });
+});
+
+describe('stacking order keys', () => {
+  beforeEach(() => document.body.replaceChildren());
+
+  const press = (code: 'BracketLeft' | 'BracketRight', shiftKey = false) => document.body.dispatchEvent(
+    new KeyboardEvent('keydown', {
+      code, key: code === 'BracketLeft' ? (shiftKey ? '{' : '[') : (shiftKey ? '}' : ']'),
+      shiftKey, bubbles: true, cancelable: true,
+    }),
+  );
+  /** Ids bottom to top. */
+  const stack = (store: ReturnType<typeof setup>['store']) => [...store.slide!.elements]
+    .sort((a, b) => a.z - b.z).map((e) => e.id);
+
+  it('steps with [ and ], goes to the back and front with Shift, each one undo step', () => {
+    const { store } = setup();
+    store.commit((deck) => deck.slides[0].elements.push(imageElement()));
+    bindEditorKeys(shellDeps(store), noopClipboard());
+    expect(stack(store)).toEqual(['text-1', 'video-1', 'image-1']);
+    store.select(['text-1']);
+
+    press('BracketRight');
+    expect(stack(store)).toEqual(['video-1', 'text-1', 'image-1']);
+    expect(store.history()[0]?.label).toBe('Bring forward');
+    press('BracketRight', true);
+    expect(stack(store)).toEqual(['video-1', 'image-1', 'text-1']);
+    press('BracketLeft');
+    expect(stack(store)).toEqual(['video-1', 'text-1', 'image-1']);
+    press('BracketLeft', true);
+    expect(stack(store)).toEqual(['text-1', 'video-1', 'image-1']);
+    store.undo();
+    expect(stack(store)).toEqual(['video-1', 'text-1', 'image-1']);
+  });
+
+  it('leaves brackets alone while typing into a field', () => {
+    const { store } = setup();
+    bindEditorKeys(shellDeps(store), noopClipboard());
+    store.select(['text-1']);
+    const input = document.createElement('input');
+    document.body.appendChild(input);
+    input.dispatchEvent(new KeyboardEvent('keydown', { code: 'BracketRight', key: ']', bubbles: true, cancelable: true }));
+    expect(stack(store)).toEqual(['text-1', 'video-1']);
+  });
+});
+
+describe('shape fill style', () => {
+  beforeEach(() => document.body.replaceChildren());
+
+  it('offers None, which clears the fill, and Solid brings back a theme colour', () => {
+    const { store } = setup();
+    const shape = insertShape(store, 'rect');
+    const panel = document.createElement('div');
+    document.body.appendChild(panel);
+    new Inspector(panel, store).render();
+    const style = () => [...panel.querySelectorAll<HTMLLabelElement>('label.field')]
+      .find((field) => field.querySelector('span')?.textContent === 'Fill style')!
+      .querySelector('select')!;
+    const current = () => store.slide!.elements.find((e) => e.id === shape.id) as Extract<SlideElement, { type: 'shape' }>;
+    expect([...style().options].map((o) => o.value)).toEqual(['None', 'Solid', 'Linear gradient', 'Radial gradient']);
+    expect(style().value).toBe('Solid');
+
+    style().value = 'None';
+    style().dispatchEvent(new Event('change'));
+    expect(current().fill).toBeNull();
+    expect(current().fillGradient ?? null).toBeNull();
+    expect(style().value).toBe('None');
+
+    style().value = 'Solid';
+    style().dispatchEvent(new Event('change'));
+    expect(current().fill).toBe(shape.fill);
   });
 });

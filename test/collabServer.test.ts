@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import WebSocket from 'ws';
@@ -8,7 +7,7 @@ import { connect as connect_ } from 'node:net';
 import { emptyDeck, parseDeck, type Deck } from '../src/shared/deck.js';
 import { saveDeck } from '../src/main/deckStore.js';
 import { COLLAB_PROTOCOL_VERSION, ServerMessageSchema, type ClientMessage, type ServerMessage } from '../src/shared/collab.js';
-import { renditionPath } from '../src/server/streamingRenditions.js';
+import { contentKeyOfFile, renditionPath } from '../src/server/streamingRenditions.js';
 import { startCollabServer, type RunningCollabServer } from '../src/server/collabServer.js';
 
 const DECK_ID = 'demo';
@@ -116,6 +115,7 @@ describe('collab server', () => {
       Array<{ id: string; title: string; slides: number; editedAt: string | null; editors: number }>;
     expect(decks).toEqual([{
       id: DECK_ID, title: 'Collab', slides: 2, folder: '', editors: 0, editedAt: expect.any(String),
+      createdAt: expect.any(String),
     }]);
     expect(Number.isNaN(Date.parse(decks[0].editedAt!))).toBe(false);
   });
@@ -237,7 +237,7 @@ describe('collab server', () => {
     expect(txn.txnId).toBe('ghost');
   });
 
-  it('broadcasts a resync deck on genuine external writes but not on its own autosave', async () => {
+  it('merges a genuine external write in as a transaction, but not its own autosave', async () => {
     const a = await connect('A');
     a.client.send({
       kind: 'txn', txnId: 't1', baseSeq: 0, label: 'rename',
@@ -251,9 +251,14 @@ describe('collab server', () => {
 
     const external = parseDeck({ ...emptyDeck('External'), slides: [{ id: 'sX', name: 'X' }] });
     await saveDeck(deckDir, external);
-    const deckMsg = await a.client.nextOfKind('deck');
-    expect(deckMsg.reason).toBe('external-edit');
-    expect(deckMsg.deck.title).toBe('External');
+    // Not a whole deck that would drop what a client has not had confirmed:
+    // the difference, replayed like anybody's edit.
+    const merged = await a.client.nextOfKind('txn');
+    expect(merged.byClientId).toBe('disk');
+    expect(merged.ops).toContainEqual({ op: 'updateDeck', title: 'External' });
+    const live = await (await fetch(`http://127.0.0.1:${server.port}/api/deck?deck=${DECK_ID}`)).json() as { title: string; slides: Array<{ id: string }> };
+    expect(live.title).toBe('External');
+    expect(live.slides.map((slide) => slide.id)).toEqual(['sX']);
   });
 
   it('relays presence and cursor to other clients only, and peerLeft on disconnect', async () => {
@@ -380,7 +385,7 @@ describe('collab server', () => {
     expect(original.headers.get('content-length')).toBe(String(info.size));
     expect(original.headers.get('cache-control')).toBe('public, no-cache');
 
-    await writeFile(renditionPath(source, info.size, info.mtimeMs, cacheDir), 'RENDITION');
+    await writeFile(renditionPath(await contentKeyOfFile(source), cacheDir), 'RENDITION');
     const served = await fetch(`${base}/assets/huge.mp4`);
     expect(await served.text()).toBe('RENDITION');
     // A different variant of the same URL must not answer 304 to the ETag the
@@ -390,6 +395,60 @@ describe('collab server', () => {
       headers: { 'if-none-match': original.headers.get('etag')! },
     });
     expect(stale.status).toBe(200);
+  });
+
+  it('gives a picture one content-keyed URL, served immutable, and announces one an edit brings in', async () => {
+    // Presenting a hosted talk, Oct 2026: every photo the editor already had
+    // was served `no-cache`, so each reshow was a 304 that queued behind a
+    // clip's download. A picture now has a content key like a clip
+    // (docs/media-loading.md, "Pictures").
+    const cacheDir = join(rootDir, 'rendition-cache');
+    await mkdir(join(deckDir, 'assets'), { recursive: true });
+    const photo = join(deckDir, 'assets', 'photo-3.png');
+    const later = join(deckDir, 'assets', 'later.jpg');
+    await writeFile(photo, Buffer.from('not really a png, but bytes all the same'));
+    await writeFile(later, Buffer.from('a picture an edit brings in'));
+    const deck = parseDeck({
+      ...emptyDeck('Pictures'),
+      slides: [{
+        id: 's1', name: 'One', background: { color: null, image: 'assets/photo-3.png' },
+        elements: [{ id: 'p1', type: 'image', x: 0, y: 0, w: 100, h: 50, src: 'assets/photo-3.png' }],
+      }],
+    });
+    await saveDeck(deckDir, deck);
+    await server.close();
+    server = await startCollabServer({ rootDir, port: 0, host: '127.0.0.1', mediaRenditions: { cacheDir } });
+
+    const { client, welcome } = await connect('A');
+    const key = (await contentKeyOfFile(photo)).slice(0, 24);
+    expect(welcome.mediaVariants?.['assets/photo-3.png']).toBe(`o${key}`);
+
+    const url = `http://127.0.0.1:${server.port}/media/o${key}.png`;
+    const served = await fetch(url);
+    expect(served.status).toBe(200);
+    expect(served.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    expect(served.headers.get('content-type')).toBe('image/png');
+    expect(await served.text()).toBe('not really a png, but bytes all the same');
+    // A resumed download names the bytes it has: the rest only if they are still those.
+    const etag = served.headers.get('etag')!;
+    const resumed = await fetch(url, { headers: { range: 'bytes=4-', 'if-range': etag } });
+    expect(resumed.status).toBe(206);
+    expect(await resumed.text()).toBe('really a png, but bytes all the same');
+    const changed = await fetch(url, { headers: { range: 'bytes=4-', 'if-range': '"something-else"' } });
+    expect(changed.status).toBe(200);
+    expect(await changed.text()).toBe('not really a png, but bytes all the same');
+
+    // An edit that brings a picture in is preceded by its variant.
+    client.send({
+      kind: 'txn', txnId: 't1', baseSeq: 0, label: 'Add a picture',
+      ops: [{
+        op: 'insertElements', slideId: 's1',
+        elements: [{ ...deck.slides[0].elements[0], id: 'p2', src: 'assets/later.jpg' }] as never,
+      }],
+    });
+    const media = await client.nextOfKind('media');
+    expect(media.variants['assets/later.jpg']).toBe(`o${(await contentKeyOfFile(later)).slice(0, 24)}`);
+    await client.nextOfKind('txn');
   });
 
   it('serves the client bundle cacheably: hashed files immutable, shells revalidated', async () => {
@@ -489,6 +548,48 @@ describe('collab server', () => {
     expect(deck.slides.length).toBeGreaterThan(0);
   });
 
+  it('keeps every Keynote upload, failed ones too, out of sight of the listing', async () => {
+    await server.close();
+    server = await startCollabServer({
+      rootDir,
+      port: 0,
+      host: '127.0.0.1',
+      keepUploadsDays: 30,
+      keynoteImporter: async (keyFile, outDir) => {
+        if ((await readFile(keyFile, 'utf8')) === 'broken') throw new Error('No readable .iwa streams');
+        await saveDeck(outDir, parseDeck({ ...emptyDeck('Kept'), slides: [{ id: 's', name: 'S' }] }));
+        return { warnings: [] };
+      },
+    });
+    const base = `http://127.0.0.1:${server.port}`;
+    // A stale upload from long ago goes on the next import.
+    const stale = join(rootDir, '.uploads', '2020-01-01T00-00-00-000Z-old');
+    await mkdir(stale, { recursive: true });
+    await writeFile(join(stale, 'old.key'), 'old');
+    const old = new Date('2020-01-01');
+    await utimes(stale, old, old);
+
+    expect((await fetch(`${base}/api/import-keynote?name=Kept`, { method: 'POST', body: 'good' })).status).toBe(200);
+    expect((await fetch(`${base}/api/import-keynote?name=Broken`, { method: 'POST', body: 'broken' })).status).toBe(400);
+
+    const kept = await readdir(join(rootDir, '.uploads'));
+    expect(kept).toHaveLength(2);
+    const metas = await Promise.all(kept.map(async (entry) => ({
+      meta: JSON.parse(await readFile(join(rootDir, '.uploads', entry, 'upload.json'), 'utf8')),
+      files: await readdir(join(rootDir, '.uploads', entry)),
+    })));
+    expect(metas).toContainEqual({
+      meta: expect.objectContaining({ deck: 'Kept', file: 'Kept.key', bytes: 4, ok: true }),
+      files: expect.arrayContaining(['Kept.key', 'upload.json']),
+    });
+    expect(metas).toContainEqual({
+      meta: expect.objectContaining({ deck: 'Broken', ok: false, error: expect.stringContaining('.iwa') }),
+      files: expect.arrayContaining(['Broken.key']),
+    });
+    const decks = await (await fetch(`${base}/api/decks`)).json() as Array<{ id: string }>;
+    expect(decks.map((deck) => deck.id)).not.toContain(expect.stringContaining('uploads'));
+  });
+
   it('retires the direct HTTP agent authoring API in favor of the filesystem bridge', async () => {
     const base = `http://127.0.0.1:${server.port}`;
     for (const path of ['/api/brief', '/api/edit-schema', '/api/preview-html']) {
@@ -545,10 +646,6 @@ describe('collab server', () => {
 
   /* --- self-contained web export ----------------------------------------- */
 
-  // The exported player is a build artefact (`npm run build:export`), so the
-  // full download is gated on it; the guard rails around it are not.
-  const webExportBundle = existsSync(join(process.cwd(), 'out', 'export', 'player.js'));
-
   const exportUrl = (query: string) =>
     `http://127.0.0.1:${server.port}/api/export/web?${query}`;
 
@@ -568,13 +665,13 @@ describe('collab server', () => {
     expect((await fetch(exportUrl('probe=1'))).status).toBe(400);
   });
 
-  it.skipIf(!webExportBundle)('answers the probe before any bytes move', async () => {
+  it('answers the probe before any bytes move', async () => {
     const response = await fetch(exportUrl(`deck=${DECK_ID}&probe=1`));
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true });
   });
 
-  it.skipIf(!webExportBundle)('exports the live session as a self-contained web bundle', async () => {
+  it('exports the live session as a self-contained web bundle', async () => {
     // An edit that has not been written to disk still belongs in the export:
     // the bundle is what everyone currently sees, not what was last saved.
     const { client, welcome } = await connect('Exporter');

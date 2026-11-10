@@ -1,9 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { createServer } from 'node:net';
 import { join } from 'node:path';
 import WebSocket from 'ws';
+import { electronChildEnv } from '../../src/cli/electronDisplay.js';
 
 /**
  * Shared plumbing for the production-browser tests: launch a hidden Electron
@@ -27,6 +27,9 @@ export const electronBinary = (() => {
 })();
 
 export interface DevToolsTarget {
+  id?: string;
+  /** For an out-of-process frame, the target id of the page that embeds it. */
+  parentId?: string;
   title: string;
   url: string;
   webSocketDebuggerUrl?: string;
@@ -51,7 +54,7 @@ export class Cdp {
     reject: (error: Error) => void;
   }>();
 
-  private constructor(private socket: WebSocket) {
+  private constructor(private socket: WebSocket, private commandTimeoutMs: number) {
     socket.on('message', (raw) => {
       const message = JSON.parse(String(raw));
       if (typeof message.id !== 'number') return;
@@ -69,13 +72,21 @@ export class Cdp {
     });
   }
 
-  static async connect(webSocketDebuggerUrl: string): Promise<Cdp> {
+  /**
+   * `commandTimeoutMs` lowers the cap of every `call` on this connection, for
+   * a test whose own budget is shorter than the default: a command that never
+   * answers then fails naming itself rather than as a bare test timeout.
+   */
+  static async connect(
+    webSocketDebuggerUrl: string,
+    { commandTimeoutMs = CDP_COMMAND_TIMEOUT_MS }: { commandTimeoutMs?: number } = {},
+  ): Promise<Cdp> {
     const socket = new WebSocket(webSocketDebuggerUrl);
     await new Promise<void>((resolve, reject) => {
       socket.once('open', resolve);
       socket.once('error', reject);
     });
-    const cdp = new Cdp(socket);
+    const cdp = new Cdp(socket, commandTimeoutMs);
     await cdp.call('Runtime.enable');
     return cdp;
   }
@@ -92,7 +103,7 @@ export class Cdp {
   call(
     method: string,
     params: Record<string, unknown> = {},
-    timeoutMs = CDP_COMMAND_TIMEOUT_MS,
+    timeoutMs = this.commandTimeoutMs,
   ): Promise<any> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -224,14 +235,27 @@ export class Cdp {
    * A real double-click at a point. The second press carries clickCount 2, the
    * way the OS reports it: two clickCount-1 presses rely on Chromium pairing
    * them by wall-clock interval, which a loaded CI runner routinely exceeds.
+   *
+   * The four events are also stamped the way the OS stamps hardware input —
+   * when the button moved, not when the event reached the renderer. CDP
+   * otherwise stamps each one on arrival, and every dispatch waits for the
+   * renderer to handle the one before: the first press selects the box and
+   * redraws, which on a loaded runner took long enough that the second press's
+   * `timeStamp` fell outside the canvas's own double-click interval
+   * (`DOUBLE_CLICK_MS` in canvas.ts). The canvas then opened a bare caret
+   * instead of taking the word, a gap no physical double-click produces.
    */
   async doubleClickAt(x: number, y: number): Promise<void> {
     await this.mouse('mouseMoved', x, y, 0);
-    await this.mouse('mousePressed', x, y, 1);
-    await this.mouse('mouseReleased', x, y, 1);
+    const start = Date.now() / 1000;
+    await this.mouse('mousePressed', x, y, 1, 0, start);
+    await this.mouse('mouseReleased', x, y, 1, 0, start + 0.01);
+    // Keep the two clicks inside the native double-click interval without
+    // collapsing them into the same event-loop instant. Back-to-back CDP
+    // packets can exercise renderer coalescing that no physical mouse can.
     await wait(35);
-    await this.mouse('mousePressed', x, y, 2);
-    await this.mouse('mouseReleased', x, y, 2);
+    await this.mouse('mousePressed', x, y, 2, 0, start + 0.045);
+    await this.mouse('mouseReleased', x, y, 2, 0, start + 0.055);
   }
 
   /** A real left click at a point inside the matching node, given as 0..1. */
@@ -354,6 +378,8 @@ export class Cdp {
     y: number,
     clickCount: number,
     modifiers = 0,
+    /** Seconds since the epoch; CDP stamps the event on arrival without it. */
+    timestamp?: number,
   ): Promise<void> {
     const pressed = type === 'mousePressed' || (type === 'mouseMoved' && clickCount > 0);
     return this.call('Input.dispatchMouseEvent', {
@@ -362,6 +388,7 @@ export class Cdp {
       y,
       clickCount,
       modifiers,
+      timestamp,
       button: clickCount ? 'left' : 'none',
       buttons: pressed ? 1 : 0,
     });
@@ -497,11 +524,7 @@ export class Cdp {
   /** A real double-click at the centre of a visible node. */
   async doubleClick(selector: string, label = selector): Promise<void> {
     const box = await this.boxOf(selector, label);
-    await this.mouse('mouseMoved', box.x, box.y, 0);
-    await this.mouse('mousePressed', box.x, box.y, 1);
-    await this.mouse('mouseReleased', box.x, box.y, 1);
-    await this.mouse('mousePressed', box.x, box.y, 2);
-    await this.mouse('mouseReleased', box.x, box.y, 2);
+    await this.doubleClickAt(box.x, box.y);
   }
 
   /** Double-click the first rendered word in a node, using its glyph box. */
@@ -510,6 +533,16 @@ export class Cdp {
       const root = document.querySelector(${JSON.stringify(selector)});
       if (!root) return { error: 'no element matches' };
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      // The first click selects the box and puts its resize handles up (its
+      // corners and the middles of its sides), so a glyph under one of them
+      // -- small fitted text at the box's edge -- has the second click land
+      // on the handle instead. Aim past them.
+      const box = (root.closest('.element') ?? root).getBoundingClientRect();
+      const xs = [box.left, (box.left + box.right) / 2, box.right];
+      const ys = [box.top, (box.top + box.bottom) / 2, box.bottom];
+      const corner = (x, y) => xs.some((hx, i) => ys.some((hy, j) => (i !== 1 || j !== 1)
+        && Math.abs(x - hx) < 14 && Math.abs(y - hy) < 14));
+      let fallback = null;
       for (let node = walker.nextNode(); node; node = walker.nextNode()) {
         const offset = node.data.search(/\\S/);
         if (offset < 0) continue;
@@ -519,24 +552,20 @@ export class Cdp {
         const rect = range.getBoundingClientRect();
         const x = rect.left + rect.width / 2;
         const y = rect.top + rect.height / 2;
+        if (corner(x, y)) {
+          fallback ??= { x, y };
+          continue;
+        }
         const hit = document.elementFromPoint(x, y);
         if (!root.contains(hit)) {
           return { error: 'its first glyph is covered by ' + (hit?.className || hit?.tagName) };
         }
         return { x, y };
       }
-      return { error: 'node has no rendered text' };
+      return fallback ?? { error: 'node has no rendered text' };
     })()`);
     if ('error' in point) throw new Error(`cannot double-click ${label}: ${point.error}`);
-    await this.mouse('mouseMoved', point.x, point.y, 0);
-    await this.mouse('mousePressed', point.x, point.y, 1);
-    await this.mouse('mouseReleased', point.x, point.y, 1);
-    // Keep the two clicks inside the native double-click interval without
-    // collapsing them into the same event-loop instant. Back-to-back CDP
-    // packets can exercise renderer coalescing that no physical mouse can.
-    await wait(35);
-    await this.mouse('mousePressed', point.x, point.y, 2);
-    await this.mouse('mouseReleased', point.x, point.y, 2);
+    await this.doubleClickAt(point.x, point.y);
   }
 
   /** Double-click the rendered word containing a flat text offset. */
@@ -546,12 +575,7 @@ export class Cdp {
     label = selector,
   ): Promise<void> {
     const point = await this.textGlyphPoint(selector, offset, 0.5, label);
-    await this.mouse('mouseMoved', point.x, point.y, 0);
-    await this.mouse('mousePressed', point.x, point.y, 1);
-    await this.mouse('mouseReleased', point.x, point.y, 1);
-    await wait(35);
-    await this.mouse('mousePressed', point.x, point.y, 2);
-    await this.mouse('mouseReleased', point.x, point.y, 2);
+    await this.doubleClickAt(point.x, point.y);
   }
 
   /**
@@ -570,6 +594,11 @@ export class Cdp {
     if (end <= start) throw new Error(`cannot select empty range ${start}..${end}`);
     const from = await this.textGlyphPoint(selector, start, 0.15, `${label} start`);
     const to = await this.textGlyphPoint(selector, end - 1, 0.85, `${label} end`);
+    await this.selectBetween(from, to);
+  }
+
+  /** A click at `from` and a shift-click at `to`: the selection a person makes. */
+  async selectBetween(from: { x: number; y: number }, to: { x: number; y: number }): Promise<void> {
     await this.call('Input.dispatchMouseEvent', {
       type: 'mouseMoved', x: from.x, y: from.y, button: 'none', buttons: 0,
     });
@@ -688,21 +717,7 @@ export class Cdp {
       };
     })()`);
     if ('error' in points) throw new Error(`cannot select ${label}: ${points.error}`);
-    await this.call('Input.dispatchMouseEvent', {
-      type: 'mouseMoved', x: points.start.x, y: points.start.y, button: 'none', buttons: 0,
-    });
-    await this.call('Input.dispatchMouseEvent', {
-      type: 'mousePressed', x: points.start.x, y: points.start.y,
-      button: 'left', buttons: 1, clickCount: 1,
-    });
-    await this.call('Input.dispatchMouseEvent', {
-      type: 'mouseMoved', x: points.end.x, y: points.end.y,
-      button: 'left', buttons: 1,
-    });
-    await this.call('Input.dispatchMouseEvent', {
-      type: 'mouseReleased', x: points.end.x, y: points.end.y,
-      button: 'left', buttons: 0, clickCount: 1,
-    });
+    await this.sweepSelect(points.start, points.end, label);
   }
 
   /** Select the first rendered word with a real pointer drag. */
@@ -733,21 +748,74 @@ export class Cdp {
       return { error: 'node has no rendered word' };
     })()`);
     if ('error' in points) throw new Error(`cannot select ${label}: ${points.error}`);
+    await this.sweepSelect(points.start, points.end, label);
+  }
+
+  /**
+   * Press at `start`, move to `end` and release: the drag that selects text.
+   *
+   * A press on text that is already selected does not start a new selection:
+   * it picks the selected text up for drag-and-drop, under a person's mouse
+   * and under CDP alike. That is never what these helpers mean, and under CDP
+   * it can be worse than a wrong selection. On Linux the drag becomes a native
+   * drag-and-drop session that waits for the pointer's own release; when the
+   * synthetic release lost the race to it (a slow CI runner), every later
+   * mouse and key event went to the stuck drag instead of the page, and each
+   * case after it failed with "the text box did not enter editing" (paste
+   * fuzz, nightly 2026-10-06; a select-all or a double-clicked word ahead of
+   * the sweep is enough). A person clicks into the selected text first, which
+   * clears it, and so does this. If the gesture still starts a drag-and-drop
+   * it is reported here, by name, not as whatever fails next.
+   */
+  private async sweepSelect(
+    start: { x: number; y: number },
+    end: { x: number; y: number },
+    label: string,
+  ): Promise<void> {
+    const pressOnSelection = `(() => {
+      const selection = window.getSelection();
+      if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return false;
+      const x = ${JSON.stringify(start.x)};
+      const y = ${JSON.stringify(start.y)};
+      return [...selection.getRangeAt(0).getClientRects()].some((rect) =>
+        x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom);
+    })()`;
+    if (await this.evaluate<boolean>(pressOnSelection)) {
+      await this.mouse('mouseMoved', start.x, start.y, 0);
+      await this.mouse('mousePressed', start.x, start.y, 1);
+      await this.mouse('mouseReleased', start.x, start.y, 1);
+      if (await this.evaluate<boolean>(pressOnSelection)) {
+        throw new Error(`cannot select ${label}: clicking the selected text did not clear the selection`);
+      }
+    }
+    await this.evaluate(`(() => {
+      window.__sweepDragStarts = 0;
+      window.__sweepCountDragStart ??= () => { window.__sweepDragStarts += 1; };
+      window.addEventListener('dragstart', window.__sweepCountDragStart, true);
+      return true;
+    })()`);
     await this.call('Input.dispatchMouseEvent', {
-      type: 'mouseMoved', x: points.start.x, y: points.start.y, button: 'none', buttons: 0,
+      type: 'mouseMoved', x: start.x, y: start.y, button: 'none', buttons: 0,
     });
     await this.call('Input.dispatchMouseEvent', {
-      type: 'mousePressed', x: points.start.x, y: points.start.y,
+      type: 'mousePressed', x: start.x, y: start.y,
       button: 'left', buttons: 1, clickCount: 1,
     });
     await this.call('Input.dispatchMouseEvent', {
-      type: 'mouseMoved', x: points.end.x, y: points.end.y,
+      type: 'mouseMoved', x: end.x, y: end.y,
       button: 'left', buttons: 1,
     });
     await this.call('Input.dispatchMouseEvent', {
-      type: 'mouseReleased', x: points.end.x, y: points.end.y,
+      type: 'mouseReleased', x: end.x, y: end.y,
       button: 'left', buttons: 0, clickCount: 1,
     });
+    const dragStarts = await this.evaluate<number>(`(() => {
+      window.removeEventListener('dragstart', window.__sweepCountDragStart, true);
+      return window.__sweepDragStarts;
+    })()`);
+    if (dragStarts > 0) {
+      throw new Error(`selecting ${label} started a drag-and-drop of the selected text instead`);
+    }
   }
 
   /**
@@ -843,6 +911,8 @@ export class Cdp {
 export interface RunningBrowser {
   process: ChildProcess;
   debugPort: number;
+  /** The main process's Node inspector, when it was launched with `--inspect=0`. */
+  inspectorPort?: number;
   log: () => string;
 }
 
@@ -850,19 +920,76 @@ export interface RunningBrowser {
 export async function launchBrowser(
   url: string,
   profileDir: string,
+  /** Extra Electron switches, e.g. `--inspect=0` for the main process. */
+  electronArgs: string[] = [],
 ): Promise<RunningBrowser> {
-  const debugPort = await freePort();
   const child = spawn(electronBinary, [
     join(process.cwd(), 'scripts/eval-browser.cjs'),
     url,
-    String(debugPort),
+    // Chromium picks the port; see `reportedPorts`.
+    '0',
     profileDir,
+    ...electronArgs,
   ], {
     cwd: process.cwd(),
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, ELECTRON_DISABLE_SECURITY_WARNINGS: '1' },
+    env: electronChildEnv(),
   });
-  return { process: child, debugPort, log: collectProcessOutput(child) };
+  const log = collectProcessOutput(child);
+  return { process: child, log, ...await reportedPorts(child, electronArgs, log) };
+}
+
+const DEVTOOLS_LISTENING = /DevTools listening on ws:\/\/[^\s/]+:(\d+)\//;
+const INSPECTOR_LISTENING = /Debugger listening on ws:\/\/[^\s/]+:(\d+)\//;
+
+/**
+ * The ports an Electron launched with `--remote-debugging-port=0` (and, when
+ * `args` asks for it, `--inspect=0`) actually bound, as it reports them on
+ * stderr.
+ *
+ * Asking the OS for a free port and handing the number to Electron was a race:
+ * the probe socket closes before Electron binds, and with a tier's worth of
+ * Electrons starting at once another one took the port in between. The loser
+ * logged "bind() failed: Address already in use", exposed no DevTools at all,
+ * and its suite timed out waiting for a target. Port 0 cannot collide.
+ */
+export function reportedPorts(
+  child: ChildProcess,
+  args: string[],
+  log: () => string,
+  timeoutMs = FIND_TARGET_TIMEOUT_MS,
+): Promise<{ debugPort: number; inspectorPort?: number }> {
+  const wantsInspector = args.includes('--inspect=0');
+  return new Promise((resolve, reject) => {
+    let text = '';
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      child.stderr?.off('data', onData);
+      child.off('exit', onExit);
+      if (error) {
+        reject(error);
+        return;
+      }
+      const inspector = INSPECTOR_LISTENING.exec(text);
+      resolve({
+        debugPort: Number(DEVTOOLS_LISTENING.exec(text)![1]),
+        ...(inspector ? { inspectorPort: Number(inspector[1]) } : {}),
+      });
+    };
+    const onData = (chunk: unknown) => {
+      text += String(chunk);
+      if (DEVTOOLS_LISTENING.test(text) && (!wantsInspector || INSPECTOR_LISTENING.test(text))) {
+        finish();
+      }
+    };
+    const onExit = () => finish(new Error(`Electron exited before exposing DevTools\n${log()}`));
+    const timer = setTimeout(
+      () => finish(new Error(`Electron did not report its DevTools port in ${timeoutMs} ms\n${log()}`)),
+      timeoutMs,
+    );
+    child.stderr?.on('data', onData);
+    child.once('exit', onExit);
+  });
 }
 
 /**
@@ -949,8 +1076,102 @@ export async function textEditingState(cdp: Cdp, selector: string): Promise<stri
       hit: describe(hit),
       overlays: [...document.querySelectorAll('#ctx-menu, .color-picker-popover, dialog[open], .modal')]
         .filter((node) => node.getClientRects().length > 0).map(describe),
-    });
+    }) + (window.__deckwerkTrace
+      ? '\\ntrace (ms since install, newest last):\\n  ' + window.__deckwerkTrace.slice(-80).join('\\n  ')
+      : '');
   })()`).catch((error) => `(state unreadable: ${error instanceof Error ? error.message : String(error)})`);
+}
+
+/**
+ * Record, in the page, every pointer and key event the canvas could see and
+ * every change to the selection, the document and the edit session, with the
+ * call site that made it. `textEditingState` prints the tail. A lost
+ * double-click leaves only its end state behind ("selection: []"); this says
+ * whether the press arrived, what it hit, and what took the selection away.
+ *
+ * Needs `window.store` and `window.canvas` (both shells expose them).
+ */
+export async function installEditingTrace(cdp: Cdp): Promise<void> {
+  await cdp.evaluate(`(() => {
+    if (window.__deckwerkTrace || !window.store || !window.canvas) return false;
+    const log = [];
+    window.__deckwerkTrace = log;
+    const t0 = performance.now();
+    const push = (line) => {
+      log.push((performance.now() - t0).toFixed(0).padStart(7) + ' ' + line);
+      if (log.length > 400) log.shift();
+    };
+    const describe = (node) => node instanceof Element
+      ? node.tagName.toLowerCase() + (typeof node.className === 'string' && node.className.trim()
+        ? '.' + node.className.trim().split(/\\s+/).slice(0, 3).join('.') : '')
+      : String(node);
+    // The caller of a wrapped method: skip this wrapper's own frame.
+    const caller = () => (new Error().stack ?? '').split('\\n').slice(3, 6)
+      .map((frame) => frame.trim().replace(/^at /, '').replace(/\\(?https?:\\/\\/[^/]+\\//, '(')).join(' < ');
+    // Moves are only interesting while a press is held: that is when the
+    // canvas reads one as a drag. Log each, with the buttons it reports.
+    let held = 0;
+    window.addEventListener('pointerdown', () => { held = 8; }, true);
+    window.addEventListener('pointerup', () => { held = 0; }, true);
+    window.addEventListener('pointermove', (event) => {
+      if (held <= 0) return;
+      held -= 1;
+      push('pointermove ' + describe(event.target) + ' x=' + Math.round(event.clientX)
+        + ' y=' + Math.round(event.clientY) + ' buttons=' + event.buttons
+        + ' trusted=' + event.isTrusted + ' t=' + event.timeStamp.toFixed(0));
+    }, true);
+    // Where the slide view sits: a re-fit under a held pointer remaps it.
+    const stage = document.querySelector('#canvas .stage');
+    if (stage) {
+      new MutationObserver(() => push('stage ' + stage.style.left + ',' + stage.style.top
+        + ' ' + stage.style.transform)).observe(stage, { attributes: true, attributeFilter: ['style'] });
+    }
+    for (const type of ['pointerdown', 'pointerup', 'pointercancel', 'lostpointercapture', 'dblclick', 'keydown']) {
+      window.addEventListener(type, (event) => push(type + ' ' + describe(event.target)
+        + (event.key ? ' key=' + event.key : '')
+        + (event.pointerId !== undefined ? ' x=' + Math.round(event.clientX) + ' y=' + Math.round(event.clientY)
+          + ' buttons=' + event.buttons : '')
+        + (event.detail ? ' detail=' + event.detail : '')
+        + ' t=' + event.timeStamp.toFixed(0)), true);
+    }
+    const store = window.store;
+    const canvas = window.canvas;
+    const state = () => '[' + [...store.get().selection].join(',') + '] editing=' + canvas.editingId;
+    const wrap = (owner, name, label) => {
+      const original = owner[name];
+      if (typeof original !== 'function') return;
+      owner[name] = function (...args) {
+        const before = state();
+        try {
+          return original.apply(this, args);
+        } finally {
+          push(label + '.' + name + ' ' + before + ' -> ' + state() + ' from ' + caller());
+        }
+      };
+    };
+    for (const name of ['select', 'clearSelection', 'load', 'resyncRemote', 'replaceExternal',
+      'undo', 'redo', 'restoreHistory', 'deleteSelection', 'selectSlide']) wrap(store, name, 'store');
+    for (const name of ['beginTextEdit', 'commitTextEdit', 'endTextEditing']) wrap(canvas, name, 'canvas');
+    // Remote and local commits are frequent; log them only by label.
+    const applyRemote = store.applyRemote;
+    store.applyRemote = function (deck, label, ...rest) {
+      push('store.applyRemote ' + JSON.stringify(label));
+      return applyRemote.call(this, deck, label, ...rest);
+    };
+    const commit = store.commit;
+    store.commit = function (fn, opts = {}) {
+      push('store.commit ' + JSON.stringify(opts.label ?? '') + (opts.transient ? ' transient' : '')
+        + (opts.measurement ? ' measurement' : ''));
+      return commit.call(this, fn, opts);
+    };
+    let last = state();
+    store.subscribe(() => {
+      const now = state();
+      if (now !== last) push('state ' + last + ' -> ' + now);
+      last = now;
+    });
+    return true;
+  })()`);
 }
 
 export function collectProcessOutput(child: ChildProcess): () => string {
@@ -959,19 +1180,6 @@ export function collectProcessOutput(child: ChildProcess): () => string {
   child.stdout?.on('data', (chunk) => (stdout += String(chunk)));
   child.stderr?.on('data', (chunk) => (stderr += String(chunk)));
   return () => [stdout, stderr].filter(Boolean).join('\n').trim();
-}
-
-export async function freePort(): Promise<number> {
-  const portServer = createServer();
-  await new Promise<void>((resolve, reject) => {
-    portServer.once('error', reject);
-    portServer.listen({ host: '127.0.0.1', port: 0, exclusive: true }, resolve);
-  });
-  const address = portServer.address();
-  if (!address || typeof address === 'string') throw new Error('could not allocate debug port');
-  await new Promise<void>((resolve, reject) =>
-    portServer.close((error) => error ? reject(error) : resolve()));
-  return address.port;
 }
 
 export function wait(ms: number): Promise<void> {

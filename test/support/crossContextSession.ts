@@ -14,6 +14,7 @@ import {
   type RunningBrowser,
 } from './browserSession.js';
 import { collabClientDir } from './collabClient.js';
+import { KEPT_SELECTION_INVARIANTS } from './selectionSession.js';
 
 /**
  * A three-element editor for the cross-context fuzz walk: one textbox holding
@@ -129,6 +130,7 @@ const INVARIANTS = `() => {
     }
   }
 
+${KEPT_SELECTION_INVARIANTS}
   const highlighted = [...layer.querySelectorAll('.editor-table-selected')];
   if (table === null && highlighted.length > 0) {
     problems.push(highlighted.length + ' table cells stay highlighted with no cell range');
@@ -223,6 +225,12 @@ export interface CrossSession {
   doubleClick(elementId: string): Promise<void>;
   clickEmpty(): Promise<void>;
   clickRail(index: number): Promise<void>;
+  /**
+   * A click on an element during which the window system reports a hover
+   * elsewhere with no button held — what CI's X display sends whenever a
+   * window maps. It is a click, not a drag (test/pointerDragBugs.test.ts).
+   */
+  clickWithStrayHover(elementId: string): Promise<void>;
   /** A real primary-button marquee drag along viewport points. */
   dragPath(points: Array<{ x: number; y: number }>): Promise<void>;
   /** Viewport box of a selector. */
@@ -231,6 +239,8 @@ export interface CrossSession {
   chord(key: string, code: string, virtualKey: number, modifiers: number,
     commands?: string[]): Promise<void>;
   type(value: string): Promise<void>;
+  /** A real [ or ] key (with Shift: { or }), carrying both its physical code and its character. */
+  stackKey(right: boolean, shift: boolean): Promise<void>;
   state(): Promise<CrossState>;
   /** Invariant violations that survive a short settle window. */
   problems(): Promise<string[]>;
@@ -295,7 +305,7 @@ export async function startCrossSession(deckId: string, name: string): Promise<{
   ), 'the cross-context fixture never loaded');
   await cdp.evaluate(ERROR_TRAP);
 
-  const session = buildSession(cdp);
+  const session = buildSession(cdp, deck.slides);
   return {
     session,
     close: async () => {
@@ -310,7 +320,7 @@ export async function startCrossSession(deckId: string, name: string): Promise<{
   };
 }
 
-function buildSession(cdp: Cdp): CrossSession {
+function buildSession(cdp: Cdp, startingSlides: unknown[]): CrossSession {
   const session: CrossSession = {
     cdp,
     async reset() {
@@ -323,8 +333,19 @@ function buildSession(cdp: Cdp): CrossSession {
       }
       await cdp.evaluate(`(() => {
         window.store.commit((deck) => {
-          deck.slides[0].elements = ${JSON.stringify(startingElements())};
-          deck.slides[1].elements = ${JSON.stringify([secondSlideElement()])};
+          const starting = ${JSON.stringify(startingSlides)};
+          // A walk may have confirmed deleting both slides and then redone
+          // that after its undo, which legitimately leaves one blank slide
+          // with a new id: then the slide list itself is rebuilt. Otherwise
+          // only the fixture slides' objects are, so a suite that added
+          // slides of its own keeps them.
+          if (starting.some((slide) => !deck.slides.some((s) => s.id === slide.id))) {
+            deck.slides = starting;
+            return;
+          }
+          for (const slide of starting) {
+            deck.slides.find((s) => s.id === slide.id).elements = slide.elements;
+          }
         }, { label: 'Cross-context fixture' });
         window.store.selectSlide(0);
         window.store.clearSelection();
@@ -354,6 +375,24 @@ function buildSession(cdp: Cdp): CrossSession {
     async clickRail(index) {
       await cdp.click(`.rail-item[data-index="${index}"]`, `rail slide ${index}`);
       await wait(150);
+    },
+    async clickWithStrayHover(elementId) {
+      const box = await session.boxOf(elementSelector(elementId));
+      const x = box.left + box.width / 2;
+      const y = box.top + box.height / 2;
+      await cdp.call('Input.dispatchMouseEvent', {
+        type: 'mouseMoved', x, y, button: 'none', buttons: 0,
+      });
+      await cdp.call('Input.dispatchMouseEvent', {
+        type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1,
+      });
+      await cdp.call('Input.dispatchMouseEvent', {
+        type: 'mouseMoved', x: x + 240, y: y + 160, button: 'none', buttons: 0,
+      });
+      await cdp.call('Input.dispatchMouseEvent', {
+        type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1,
+      });
+      await wait(60);
     },
     async dragPath(points) {
       const start = points[0];
@@ -398,6 +437,20 @@ function buildSession(cdp: Cdp): CrossSession {
     async type(value) {
       await cdp.typeKeys(value);
       await wait(60);
+    },
+    async stackKey(right, shift) {
+      const character = right ? (shift ? '}' : ']') : (shift ? '{' : '[');
+      const key = {
+        key: character,
+        code: right ? 'BracketRight' : 'BracketLeft',
+        windowsVirtualKeyCode: right ? 221 : 219,
+        nativeVirtualKeyCode: right ? 221 : 219,
+        modifiers: shift ? 8 : 0,
+      };
+      await cdp.call('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...key });
+      await cdp.call('Input.dispatchKeyEvent', { type: 'char', text: character, unmodifiedText: character, ...key });
+      await cdp.call('Input.dispatchKeyEvent', { type: 'keyUp', ...key });
+      await wait(80);
     },
     state() {
       return cdp.evaluate<CrossState>(`(${STATE})()`);

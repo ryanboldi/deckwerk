@@ -28,6 +28,35 @@ hash, with every window hidden. Never point a test at the checkout's `out/`
 directory — that is whatever was last built by hand — and never leave a suite
 skipping itself when a build is missing.
 
+### Agent collaboration suites
+
+Three suites guard the loop agents work in — export a page, edit it, save it —
+through all three doors it has: `slide-agent` beside a closed deck, the live
+desktop editor's `edit/` watcher, and a hosted session (the bundled
+`deckwerk-connect.mjs` the server hands out, run as a collaborator runs it,
+with `./deck` and a person editing over the WebSocket). They share
+`test/support/agentWorkspace.ts`.
+
+- `test/agentCollaboration.test.ts` — the regression suite: what a page lands,
+  what it must leave alone (notes, skips, comments, non-appear builds and
+  build order, maths as TeX, line breaks, video flags, layouts, regions),
+  what a section carries to a copy (notes, skip, the whole timeline), a
+  scattered export replacing in place, an untouched export re-saving as no
+  change on the fixture and on every deck in `decks/`, `--after 0`, races
+  with a collaborator.
+- `test/agentCollaborationSandbox.test.ts` — the hosted server under the
+  production systemd sandbox (`packaging/linux/deckwerk-collab-chromium-sandbox.conf`),
+  and on a machine that runs `deckwerk-collab.service`, under the unit systemd
+  actually resolved.
+- `test/agentCollaborationFuzz.test.ts` — a seeded walk of agent and person
+  moves against a model of the deck (`AGENT_FUZZ_SEEDS`, `AGENT_FUZZ_STEPS`,
+  `AGENT_FUZZ_BACKENDS`; `npm run test:agents:fuzz` walks it long, as the
+  nightly does with a rotated seed).
+
+A change to that loop — the export, the compile, the sync, the bridge, `./deck`
+— adds its case to the regression suite and, if it is a new move, to the fuzz
+alphabet, in the same PR.
+
 ## UI consistency
 
 Every new UI element must match the rest of the application. Reuse the shared
@@ -81,6 +110,9 @@ it is always the whole deck.
 `context` and `comments` print, and the number a person says out loud. So "my
 slide 44 is ugly" is `--slide 44`, and that slide with its neighbours is
 `--slide 43,44,45`. You never have to look up an id to act on a number.
+Where a command takes several slides (`inspect`, `render`, `validate`,
+`theme apply`), a range of numbers counts too, both ends included, and a list
+can mix them: `--slide 2-40`, `--slide 1,3-5`.
 
 ### Resolve the visual direction before creating slides
 
@@ -125,6 +157,12 @@ Two rules about the file itself:
   replaces those slides rather than inserting them a second time — and it means
   dropping a section (its id now recorded) deletes that slide on the next save.
   Re-read the file after a sync rather than editing a stale copy of it.
+- **Leave `data-base` alone.** Each exported section and object records what
+  it was when exported (a short fingerprint). If somebody edits one of those
+  slides while you work, your save merges instead of undoing them: objects you
+  left alone keep their edits, objects you changed take yours, anything they
+  added stays and anything they deleted stays deleted. A section or object you
+  write yourself needs no `data-base`.
 
 If `apply` times out, **do not apply again**: the editor may still land the
 change. Check `slide-agent context` for the outline first — the id write-back
@@ -144,7 +182,8 @@ destroyed. Decide which you are doing *before* you open an editor:
 browser-openable skeleton as an export — the canvas box, `theme.css`, the type
 rules, the `<base>` — but with no slide ids and no scope marker, so nothing in
 the deck is at risk however you edit it. `--count <n>` gives you n starter
-sections. `apply --after <slideId>` places them somewhere other than the end.
+sections. `apply --after <slide>` (an id or a number) places them somewhere
+other than the end, and `apply --after 0` makes them the first slides.
 
 **Never copy an export to author new slides.** This is the mistake that bites:
 an export carries a `slide-editor-scope` marker in its `<head>` recording the
@@ -164,6 +203,43 @@ is and put a new id-less section beside it. Duplicating slide 44's section to
 get a starting point only works if you **delete the copy's `data-slide-id`** —
 leave it in and the file names one slide twice, which is refused.
 
+**Where things land.** The slides a page governs keep the places they hold in
+the deck; the page's order only decides which of them goes in which place. An
+export of `--slide 2,39,77` saved with its sections in the same order moves
+nothing (`moved: 0`), and swapping two of its sections swaps exactly those two
+slides, wherever they sit — a scattered export is never pulled together. A new
+section lands right after the slide of the section before it in the page; one
+with no section before it lands right before the slide of the first section
+after it; a page left with only new sections puts them where its first
+exported slide was. For a contiguous export that is the block it always was.
+`moved` counts the slides that actually changed place.
+
+**What a section carries besides its objects.** Each exported section also
+holds what is not drawn on the slide, so a section copied into another deck's
+page (with its `data-slide-id` deleted) keeps it:
+
+- `data-skipped="true"` on the `<section>` — a skipped slide. Remove it to
+  un-skip the slide.
+- `<aside class="notes">…</aside>` inside the section — its speaker notes,
+  plain text, hidden on the page. Edit the words to change them; an empty
+  aside clears them; a section with no aside at all leaves them alone.
+- `<script type="application/deckwerk-timeline">[…]</script>` — written only
+  when the objects' `data-build` attributes cannot say the slide's builds on
+  their own (a disappear, a play/pause/seek, a by-paragraph reveal, a second
+  build of one object, or builds in another order than paint order). It is
+  the timeline as `deck.json` holds it, one step per line, naming objects by
+  their `data-element-id`: move a line to move that step, add or delete lines
+  to add or remove steps. Attributes win for what they state (an object's
+  first appearance, its trigger and effect, equation and line builds). When a
+  copy's object ids are taken in the destination deck the objects are
+  renamed and their steps follow them.
+- On a page you write yourself, `data-build-order="n"` on an object makes its
+  appearance the n-th step, whatever the paint order.
+
+Notes, skip and timeline merge like objects do: if a person changes them in
+the editor after your export and your page leaves them as exported, the
+person's version stands.
+
 **Check what actually happened.** Every `apply` reports a `changes` object —
 `replaced`, `inserted`, `deleted`, `moved`, each naming ids. Read it. If
 `deleted` is not empty and you did not mean to delete a slide, undo in the
@@ -173,8 +249,12 @@ save the editor's status message says the same thing.
 `slide-agent validate` also reports `overflows`: every element whose authored
 box extends past the canvas, from geometry alone. Deliberate bleeds show up
 there too — the list is a checklist, not an error. Scope it to the slides you
-are actually editing with `--slide <id|number>` (repeatable, or comma-separated) or
-`--selected`; structural `errors` stay deck-wide either way.
+are actually editing with `--slide <id|number|a-b>` (repeatable, or comma-separated) or
+`--selected`; structural `errors` stay deck-wide either way. It also lists
+`mathProblems`: text elements whose `$`/`$$` maths opens and never closes,
+which the slide shows as raw TeX (usually a `<` inside maths; see below). And
+`buildProblems`: equation term builds with nothing to step through, because
+the equation marks no terms (`\step{1}{…}`) or not the one the build names.
 
 **Write semantic markup; put reusable classes in `theme.css`.** The walk bakes
 layout from any CSS, keeps a dissolving container's paint (background, border,
@@ -192,17 +272,34 @@ turns into, not a list of things to opt into.
 
 - **Text** — any text-bearing tag: headings, `<p>`, `<blockquote>`, `<li>`,
   `<dt>`/`<dd>`, `<figcaption>`, `<small>`, `<cite>`, and their inline markup.
-  A `<ul>`/`<ol>` stays one object, markers and all, and a hand-written
+  A `<ul>`/`<ol>` stays one object, markers and all, laid out in the page with
+  the player's own list rules (markers flush with the box, a little space
+  between items), so the box you see is the box it gets. Indent and
+  pretty-print freely: whitespace between tags is dropped, while `&emsp;` and
+  `&nbsp;` are kept; `<ol start>` and `<li value>` number as in HTML. A hand-written
   `<table>` becomes an editable deck table with the column widths the browser
-  measured. The player draws an unstyled table as a plain 1px grid; a
-  designed table resets that first (`.results th, .results td { border: 0 }`
+  measured, read per column from the cells' grid, so `<col>` widths and cell
+  widths survive a group-header first row of `colspan` cells. Write a new
+  table in a `slide-agent new` page: one written into an exported section
+  stays an HTML region (`apply` says so). The player
+  draws an unstyled table as a plain 1px grid; a designed table resets that first (`.results th, .results td { border: 0 }`
   in `theme.css`) and then adds only the rules it wants.
+- **Maths** — `$…$` inline, `$$…$$` display, KaTeX TeX inside any text; the
+  deck stores the TeX, not KaTeX's render. A literal dollar is `\$`. **Write
+  `<` inside maths as `&lt;` or `\lt`**: the page is HTML, so `y_{<k}` or
+  `$a<b$` starts a tag and everything after it vanishes from the text. `apply`
+  warns when that happened (naming the slide, element and the spot) and
+  `validate` lists maths left unclosed as `mathProblems`. `>` is safe.
 - **Media** — `<img>` and `<video>`. A border, a radius, a circular mask, a
   ring shadow or a backdrop colour on the media *or on a frame that wraps only
   that media* becomes the picture's own, so a framed photograph is one object
   rather than a picture with a ring floating beside it. The deck paints a
   media border inside the box, so the frame lands on the picture's outer edge
-  rather than just outside it.
+  rather than just outside it. A video's trim is `data-trim="start,end"` in
+  seconds; an exported `<video src>` also carries `#t=<start>` so the page
+  previews the right frame. The file is the `src` without that fragment, and
+  `deck.json` never stores one: a hand-written `src="x.mp4#t=15,20"` with no
+  `data-trim` lands as `src: "x.mp4"`, `start: 15`, `end: 20`.
 - **Crops** — `object-fit: cover/contain` with an `object-position` that is
   not the default is a crop, and it is measured into the deck's own
   `sourceBox`, so the framing you chose is what the crop tool picks up when
@@ -214,6 +311,29 @@ turns into, not a list of things to opt into.
   primitive (`rect`, `circle`, `ellipse`, `line`, `path`, `polygon`,
   `polyline`) becomes that shape: a `<line>` with `marker-end` is a real
   arrow, angle and all, and a single `<path>` keeps its `d` and its viewBox.
+  A `stroke-dasharray` becomes the deck's dashed stroke, or its dotted one
+  when the dashes are no longer than the line is wide; `stroke-opacity` and
+  `fill-opacity` fold into the colours' alpha, and `opacity` onto the object.
+  All of this holds for markup you write fresh into an exported section too:
+  only the objects the page was exported with (`data-element-id`) come back
+  exactly as they went out.
+  An exported line or arrow says its bend as `data-control-offset="dx,dy"`,
+  relative to its box's top-left corner, so moving it by `left`/`top` moves
+  the bend too; delete the attribute to straighten it.
+- **Code** — `<pre><code class="language-python">` (or `<pre
+  data-element="code" data-language="python" data-scheme="github-dark">`) is
+  a highlighted code block: the code stays exactly as written, coloured by
+  Shiki in a bundled scheme (`github-light`, `github-dark`, `one-dark-pro`,
+  `solarized-light`, `dracula`, `nord`, or `deck` for the deck's own theme
+  colours). `data-font-size`, `data-line-numbers="true"`, and the block's
+  line builds in order, `data-build-lines="each; highlight:3-5; dim:7"`,
+  ride on the `<pre>`: each `;`-separated part is one build on its own
+  click — `each` reveals the block a line per click, bare lines (`2-4`)
+  appear, `highlight:` tints those lines and `dim:` fades every other one.
+  These are the same builds a person makes by picking lines in the block's
+  gutter, and a save keeps each build's trigger, tint and place among the
+  slide's other builds. Escape `<` and `&` in the code; never fake a listing
+  with a monospace text box.
 - **Decoration** — `::before`/`::after` come across too: solid paint as a
   shape, a gradient bar, a shadowed chip, a border-triangle arrowhead or a
   `content:"→"` as a styled text object, painted in front of or behind its
@@ -224,8 +344,8 @@ turns into, not a list of things to opt into.
 ### What to avoid
 
 These still import, but as an inert `data-element="html"` region — movable and
-resizable, editable only by rewriting the markup (`validate` lists them as
-`importGaps`):
+resizable, editable only by rewriting the markup. `apply` warns about each one
+it made, saying why, and `validate` lists them as `importGaps`:
 
 - **A multi-primitive inline SVG.** A boxes-and-arrows diagram drawn as one
   `<svg>` is a picture to the deck. Build it from divs and one-primitive SVGs
@@ -312,6 +432,15 @@ What the page can and cannot do:
   the deck's builds. Navigation keys the page leaves unhandled are forwarded to
   the deck, so a focused page never traps the presenter; a page that wants the
   arrows calls `preventDefault`.
+- While presenting, the page stays hidden — its poster shows in its place —
+  until it has loaded and painted, so nobody sees it half-built. A page that
+  lays itself out from script after `load` (once `document.fonts.ready`
+  resolves, say) should call `deckwerk.ready(promise)` from its top-level
+  script, with the promise of that work:
+  `deckwerk.ready(document.fonts.ready.then(layout))`. The deck then waits for
+  the promise too. Either way a page is shown after 5 seconds, ready or not.
+  Pages staged before `ready()` existed carry an older runtime without it;
+  guard with `if (deckwerk.ready)` or re-stage the page with `web add`.
 - Nothing inside is a slide object: no inspector restyling, Morph, auto-fit or
   overflow checks. When the *content* could be ordinary slides, make ordinary
   slides — they stay editable and the design stays consistent.
@@ -412,6 +541,7 @@ my-talk/
                editor on every open unless its marker line has been removed
   edit/        watched HTML authoring files
   assets/      media, referenced by deck-relative path
+  history.jsonl  hosted decks only: the collaboration server's edit log (below)
 ```
 
 - **Save `edit/*.html` → the editor syncs that slide range into the deck**
@@ -428,10 +558,63 @@ my-talk/
   the undo history under your own label.
 - Geometry is absolute pixels on the deck's `canvas` (usually 1920×1080),
   origin top-left, width before height. `rot` is clockwise degrees about the
-  element's centre; `z` is paint order.
+  element's centre; `flipX` / `flipY` mirror an element in its own frame
+  before `rot` turns it (on a page: `transform: rotate(…) scaleX(-1)`); `z` is
+  paint order.
 - Do not edit inside the `/* >>> slide-editor theme (generated) */ … */`
   block in `theme.css` — installing a theme replaces it wholesale. Everything
   outside it is yours. Agent transactions do not touch the theme at all.
+
+### The edit log (hosted decks)
+
+A deck a collaboration server hosts gets `history.jsonl` beside `deck.json`
+(src/shared/editHistory.ts, written by src/server/editLog.ts): one JSON line
+per change the server accepted, so that when something vanishes there is a
+record of who or what removed it, and the removed content itself. Each line
+has the time, the session `seq` (restarting when the server reopens the deck),
+`kind` (`txn`, or `replace` for a deck.json written on disk behind the
+server and merged into the live deck), the `label`, the `author` (the display name the room saw; on an
+access-controlled server the `login` it was admitted under; the peer's
+`clientId`; `agent` for a bridge or the HTTP agent API; `via`
+`socket`/`http`/`disk`/`server`; `agentFor`, the participant a bridge speaks
+for), counts per operation type, and what happened: ids of slides inserted,
+moved and changed, ids of objects inserted and replaced, and every **deleted
+slide or object in full** (a slide with its 1-based number and title). Content
+of replacements is not logged — only ids. A transaction whose every operation
+was skipped is marked `noop`. Example (slide JSON shortened):
+
+```json
+{"ts":"2026-10-07T15:42:10.512Z","seq":212,"kind":"txn","label":"Update deck.json","author":{"name":"Vincent · agent","login":"sitzmann@mit.edu","clientId":"3f0c9a2e-…","agent":true,"via":"socket","agentFor":"participant-…"},"txnId":"agent-…","ops":{"deleteSlide":1,"setSlideProperties":1},"slides":{"deleted":[{"id":"slide-41","number":12,"title":"Results","slide":{"id":"slide-41","name":"Results","elements":[…]}}],"changed":["slide-7"]},"slideCount":40}
+```
+
+Lines are queued and appended in batches off the transaction path, flushed
+when the session flushes or closes; past 20 MB the file rotates to
+`history.1.jsonl`. It belongs to the server: it moves and goes to the trash
+with its folder, but it is never mirrored to a `slide-agent connect` folder,
+never served through the mirror routes, left out of the deck's zip download
+and of a desktop Save As copy, and dropped from an uploaded archive. Read it
+with `slide-agent history [deck] [--deleted] [--slide <id>] [--limit n]
+[--full]` on the machine that hosts the deck; a deleted slide's `slide` is
+exactly what an `insertSlides` transaction needs to put it back.
+
+Beside the log, the server keeps **versions**: what the deck *was*, in
+`.versions/<time>.<hash>.json.gz` (deck.json plus the theme; src/main/deckVersions.ts).
+One is taken when a deck opens, at most every 2 minutes while it is edited,
+on both sides of a deck.json replaced on disk, and when the session closes;
+all are kept for 30 days, then the last of each day. `slide-agent history
+[deck] --versions` lists them and `--restore <id | ISO time>` puts one back
+for everyone editing, after first saving what it replaces as a version, so a
+restore is itself undoable. Use it to undo anyone's change — a person's, an
+agent's, a script's — when the log shows what went wrong and when. Like every
+dotfile, `.versions/` is never mirrored, downloaded or copied by Save As.
+
+The bridge (`slide-agent connect`) also treats a `deck.json` or `notes.md`
+written in its mirror as a three-way merge: the edit is the difference from
+the version the bridge wrote that it differs from least, and only that is
+sent, so a script that rewrites the file from a stale copy no longer reverts
+what collaborators did since. Its own writes are serialised and recognised by
+content hash and file signature, so a watcher event never mistakes a write in
+flight for an edit.
 
 ## Getting this guide, from a deck folder
 
@@ -470,16 +653,82 @@ Diagnostics go to stderr. Exit codes are `0` ok, `1` error,
 | `capabilities [ids...]` | Every feature (or just the named ones), with a working example, screenshot and markup |
 | `context [deck]` | What is selected, what revision is the deck, is the editor live |
 | `new [deck] [--count <n>]` | A blank authoring page — no ids, no scope, so saving it only adds slides |
-| `inspect [deck] [--selected\|--slide id\|number\|--all] [--html\|--dom]` | Editable HTML for the slides it names (saving it can replace and delete them), or computed inspection data |
+| `inspect [deck] [--selected\|--slide id\|number\|a-b\|--all] [--html\|--dom]` | Editable HTML for the slides it names (saving it can replace and delete them), or computed inspection data |
 | `apply [deck] --html <file>` | Explicitly compile and sync an HTML range |
-| `render [deck] [--selected\|--slide id\|number\|--all] --output <dir> [--annotate] [--built] [--contact-sheet]` | Optional PNGs; `--contact-sheet` adds one tiled overview of everything rendered |
+| `render [deck] [--selected\|--slide id\|number\|a-b\|--all] --output <dir> [--annotate] [--built] [--contact-sheet]` | Optional PNGs; `--contact-sheet` adds a tiled overview of everything rendered, 48 slides to a sheet (`contactSheets` lists them when there are several) |
 | `preview [deck] [--port n] [--open]` | Export through the real player and serve on localhost; prints its URL as JSON, then blocks — run it in the background and give the user the URL |
 | `validate [deck]` | Schema, duplicate ids, timeline references, missing assets |
 | `asset import <deck> <paths...>` | Media copied into `assets/`, deduped, probed, transcoded |
 | `theme list\|show\|create\|delete\|choose\|apply [deck]` | The theme system: what is on offer, and writing, choosing and adopting one |
+| `chat [deck] [--since <id>]` | The deck's chat with the people in it (hosted decks only; see below) |
+| `chat [deck] --wait [--since <id>] [--timeout <s>]` | Blocks until a person writes `@agent`, then prints that message |
+| `say [deck] <text> [--slide <id\|number>]` | Posts to the chat as the agent |
 | `transaction apply <deck> <file.json>` | One atomic, named change |
+| `history [deck] [--deleted] [--slide <id>] [--limit <n>] [--full]` | A hosted deck's edit log: who changed what, when; `--deleted` with the full JSON of what was removed |
 
 The deck argument defaults to the current directory.
+
+`render` and `preview` export a scratch copy of the deck, with the media of the
+slides they show, into the OS temp folder (`$TMPDIR`, else `/tmp`), and remove
+it when they finish, fail or are stopped. If that folder is small or under a
+per-user quota (a tmpfs with `usrquota`, where `df` can still show free space),
+a render fails with "Disk quota exceeded writing <file> — …"; free space there
+or run with `TMPDIR` pointing at a disk with room. The PNGs themselves go to
+`--output`.
+
+### Comments and chat
+
+People leave you work in two places. **Comments** sit on a slide or an
+object, live inside `deck.json`, and are review state: `slide-agent comments
+--unresolved` at the start of a task, act on each, answer in its thread with
+`--add <text> --reply <id>` when there is something to say, then
+`--resolve <id>` (never delete). **Chat** is the running conversation about a hosted deck —
+"@agent can you tighten slide 4?" — and is deliberately *not* part of the
+document: the collab server keeps it per deck in `chat.jsonl` beside
+`deck.json` (append-only, one JSON message per line), and it never enters a
+transaction, undo or History. So chat needs the server: run the commands in
+the folder `slide-agent connect` mirrored (they read its
+`.deckwerk-mirror.json`), or name it with `--server <origin> --deck-id <id>`.
+In a mirror, `./deck chat` / `./deck say` are the same commands.
+
+A comment is a thread, as in TeXWerk: a root comment (no `parentId`) and the
+replies whose `parentId` names it; the root's `resolved` is the thread's, and
+a reply reopens a resolved thread. In the editor threads open only from the
+right-click menus (an object's, the slide background's, a rail row's); what
+stays on screen is an amber highlight on whatever carries an open thread, on
+the canvas and on the slide's rail row, and never in a presentation. A
+hosted thread's **Link** is `?deck=<id>&comment=<id>`, which opens the deck
+on that slide with the thread showing.
+
+Comments are review state, not content, and three rules keep them that way
+(`src/shared/comments.ts`): they change only through the `updateComments`
+operation, which carries the list it was made from and merges by comment id,
+so concurrent replies all land; `replaceElement`, `replaceSlide` and
+`setSlideProperties` keep the target's comments whatever they carry, so a
+drag or a retype can never carry a stale thread over a newer one, and
+`diffDecks` never puts comments in them; and undo, redo and History leave
+comments where they are.
+
+```bash
+slide-agent chat                          # everything, oldest first; prints "last"
+slide-agent chat --since chat-…           # only what came after that message
+slide-agent say "Done — slide 4 is two lines now." --slide 4
+slide-agent chat --wait                   # blocks until someone writes @agent
+slide-agent chat --wait --since chat-…    # …after that message (no gaps between waits)
+```
+
+`chat --wait` exits 0 with the message(s) that woke it, or 1 with
+`timedOut: true` after `--timeout` seconds (default: wait forever). Only a
+person's message wakes it, never an agent's. Loop on it with `--since` set
+to the `last` it printed, so a message posted between two waits is not
+lost. A person's `@agent` also shows up in their Agent panel when your
+bridge is connected. Messages you post are attributed as the agent; a
+`--slide` ref renders as a chip that jumps to the slide.
+
+Over HTTP the same thing is `GET /api/chat?deck=<id>[&since=<id>]` and
+`POST /api/chat?deck=<id>` with `{ "text", "slide"?: id|number }`, scoped and
+authorized exactly like `/api/comments` (viewers may read but not post). The
+long poll is `GET /api/chat?deck=<id>&wait=1&since=<id>[&mention=agent][&timeout=ms]`.
 
 ### Repair import gaps
 
@@ -488,6 +737,8 @@ For each gap, export its slide with `inspect --html --slide <id|number>`, replac
 conspicuous `data-element="unsupported"` placeholder with real HTML, and save.
 The replacement becomes an editable text, media, shape, or HTML object on the
 way back; a clean `importGaps: []` confirms that the repair loop is complete.
+An HTML region a compile fell back to (`originalType: "html"`, its reason in
+`note`) is listed too; one you declared with `data-element="html"` is not.
 
 ### Make or change a theme
 
@@ -566,9 +817,12 @@ required.
 
 `live` tells you which world you are in:
 
-- **`live: true`** — the editor is open. Its in-memory deck is the real
-  document, `deckRevision` is that deck's hash (which may lead `diskRevision`
-  by an autosave), and transactions are applied by the editor itself.
+- **`live: true`** — the editor is open, or a collaboration server hosts the
+  deck. Its in-memory deck is the real document, `deckRevision` is that
+  deck's hash (which may lead `diskRevision` by an autosave), and
+  transactions are applied by the editor or the server itself. A hosted deck
+  also reports `hostedBy` (the server) and `hostedDeckId`; the selection is
+  that of the person in it.
 - **`live: false`** — no editor. `deck.json` is the document. Any selection
   shown is a *hint* recovered from the last session's sidecar, filtered to ids
   that still exist; `stale: true` means that sidecar was left behind by an app
@@ -577,6 +831,20 @@ required.
 The sidecar lives in `~/.deckwerk/runtime/<deck>-<hash>/`, never in the
 deck folder — it is ephemeral state, not part of the document, and it stays out
 of git.
+
+**A deck on a collaboration server is never edited on disk.** A server
+writes `.deckwerk-server.json` at the root of the folder it serves (on this
+machine, `/srv/deckwerk/decks`), and `slide-agent` run on a deck folder under
+it — `context`, `apply --html`, `transaction apply` and everything built on
+it, `history --restore` — sends its change to the server, which applies it
+as a transaction in the live session: everyone in the deck sees it land, it
+is in their History, and nothing anybody is typing is lost. Writing
+`deck.json` beside a running server raced its autosave: while someone typed,
+the change was written over and still reported as applied. If the server is
+running but does not answer, `slide-agent` says so and changes nothing.
+Anything else that writes `deck.json` there (a script, git) is merged into
+the live deck; a change to an object someone is editing at that moment
+loses to theirs, and the file as written stays in the deck's versions.
 
 ### Computed scenes, for inspection rather than authoring
 
@@ -591,7 +859,8 @@ slide-agent inspect ~/talks/millivid --selected
 
 Each element carries:
 
-- `authored` — the geometry in `deck.json` (`x, y, w, h, rot, z, opacity`).
+- `authored` — the geometry in `deck.json` (`x, y, w, h, rot, z, opacity`,
+  and `flipX` / `flipY` when set).
 - `rendered` — the measured box, relative to the slide's top-left. `null` when
   no editor was running to measure it.
 - `computedStyle` — resolved typography and colour, merged across the element
@@ -621,7 +890,8 @@ slide-agent render ~/talks/millivid --selected \
 `--annotate` outlines every object and labels it with its element id, marking
 the selection in red. `--built` fires every build so the finished slide is
 captured rather than its opening state. Renders go through the same player the
-projector runs, and need `npm run build:export` once.
+projector runs, built from this checkout's own sources: the first render after
+a code change takes a second or two longer while it builds.
 
 ### Change the deck with a transaction — the fallback path
 
@@ -660,7 +930,7 @@ Operations, applied in array order:
 | `replaceSlide` | Replace a slide wholesale, including its `timeline` |
 | `deleteSlide` | Remove a slide (a deck must keep at least one) |
 | `moveSlide` | Move a slide after `afterSlideId` (`null` = to the start) |
-| `insertElements` | Append elements to a slide |
+| `insertElements` | Add elements to a slide: after `afterElementId`, first when it is `null`, appended when it is omitted |
 | `replaceElement` | Replace one element; its `id` must not change |
 | `deleteElements` | Remove elements and any timeline entries referencing them |
 | `updateDeck` | `title`, `morphEasing` |
@@ -729,6 +999,11 @@ slide-agent inspect $DECK --slide results      # confirm the result
   through `theme create` and `theme apply`). Editing a default changes what new
   slides are born with; existing slides keep their size until the theme is
   applied to them. Layout masters never carry a size.
+- `line-height` is a unitless ratio of the font size wherever a deck stores
+  it (element `style`, `contentStyle`, inline styles in text `html`), so lines
+  follow every change of size, auto-fit's included. A px, em or % value is
+  converted on parse and on HTML import (`src/shared/lineHeight.ts`); write
+  `line-height: 1.3`, never `line-height: 42px`.
 - A deck may carry its own theme presets in `deck.json` (`customThemes`), which
   resolve everywhere a built-in preset id does. Write them with
   `slide-agent theme create`, never by hand.
@@ -790,6 +1065,14 @@ guards. These rules keep the seams closed:
   real-input test that proves it (see the `*Bugs.test.ts` suites for the
   conventions: real CDP key/pointer input, soundness controls, `// BUG:`
   markers while red).
+- **Import fixes land on the reference decks.** A Keynote import bug gets a
+  named slide in `test/fixtures/keynote/make_reference.py` (regenerate
+  `reference.key` with the importer venv; the output is byte-stable) and a
+  block in `test/keynoteReference.test.ts`; PowerPoint bugs go into
+  `test/fixtures/pptx/`. Rebuild the archive shapes the real deck used with
+  neutral content, never a slide of an actual talk, and never a test that
+  skips without a private deck. `npm run test:importers` runs them; it is
+  part of the required CI job.
 - **Text-edit session rules** (all guarded by tests — breaking one turns a
   suite red, but know why): commit targets resolve by element id deck-wide,
   never through `slideIndex` at fire time; a formatting/list/table commit
@@ -797,8 +1080,13 @@ guards. These rules keep the seams closed:
   mid-IME-composition; `authoredTextHtml` must strip every piece of
   editor-only chrome the session stamps on the DOM; everything
   `beginTextEdit` sets on a node, `commitTextEdit` removes.
-- **Collab editing rules:** the element being edited adopts remote html when
-  nothing local is unsent (`adoptRemoteEditedHtml`); commits never re-assert
+- **Collab editing rules:** the element being edited adopts remote html,
+  merged three ways with any unsent local keystrokes and with the caret
+  carried through the change, never left at the same numeric offset
+  (`adoptRemoteEditedHtml`, `textMerge.ts`); a text box's live-sync push
+  carries the html it was edited from (`replaceElement.baseHtml`), so pushes
+  that cross in flight merge rather than the later one wiping the earlier
+  one's characters (two people typing in one box); commits never re-assert
   a stale DOM over a store that moved past the session's sync point; remote
   decks landing mid-transaction are rebased, not applied
   (`applyRemote`/`txnBase`); a rebuild that ends an edit session re-enters it
@@ -809,6 +1097,22 @@ guards. These rules keep the seams closed:
 - **Harness recoveries are findings.** Test helpers that repair lost
   selections/sessions must record it (`recordRecovery`) — a silent retry hides
   exactly the bug class these suites exist to catch.
+- **Leaving a box changes nothing on it.** A box that stops being edited is
+  drawn again from what was stored, and whatever normalisation did on the way
+  must not show. Markup checks cannot see this (an empty bullet is sound
+  markup), so the list fuzz compares the painted lines before and after every
+  way out — Escape, bare slide, another box — with `seenLines` /
+  `seenDifference` (`test/support/listEditingSession.ts`). An item that only
+  holds an indented list carries `data-list-holder` and draws no line.
+
+- **Nothing on the collab server's event loop scales with the deck.** Every
+  room shares one loop, so a whole-deck stringify, parse or encode is a pause
+  in everyone's typing (a 23 MB deck once stalled it 120 ms per autosave).
+  Saves go through `DeckSerializer` (re-serialises only what an edit
+  replaced), whole-deck messages through `DeckWire`, versions through the
+  sliced, thread-pool writer. `test/collabStalls.test.ts` drives people and
+  agents against a 20 MB deck and fails on any block over 50 ms;
+  `STALL_TEST_DECK=<folder>` runs it against a copy of a real deck.
 
 **OS-event input smoke tier** (`npm run test:osinput`,
 `test/osInputSmokeBrowser.test.ts` + `test/support/osInput.ts`): every other

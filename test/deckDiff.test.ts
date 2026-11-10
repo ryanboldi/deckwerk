@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { emptyDeck, parseDeck, type Deck, type Slide, type SlideElement } from '../src/shared/deck.js';
 import { diffDecks } from '../src/shared/deckDiff.js';
 import { applyOpsLenient } from '../src/shared/collabApply.js';
-import { applyAgentTransaction, AGENT_PROTOCOL_VERSION } from '../src/shared/agent.js';
+import { applyAgentOperations, applyAgentTransaction, AGENT_PROTOCOL_VERSION } from '../src/shared/agent.js';
 import { createHash } from 'node:crypto';
 
 function textElement(id: string, overrides: Partial<SlideElement> = {}): SlideElement {
@@ -86,6 +86,26 @@ describe('diffDecks round-trips', () => {
     next.slides[0].elements.splice(1, 1); // delete e2
     next.slides[1].elements.push(textElement('e4')); // insert e4
     expectRoundTrip(prev, next);
+  });
+
+  it('puts re-added elements back in their place in the array, not at the end', () => {
+    // Objects of equal z paint in array order, so an undone delete that came
+    // back at the end of the array jumped in front of what it used to sit
+    // behind — and the redo of the delete left it there.
+    const order = (deck: Deck) => deck.slides.map((entry) => entry.elements.map((element) => element.id));
+    const full = deckWith(slide('s1', ['a', 'b', 'c', 'd', 'e', 'f']));
+    const thinned = structuredClone(full);
+    thinned.slides[0].elements = thinned.slides[0].elements.filter((element) => !['a', 'c', 'd', 'f'].includes(element.id));
+    // Undo of the delete, as both the collab layer and the local store apply it.
+    const back = diffDecks(thinned, full);
+    expect(order(applyOpsLenient(thinned, back).deck)).toEqual(order(full));
+    expect(order(applyAgentOperations(thinned, back))).toEqual(order(full));
+    // Into an empty slide, and after an anchor that has since gone (lenient).
+    const empty = deckWith(slide('s1'));
+    expect(order(applyOpsLenient(empty, diffDecks(empty, full)).deck)).toEqual(order(full));
+    const withoutB = structuredClone(thinned);
+    withoutB.slides[0].elements = withoutB.slides[0].elements.filter((element) => element.id !== 'b');
+    expect(order(applyOpsLenient(withoutB, back).deck)).toEqual([['a', 'e', 'f', 'c', 'd']]);
   });
 
   it('diffs slide property changes without touching elements', () => {
@@ -288,5 +308,22 @@ describe('applyOpsLenient merge rules', () => {
       diffDecks(base, second),
     ).deck;
     expect(result.slides[0].elements[0].x).toBe(2);
+  });
+});
+
+describe('replacing every slide', () => {
+  // A deck may not pass through having no slides: deleting the only slide
+  // before inserting its replacement was refused, leaving both.
+  it('inserts the new slides before deleting the last old one', () => {
+    const prev = deckWith(slide('old'));
+    const next = deckWith(slide('new-1'), slide('new-2'));
+    const ops = diffDecks(prev, next);
+    expect(applyOpsLenient(prev, ops).deck).toEqual(next);
+    expect(applyAgentOperations(prev, ops)).toEqual(next);
+  });
+
+  it('still deletes first when some slide survives', () => {
+    const ops = diffDecks(deckWith(slide('a'), slide('b')), deckWith(slide('b'), slide('c')));
+    expect(ops.map((op) => op.op)).toEqual(['deleteSlide', 'insertSlides']);
   });
 });

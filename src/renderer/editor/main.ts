@@ -2,13 +2,16 @@ import '../player/player.css';
 import '../appChrome.css';
 import './editor.css';
 import '../collab/collab.css';
-import { applyAgentTransaction } from '@shared/agent.js';
+import '../lightTheme.css';
+import { applyUiTheme } from '../uiTheme.js';
+import { applyUiScale } from '../uiScale.js';
+import { applyAgentOperations, applyAgentTransaction, type AgentOperation } from '@shared/agent.js';
 import type { Deck, SlideElement } from '@shared/deck.js';
 import { emptyDeck } from '@shared/deck.js';
 import type { AgentSessionConnection, AuthoredHtmlFile, PresentationImportResult } from '@shared/ipc.js';
 import { captureEditorView, decodeEditorView, restoreEditorView } from '@shared/editorView.js';
 import { setIdSuffix } from '@shared/geometry.js';
-import { adoptAuthoredIds, describeHtmlSync, htmlSyncSummary } from '@shared/htmlSlides.js';
+import { adoptAuthoredIds, describeHtmlSync, htmlSyncSummary, pageStampOf, stampPage } from '@shared/htmlSlides.js';
 import { rangeForSlideSelection } from '@shared/presentationRange.js';
 import {
   themeById,
@@ -23,13 +26,17 @@ import { AgentPanel } from './agentPanel.js';
 import { createDeckWerkButton } from './aboutDialog.js';
 import { showEditorThemeDialog } from './editorThemeDialog.js';
 import { installEditorTheme } from '../editorTheme.js';
+import { installUpdates } from './updateDialog.js';
 import { trackPreviewFrameRecovery } from '../player/previewFrameRecovery.js';
-import { EditorCanvas } from './canvas.js';
+import { CANVAS_NOTICE_EVENT, EditorCanvas } from './canvas.js';
 import { CssEditor } from './cssEditor.js';
 import { Inspector } from './inspector.js';
 import { HistoryPanel } from './historyPanel.js';
+import { ObjectList } from './objectList.js';
+import { MediaPanel, installMediaDrop } from './mediaPanel.js';
 import { authoredHtmlSync, fileName } from './htmlCompile.js';
-import { createShapeInsertPicker, createTableInsertPicker, insertText } from './elementCreation.js';
+import { createPenButton, createShapeInsertPicker, createTableInsertPicker, insertText } from './elementCreation.js';
+import { insertCode } from './codeInspector.js';
 import { createToolbarPicker, createToolbarSplitButton } from './exportPicker.js';
 import { showPdfExportDialog } from './pdfExportDialog.js';
 import { showWebExportDialog } from './webExportDialog.js';
@@ -40,8 +47,7 @@ import { persistSessionDeck } from './sessionPersistence.js';
 import { createThemePanel } from './themePanel.js';
 import {
   barButton,
-  barIconButton,
-  TEXT_ICON,
+  createTextInsertPicker,
   bindEditorKeys,
   createClipboardActions,
   makeContextActions,
@@ -49,9 +55,11 @@ import {
   type ShellDeps,
 } from './shellWiring.js';
 import { SlideRail } from './slideRail.js';
+import { createHistoryButton, createMediaButton, popoverPanelHost } from './toolbarPanels.js';
 import { installWindowApiPosterProvider } from '../player/previewPosterProvider.js';
 import { EditorStore } from './store.js';
 import { statusBarText } from './statusBar.js';
+import { BuildPreview } from './buildPreview.js';
 import { TimelinePanel } from './timelinePanel.js';
 import { WelcomeScreen } from './welcomeScreen.js';
 import { CollabBridge } from '../collab/collabBridge.js';
@@ -60,8 +68,18 @@ import { openEndCollaborationPopover } from '../collab/endCollaborationPopover.j
 import { setRenderInvariantChecks } from './renderInvariants.js';
 import { setSelectionInvariantChecks } from './selectionInvariants.js';
 import { SpeakerNotesDrawer } from './speakerNotesDrawer.js';
+import { CanvasRulers, isRulersShortcut, toggleRulers } from './rulers.js';
+import { LightTable } from './lightTable.js';
 import { applySpeakerNotes } from '@shared/speakerNotes.js';
 import { installResponsiveToolbar } from './responsiveToolbar.js';
+import { setSlideColorSource } from './colorPicker.js';
+import { slideColors } from '@shared/slideColors.js';
+import type { RemoteDeckBinding } from '@shared/ipc.js';
+import { showOpenDialog, type OpenChoice } from './openDialog.js';
+import { reconcileOffline } from './remoteSync.js';
+
+applyUiTheme();
+applyUiScale();
 
 /**
  * Editor shell: wires the panels to one store, owns the toolbar, the keyboard
@@ -79,6 +97,8 @@ const el = <T extends HTMLElement>(id: string): T => {
 if (navigator.userAgent.includes('Macintosh')) document.body.classList.add('mac-titlebar');
 
 const store = new EditorStore(emptyDeck());
+// The colour picker offers the colours already on the slide being edited.
+setSlideColorSource(() => slideColors(store.slide));
 // Rail and Morph thumbnails take their poster frames from the main process, so
 // this window never opens a video pipeline for a preview (see posterCache.ts).
 installWindowApiPosterProvider();
@@ -123,10 +143,14 @@ const initialView = decodeEditorView(new URLSearchParams(location.search).get('v
 let initialViewPending = initialView !== null;
 // Development builds verify after every in-place patch that the canvas DOM
 // still matches a fresh render of the deck, and report any property the two
-// paths disagree about. See renderInvariants.ts.
-setRenderInvariantChecks(import.meta.env.DEV);
+// paths disagree about. See renderInvariants.ts. The test builds turn it on
+// too (VITE_RENDER_INVARIANTS), so the fuzz walks fail on what it reports.
+setRenderInvariantChecks(import.meta.env.DEV || import.meta.env.VITE_RENDER_INVARIANTS === '1');
 setSelectionInvariantChecks(import.meta.env.DEV);
 const canvas = new EditorCanvas(el('canvas'), store);
+el('canvas').addEventListener(CANVAS_NOTICE_EVENT, (event) => {
+  setStatusMessage((event as CustomEvent<string>).detail);
+});
 // A presentation window occludes this one, and a hidden page's media buffers
 // are Chromium's to reclaim -- closing Present used to leave canvas, rail and
 // Morph previews black until something happened to touch them.
@@ -140,10 +164,42 @@ new SpeakerNotesDrawer(el('canvas'), store, {
   onInsetChange: (px) => canvas.setBottomInset(px),
   onStatus: setStatusMessage,
 });
+new CanvasRulers(el('canvas'), canvas, store, { shortcutHint: 'Cmd/Ctrl+R' });
+new LightTable(el('canvas'), canvas, store);
+// Cmd/Ctrl+R shows and hides the rulers, as in Keynote, wherever focus is --
+// in the capture phase, because a text box being edited keeps its keys to
+// itself. Taking it also keeps Electron's default menu from reloading the
+// window on it; Cmd/Ctrl+Shift+R still force-reloads.
+window.addEventListener('keydown', (event) => {
+  if (!isRulersShortcut(event)) return;
+  event.preventDefault();
+  if (!event.repeat) toggleRulers();
+}, true);
 const inspector = new Inspector(el('inspector'), store);
-new TimelinePanel(el('timeline'), store);
-new HistoryPanel(el('history'), store);
+new TimelinePanel(el('timeline'), store, new BuildPreview(canvas, store));
+// History is the deck's past, not the selection's: it opens from the deck
+// name in the toolbar rather than from a sidebar tab.
+const historyHost = popoverPanelHost('history');
+new HistoryPanel(historyHost, store);
+// The deck's media library opens from Media on the Insert bar: reusing a file
+// is inserting it, so it sits with Text, Shape and Table rather than in a tab.
+const mediaHost = popoverPanelHost('media');
+const mediaPanel = new MediaPanel(mediaHost, store, {
+  setStatusMessage,
+  beginOperation: (message) => operationProgress.begin(message),
+});
+installMediaDrop(el('canvas'), store, mediaPanel);
 const rail = new SlideRail(el('rail'), store);
+rail.onStatus = setStatusMessage;
+// The slide's objects, from a floating icon in the canvas's top-left corner,
+// as the speaker notes open from the bottom-left one: a drawer over the canvas
+// rather than a column of its own.
+const objectsDrawer = document.createElement('div');
+objectsDrawer.id = 'objects';
+objectsDrawer.className = 'objects-drawer';
+const objectList = new ObjectList(objectsDrawer, store);
+objectList.toggle.classList.add('objects-toggle');
+el('canvas').append(objectList.toggle, objectsDrawer);
 const editorBody = el('body');
 const railDivider = document.createElement('div');
 railDivider.className = 'panel-resize-divider panel-resize-rail';
@@ -176,12 +232,19 @@ let agentSessionBridge: CollabBridge | null = null;
 let agentSessionReady = false;
 let agentSessionWsUrl: string | null = null;
 let agentPresence: PresenceOverlay | null = null;
-let activeSessionMode: 'agent' | 'collaboration' | null = null;
+let activeSessionMode: 'agent' | 'collaboration' | 'remote' | null = null;
+/** The server deck this window's folder mirrors, while one is open (remoteDecks.ts). */
+let remoteBinding: RemoteDeckBinding | null = null;
+let remoteChip: HTMLButtonElement | null = null;
+let remoteConnected = false;
+let remoteProblem: string | null = null;
 let collaborateButton: HTMLButtonElement | null = null;
 const persistThemeCss = (css: string): Promise<void> | void => {
   if (agentSessionReady && agentSessionBridge) {
     agentSessionBridge.sendTheme(css);
-    return;
+    // A server deck's mirror keeps its own theme.css too: it is what opens
+    // offline, and the base of the next merge.
+    if (!remoteBinding) return;
   }
   return window.api.saveTheme(css);
 };
@@ -227,7 +290,11 @@ function queueAgentSessionSnapshot(): void {
 }
 const welcome = new WelcomeScreen(el('canvas'), {
   newPresentation,
-  openPresentation,
+  openPresentation: () => openPresentation(),
+  openFromServer: async () => {
+    const servers = await window.api.remoteServers().catch(() => []);
+    await openPresentation(servers.length > 0 ? {} : { start: 'connect' });
+  },
   importKeynote: importKeynotePresentation,
   importPowerPoint: importPowerPointPresentation,
 });
@@ -276,7 +343,7 @@ window.api.onAgentRequest?.((request) => void agent.handle(request));
  * the user. The theme comes from the editor rather than from disk, so slides
  * are measured against the typography currently on screen.
  */
-window.api.onHtmlEdit?.((file) => void applyHtmlEdit(file).catch(() => undefined));
+window.api.onHtmlEdit?.((file) => void applyHtmlEdit(file, { watched: true }).catch(() => undefined));
 // notes.md saved outside the editor: the file is the whole set of notes, so
 // apply it to every slide as one undoable edit. The autosave that follows
 // rewrites deck.json and the file itself in normalised form.
@@ -303,16 +370,32 @@ let htmlEditQueue: Promise<unknown> = Promise.resolve();
  */
 const lastHtmlSync = new Map<string, { contents: string; outcome: HtmlSyncOutcome }>();
 
+/**
+ * New slides a watched save added at the end, per file, with the page as it
+ * was saved and as it was stamped: no `apply --after` has said where they go
+ * yet. An agent writes the page with one tool and runs apply with the next,
+ * so the watcher has nearly always synced the save by the time apply asks.
+ */
+const unplacedHtml = new Map<string, { contents: Set<string>; ids: string[]; outcome: HtmlSyncOutcome }>();
+
 function applyHtmlEdit(
   file: AuthoredHtmlFile,
-  options: { after?: string | null; label?: string } = {},
+  options: { after?: string | null; label?: string; watched?: boolean } = {},
 ): Promise<HtmlSyncOutcome> {
   // Serialised: two saves in flight would compile against the same deck and
   // the second would apply operations built from a deck that no longer exists.
   const run = htmlEditQueue.then(async (): Promise<HtmlSyncOutcome> => {
     const name = fileName(file.path);
+    const unplaced = unplacedHtml.get(file.path);
+    if (unplaced && options.after !== undefined && unplaced.contents.has(file.contents)) {
+      const outcome = await placeSyncedSlides(name, unplaced, options.after);
+      unplacedHtml.delete(file.path);
+      return outcome;
+    }
     const previous = lastHtmlSync.get(file.path);
     if (previous && previous.contents === file.contents) return previous.outcome;
+    /** The page as stamped with the ids this sync assigned, if it was. */
+    let stampedContents: string | null = null;
     try {
       const outcome = await runOperation(`Compiling ${name}…`, async (operation): Promise<HtmlSyncOutcome> => {
         // Compiling takes a moment, and the user may edit during it. The
@@ -328,11 +411,13 @@ function applyHtmlEdit(
             options,
           );
           if (store.get().deck !== deck) continue;
-          // Inline style the browser's parser dropped would otherwise vanish
-          // silently: the page measured without it, yet the apply reads as clean.
+          // Inline style the browser's parser dropped, or maths a `<` cut
+          // short, would otherwise vanish silently: the page measured without
+          // it, yet the apply reads as clean.
           const warned = warnings.length === 0 ? ''
-            : ` — ${warnings.length} style warning${warnings.length === 1 ? '' : 's'}: ${warnings[0]}`;
+            : ` — ${warnings.length} warning${warnings.length === 1 ? '' : 's'}: ${warnings[0]}`;
           const summarise = (message: string, operations: typeof transaction extends null ? never : NonNullable<typeof transaction>['operations'] | []): HtmlSyncOutcome => ({
+            stamp: pageStampOf(slides),
             changes: htmlSyncSummary(operations),
             slides: slides.map((slide) => ({
               id: slide.id,
@@ -349,9 +434,12 @@ function applyHtmlEdit(
           store.replaceWithHistory(applyAgentTransaction(deck, transaction), transaction.label);
           await save();
           // Stamp the ids this compile assigned back into the file, so saving it
-          // again replaces these slides rather than inserting them a second time.
-          const adopted = adoptAuthoredIds(file.contents, slides);
+          // again replaces these slides rather than inserting them a second time
+          // — and what the page now says, which its next save is compared with.
+          const stampedPage = stampPage(adoptAuthoredIds(file.contents, slides) ?? file.contents, pageStampOf(slides));
+          const adopted = stampedPage === file.contents ? null : stampedPage;
           if (adopted) {
+            stampedContents = adopted;
             operation.update(`Writing assigned slide ids to ${name}`);
             // Main only writes inside edit/; a file elsewhere (an agent's
             // drafts/ page applied through the CLI) is stamped by the CLI from
@@ -373,6 +461,13 @@ function applyHtmlEdit(
         throw new Error(`${name}: the deck kept changing while it compiled — save it again`);
       });
       lastHtmlSync.set(file.path, { contents: file.contents, outcome });
+      const { inserted, replaced, deleted, moved } = outcome.changes;
+      if (options.watched && inserted.length > 0 && replaced.length === 0 && deleted.length === 0) {
+        unplacedHtml.set(file.path, { contents: new Set([file.contents, stampedContents ?? file.contents]), ids: inserted, outcome });
+      } else if (inserted.length + replaced.length + deleted.length + moved > 0) {
+        // The page was saved again with changes: those slides are its own now.
+        unplacedHtml.delete(file.path);
+      }
       setStatusMessage(outcome.message);
       return outcome;
     } catch (err) {
@@ -385,7 +480,38 @@ function applyHtmlEdit(
   return run;
 }
 
+/**
+ * Move the slides a watched save added at the end to where an apply that came
+ * after it says they go — where the apply would have put them had it come
+ * first. `after` is a slide id, or null for "first".
+ */
+async function placeSyncedSlides(
+  name: string,
+  unplaced: { ids: string[]; outcome: HtmlSyncOutcome },
+  after: string | null,
+): Promise<HtmlSyncOutcome> {
+  const deck = store.get().deck;
+  const ids = unplaced.ids.filter((id) => deck.slides.some((slide) => slide.id === id));
+  if (after !== null && (ids.includes(after) || !deck.slides.some((slide) => slide.id === after))) {
+    throw new Error(`${name} was already saved and its slides added at the end; there is no slide ${after} to put them after`);
+  }
+  const order = deck.slides.map((slide) => slide.id).filter((id) => !ids.includes(id));
+  const at = after === null ? 0 : order.indexOf(after) + 1;
+  order.splice(at, 0, ...ids);
+  if (ids.length > 0 && order.join() !== deck.slides.map((slide) => slide.id).join()) {
+    const operations: AgentOperation[] = ids.map((id, index) => ({
+      op: 'moveSlide', slideId: id, afterSlideId: index === 0 ? after : ids[index - 1],
+    }));
+    const label = `Place ${ids.length === 1 ? 'the new slide' : 'the new slides'} from ${name}`;
+    store.replaceWithHistory(applyAgentOperations(deck, operations), label);
+    await save();
+    setStatusMessage(`${label} after ${after ?? 'the start'}`);
+  }
+  return unplaced.outcome;
+}
+
 /* --- toolbar --- */
+
 
 let deckNameLabel: HTMLElement | null = null;
 
@@ -433,7 +559,10 @@ function buildToolbar(): void {
   ];
   fileActions.append(
     barButton('New', newPresentation),
-    barButton('Open', openPresentation),
+    createToolbarSplitButton('Open', () => void openPresentation(), [
+      { label: 'Open Folder…', action: () => void openLocalPresentation() },
+      { label: 'Connect to Server…', action: () => void openPresentation({ start: 'connect' }) },
+    ], { menuLabel: 'Open options' }),
     createToolbarPicker('Import…', importEntries),
     createToolbarPicker('Save As…', saveEntries, { deckOnly: true }),
   );
@@ -442,7 +571,8 @@ function buildToolbar(): void {
       label: 'Presentation',
       options: [
         { label: 'New', action: newPresentation },
-        { label: 'Open…', action: openPresentation },
+        { label: 'Open…', action: () => void openPresentation() },
+        { label: 'Connect to Server…', action: () => void openPresentation({ start: 'connect' }) },
       ],
     },
     { label: 'Import', options: importEntries },
@@ -456,9 +586,18 @@ function buildToolbar(): void {
     },
   ], { deckOnly: true });
   compactFile.classList.add('toolbar-compact-file-action');
+  remoteChip = document.createElement('button');
+  remoteChip.type = 'button';
+  remoteChip.className = 'remote-status';
+  remoteChip.hidden = true;
+  remoteChip.addEventListener('click', () => {
+    if (!remoteConnected) agentSessionBridge?.reconnectNow();
+  });
   left.append(
     createDeckWerkButton(),
     deckNameLabel,
+    remoteChip,
+    createHistoryButton(historyHost),
     barDivider(),
     fileActions,
     compactFile,
@@ -467,9 +606,15 @@ function buildToolbar(): void {
   const mid = document.createElement('div');
   mid.className = 'bar-group deck-only bar-center';
   mid.append(
-    barIconButton('Text', TEXT_ICON, () => addText()),
+    createTextInsertPicker({
+      textBox: () => addText(),
+      // A starter listing, selected, so typing replaces it.
+      codeBlock: () => { canvas.beginCodeEdit(insertCode(store).id, 'all'); },
+    }),
     createShapeInsertPicker(store),
+    createPenButton(canvas),
     createTableInsertPicker(store),
+    createMediaButton(mediaHost),
   );
 
   const right = document.createElement('div');
@@ -569,6 +714,19 @@ async function exportPdf(): Promise<void> {
     if (result) setStatusMessage(`PDF saved to ${result}`);
   } catch (err) {
     setStatusMessage(`PDF export failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/** "Download original…": the dropped file, copied wherever the author picks. */
+async function saveOriginalAsset(src: string): Promise<void> {
+  try {
+    const saved = await runOperation('Preparing download…', async (operation) => {
+      operation.update('Waiting for a destination');
+      return window.api.saveOriginalAsset(src, operation.id);
+    });
+    if (saved) setStatusMessage(`Saved the original to ${saved}`);
+  } catch (err) {
+    setStatusMessage(`Download failed: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -678,6 +836,8 @@ el('canvas').addEventListener('mouseleave', clearCollaborationCursor);
 
 function refreshCollaborationControl(): void {
   if (!collaborateButton) return;
+  // A server deck is already shared: everyone on the server edits it.
+  collaborateButton.hidden = activeSessionMode === 'remote';
   const sharing = activeSessionMode === 'collaboration';
   collaborateButton.textContent = sharing ? 'End collaboration' : 'Collaborate';
   collaborateButton.classList.toggle('danger', sharing);
@@ -787,6 +947,239 @@ function disconnectAgentSession(): void {
   agentPresence = null;
   rail.presenceForSlide = undefined;
   rail.refreshPresence();
+  if (remoteBinding) canvas.liveTextSync = false;
+  remoteBinding = null;
+  remoteConnected = false;
+  remoteProblem = null;
+  if (remoteSaveTimer) clearTimeout(remoteSaveTimer);
+  remoteSaveTimer = null;
+  renderRemoteChip();
+}
+
+/* --- server decks: a mirror folder kept in sync, editable offline --- */
+
+let remoteSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let lastRemoteBaseline: { deck: Deck; themeCss: string; seq: number } | null = null;
+
+/** Written after the deck.json it belongs with, in the same queue. */
+function queueRemoteBaseline(dir: string, baseline: { deck: Deck; themeCss: string; seq: number }): Promise<void> {
+  if (lastRemoteBaseline && lastRemoteBaseline.deck === baseline.deck
+    && lastRemoteBaseline.themeCss === baseline.themeCss && lastRemoteBaseline.seq === baseline.seq) {
+    return Promise.resolve();
+  }
+  const next = mainSessionPersistence
+    .catch(() => {})
+    .then(() => window.api.saveRemoteBaseline(dir, baseline))
+    .then(() => { lastRemoteBaseline = baseline; });
+  mainSessionPersistence = next;
+  return next;
+}
+
+/**
+ * A server deck changed under the mirror (a collaborator's edit, a merge):
+ * write the mirror and its baseline soon, as an edit here would be. Without
+ * it a quit right after would reopen a deck.json older than its baseline,
+ * and the next merge would read the difference as edits made here.
+ */
+function scheduleRemotePersist(): void {
+  if (!remoteBinding) return;
+  if (remoteSaveTimer) clearTimeout(remoteSaveTimer);
+  remoteSaveTimer = setTimeout(() => {
+    remoteSaveTimer = null;
+    void save({ flushHistory: false }).catch((error) => {
+      console.error('Could not save the server deck copy:', error);
+    });
+  }, 800);
+}
+
+function renderRemoteChip(): void {
+  if (!remoteChip) return;
+  if (!remoteBinding) {
+    if (!remoteChip.hidden) remoteChip.hidden = true;
+    return;
+  }
+  const unsent = agentSessionBridge?.unconfirmed ?? 0;
+  const server = remoteBinding.serverName;
+  let state: 'online' | 'offline' | 'error' | 'syncing';
+  let text: string;
+  if (remoteProblem) {
+    state = 'error';
+    text = `${server}: ${remoteProblem}`;
+  } else if (agentSessionBridge?.isReconciling) {
+    state = 'syncing';
+    text = `${server} · merging`;
+  } else if (remoteConnected) {
+    state = unsent > 0 ? 'syncing' : 'online';
+    text = unsent > 0 ? `${server} · syncing` : `${server} · synced`;
+  } else {
+    state = 'offline';
+    // Unsent transactions are not a count anyone thinks in (live typing sends
+    // several per word), so say what matters: there is work waiting here.
+    text = unsent > 0 ? 'Offline · edits kept on this computer' : 'Offline';
+  }
+  // Runs on every store emit (renderStatus): touch the DOM only for a change.
+  if (remoteChip.hidden) remoteChip.hidden = false;
+  if (remoteChip.dataset.state !== state) remoteChip.dataset.state = state;
+  if (remoteChip.textContent !== text) remoteChip.textContent = text;
+  const title = remoteConnected
+    ? `Editing ${remoteBinding.deckId} on ${remoteBinding.server}. Changes sync live.`
+    : `${remoteBinding.deckId} on ${remoteBinding.server}. Edits are kept on this computer and sync when the server is reachable — click to retry now.`;
+  if (remoteChip.title !== title) remoteChip.title = title;
+}
+
+/** Fetch what the server deck refers to that the mirror lacks, and redraw what was missing it. */
+async function fetchRemoteAssets(deck: Deck): Promise<void> {
+  const binding = remoteBinding;
+  if (!binding) return;
+  const fetched = await window.api.fetchRemoteAssets(binding.dir, deck).catch(() => [] as string[]);
+  if (fetched.length === 0 || remoteBinding !== binding) return;
+  canvas.forceRedraw();
+  rail.redrawThumbnails();
+}
+
+let lastAssetCheck: Deck | null = null;
+function noteRemoteDeck(deck: Deck): void {
+  scheduleRemotePersist();
+  // Cheap to ask; main checks the files. One question per new deck object.
+  if (deck === lastAssetCheck) return;
+  lastAssetCheck = deck;
+  void fetchRemoteAssets(deck);
+}
+
+/** After any deck is adopted: if its folder mirrors a server deck, go live. */
+async function attachRemoteDeck(dir: string): Promise<void> {
+  let binding: RemoteDeckBinding | null = null;
+  try {
+    binding = await window.api.remoteBinding(dir);
+  } catch (error) {
+    console.error('Could not read the server deck binding:', error);
+  }
+  if (store.get().dir !== dir) return;
+  if (!binding) {
+    if (remoteBinding) disconnectAgentSession();
+    return;
+  }
+  connectRemoteDeck(binding);
+}
+
+function connectRemoteDeck(binding: RemoteDeckBinding): void {
+  disconnectAgentSession();
+  activeSessionMode = 'remote';
+  refreshCollaborationControl();
+  remoteBinding = binding;
+  lastRemoteBaseline = null;
+  // Typing streams to collaborators as it happens, and theirs merges into a
+  // box being edited here — the browser client's text path.
+  canvas.liveTextSync = true;
+  agentPresence = new PresenceOverlay(canvas, store);
+  rail.presenceForSlide = (slideId) => agentPresence?.peersOnSlide(slideId) ?? [];
+  const live = () => agentSessionBridge === bridge;
+
+  const bridge = new CollabBridge(binding.wsUrl ?? 'ws://127.0.0.1:9/unavailable', binding.name, {
+    onWelcome: (welcome) => {
+      if (!live()) return;
+      setIdSuffix(welcome.clientId.slice(0, 4));
+      remoteProblem = null;
+      if (JSON.stringify(store.get().deck) !== JSON.stringify(welcome.deck)) {
+        store.applyRemote(welcome.deck, `Synchronized with ${binding.serverName}`, { coalesce: false });
+      }
+      if (welcome.themeCss !== cssEditor.getValue()) {
+        cssEditor.setValue(welcome.themeCss);
+        void window.api.saveTheme(welcome.themeCss);
+      }
+      themePanel.noteDeckOpened(store.get().deck);
+      for (const peer of welcome.peers) agentPresence?.upsert(peer);
+      rail.refreshPresence();
+      lastAgentPresenceKey = '';
+      lastCollaborationCursorKey = '';
+      publishAgentPresence();
+      queueAgentSessionSnapshot();
+      noteRemoteDeck(store.get().deck);
+      // Files made here while offline go up; files peers added come down.
+      void window.api.syncRemoteFiles(binding.dir)
+        .then(() => fetchRemoteAssets(store.get().deck))
+        .catch((error) => console.error('Could not sync server deck files:', error));
+      renderRemoteChip();
+    },
+    onDeckReplaced: (deck, label, options) => {
+      store.applyRemote(deck, label, options);
+      queueAgentSessionSnapshot();
+      noteRemoteDeck(deck);
+    },
+    onPeerPresence: (state) => {
+      agentPresence?.upsert(state);
+      rail.refreshPresence();
+    },
+    onPeerCursor: (clientId, cursor) => agentPresence?.moveCursor(clientId, cursor),
+    onPeerLeft: (clientId) => {
+      agentPresence?.remove(clientId);
+      rail.refreshPresence();
+    },
+    onThemeCss: (css) => {
+      if (!cssEditor.hasFocus() && css !== cssEditor.getValue()) cssEditor.setValue(css);
+      void window.api.saveTheme(css);
+      queueAgentSessionSnapshot();
+      scheduleRemotePersist();
+    },
+    onStatus: () => renderRemoteChip(),
+    // The mirror is saved like any deck; the server confirming an edit does
+    // not make it clean on disk here.
+    onCleanChange: () => renderRemoteChip(),
+    onConnectionChange: (connected) => {
+      remoteConnected = connected;
+      if (!connected) {
+        agentPresence?.replaceAll([]);
+        rail.refreshPresence();
+      }
+      renderRemoteChip();
+    },
+    onAccessRevoked: () => {
+      remoteProblem = 'no access';
+      renderRemoteChip();
+    },
+    onUnavailable: (reason) => {
+      remoteProblem = reason;
+      renderRemoteChip();
+    },
+    onMoved: (moved) => {
+      remoteProblem = `moved to ${moved.deckId}`;
+      renderRemoteChip();
+    },
+  }, {
+    local: () => ({ deck: store.get().deck, themeCss: cssEditor.getValue() }),
+    reconcile: async (input) => {
+      renderRemoteChip();
+      store.setEditLock(`Merging your offline changes with ${binding.serverName}…`);
+      try {
+        const result = await reconcileOffline(input, {
+          serverName: binding.serverName,
+          prefetch: async (deck) => {
+            await window.api.syncRemoteFiles(binding.dir).catch(() => undefined);
+            await window.api.fetchRemoteAssets(binding.dir, deck);
+          },
+        });
+        if (result.asked) setStatusMessage(`Merged your offline changes with ${binding.serverName}.`);
+        return result;
+      } finally {
+        store.setEditLock(null);
+      }
+    },
+    onReconciled: ({ sent, themeSent }) => {
+      if (!live()) return;
+      if (sent > 0 || themeSent) {
+        setStatusMessage(`Synced offline changes with ${binding.serverName}.`);
+      }
+      renderRemoteChip();
+    },
+  });
+  bridge.seed(binding.baseline);
+  agentSessionBridge = bridge;
+  agentSessionReady = true;
+  agentSessionWsUrl = binding.wsUrl;
+  store.onLocalEdit = bridge.localEdit;
+  if (binding.wsUrl) bridge.connect();
+  else remoteProblem = 'server not in your list';
+  renderRemoteChip();
 }
 
 async function newPresentation(): Promise<void> {
@@ -800,7 +1193,33 @@ async function newPresentation(): Promise<void> {
   }
 }
 
-async function openPresentation(): Promise<void> {
+/**
+ * Open: with a deck server known, one dialog covers this computer and the
+ * servers; without one, straight to the system folder picker as always.
+ */
+async function openPresentation(options: { start?: 'connect' } = {}): Promise<void> {
+  let choice: OpenChoice | null;
+  try {
+    const servers = await window.api.remoteServers();
+    choice = servers.length === 0 && !options.start ? { kind: 'local' } : await showOpenDialog(window.api, options);
+  } catch (err) {
+    setStatusMessage(`Open failed: ${err instanceof Error ? err.message : err}`);
+    return;
+  }
+  if (!choice) return;
+  if (choice.kind === 'local') return openLocalPresentation();
+  const { serverId, deckId, title, offline } = choice;
+  try {
+    await runOperation(`Opening “${title}”…`, async (operation) => {
+      const session = await window.api.openRemoteDeck(serverId, deckId, operation.id, offline ? { offline } : undefined);
+      if (session) await adopt(session.dir, session.deck, operation);
+    });
+  } catch (err) {
+    setStatusMessage(`Open failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+async function openLocalPresentation(): Promise<void> {
   try {
     await runOperation('Opening presentation…', async (operation) => {
       const session = await window.api.openDeck(operation.id);
@@ -916,7 +1335,6 @@ const PANELS = [
   { id: 'inspector', label: 'Props' },
   { id: 'themePanel', label: 'Design' },
   { id: 'timeline', label: 'Build' },
-  { id: 'history', label: 'History' },
 ] as const;
 
 function buildTabs(): void {
@@ -968,7 +1386,8 @@ function syncSlideSelectionContext(): void {
 /* --- element creation --- */
 
 function addText(): void {
-  insertText(store);
+  // Straight into the new box, its placeholder selected: typing replaces it.
+  canvas.beginTextEdit(insertText(store).id);
 }
 
 /* --- persistence --- */
@@ -983,8 +1402,12 @@ async function save(opts: { flushHistory?: boolean } = {}): Promise<void> {
     saveTimer = null;
   }
   const deck = store.get().deck;
+  // Taken in the same tick as the deck: the baseline is a server state the
+  // deck on screen already contains, so the next merge starts from it.
+  const baseline = remoteBinding?.dir === dir ? agentSessionBridge?.baseline() ?? null : null;
   try {
-    await queueMainSessionPersistence(dir, deck, cssEditor.getValue(), agentSessionReady);
+    await queueMainSessionPersistence(dir, deck, cssEditor.getValue(), agentSessionReady && !remoteBinding);
+    if (baseline) await queueRemoteBaseline(dir, baseline);
   } catch (error) {
     // Another deck was opened while this write was in flight, and the main
     // process refused it rather than writing these slides into that deck's
@@ -1074,6 +1497,7 @@ async function adopt(
   if (fonts) await fonts.ready;
   operation?.update('Finishing initial display', 0.99);
   await operation?.waitForPaint();
+  if (generation === adoptGeneration) await attachRemoteDeck(dir);
 }
 
 /* --- keyboard, clipboard, context menu: shared shell wiring --- */
@@ -1088,6 +1512,7 @@ const shellDeps: ShellDeps = {
   currentThemeCss: () => cssEditor.getValue(),
   openTrim,
   openRaster,
+  downloadOriginal: { label: 'Download original…', run: (element) => void saveOriginalAsset(element.src) },
   undo: () => {
     if (agentSessionReady && agentSessionBridge) agentSessionBridge.undo(store.get().deck);
     else store.undo();
@@ -1125,6 +1550,26 @@ async function runOperation<T>(
   }
 }
 
+/**
+ * Before restarting into an update: write the deck, its theme and its edit
+ * history now, and report whether anything is still unsaved, so the main
+ * process can refuse to quit over it (src/main/updates.ts).
+ */
+async function flushForRestart(): Promise<{ clean: boolean; deckName?: string }> {
+  await cssEditor.flush();
+  const { dir } = store.get();
+  // A window with no deck has nothing to lose.
+  if (!dir) return { clean: true };
+  await save();
+  return { clean: !store.get().dirty, deckName: dir.split(/[\\/]/).pop() || dir };
+}
+
+installUpdates({
+  beginOperation: (message) => operationProgress.begin(message),
+  setStatus: (message) => setStatusMessage(message),
+  flush: flushForRestart,
+});
+
 function setStatusMessage(text: string): void {
   statusMessage = text;
   statusBusy = false;
@@ -1137,6 +1582,7 @@ function renderStatus(): void {
   // costs a style and paint invalidation of the full-width footer.
   const text = statusBarText(store.get(), statusMessage);
   if (status.textContent !== text) status.textContent = text;
+  renderRemoteChip();
   const busy = statusBusy ? 'true' : 'false';
   if (status.dataset.busy !== busy) status.dataset.busy = busy;
   if (status.getAttribute('aria-busy') !== busy) status.setAttribute('aria-busy', busy);
@@ -1231,12 +1677,23 @@ window.api.onRasterDone((result) => {
   setStatusMessage(`Painted image saved as ${result.src}`);
 });
 
+// Ending a presentation returns to the slide it was showing, not the one it
+// started from.
+window.api.onPresentEnded?.((slideIndex) => store.selectSlide(slideIndex));
 
 canvas.contextActions = makeContextActions(shellDeps, clipboard);
 
 // Watch mode: the main process reloads the deck when deck.json changes on
 // disk (an agent, a git checkout, hand editing) and broadcasts it here. Our
 // own saves echo back identical content and are ignored by comparison.
+window.api.onPresentNotesEdit(({ slideId, notes }) => {
+  const slide = store.get().deck.slides.find((item) => item.id === slideId);
+  if (!slide || slide.notes === notes) return;
+  store.commit((deck) => {
+    const target = deck.slides.find((item) => item.id === slideId);
+    if (target) target.notes = notes;
+  }, { label: 'Edit speaker notes' });
+});
 window.api.onDeckState((session) => {
   const state = store.get();
   if (
@@ -1255,7 +1712,13 @@ window.api.onDeckState((session) => {
     });
     return;
   }
+  const before = state.deck;
   store.replaceExternal(session.deck, session.dir);
+  // In a server deck's mirror, a deck.json rewritten on disk (a local agent's
+  // transaction with the editor's watcher in between) is this side's edit.
+  if (remoteBinding?.dir === session.dir && agentSessionBridge) {
+    agentSessionBridge.localEdit(before, store.get().deck, 'Edited on disk');
+  }
   welcome.setVisible(false);
   themePanel.refreshSwatches();
   setStatusMessage('Deck reloaded from disk.');

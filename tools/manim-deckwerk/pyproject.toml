@@ -1,0 +1,16 @@
+[project]
+name = "manim-deckwerk"
+version = "0.1.0"
+description = "Sync manim-slides scenes into DeckWerk decks as editable video slides"
+requires-python = ">=3.10"
+dependencies = ["manim>=0.18,<0.20", "manim-slides>=5.5"]
+
+[project.scripts]
+manim-deckwerk = "manim_deckwerk.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["manim_deckwerk"]

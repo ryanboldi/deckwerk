@@ -17,6 +17,7 @@ import {
   type AgentResponse,
 } from '@shared/agent.js';
 import {
+  COLLAB_CLOSE,
   COLLAB_PROTOCOL_VERSION,
   ServerMessageSchema,
   type ClientMessage,
@@ -27,11 +28,12 @@ import { applyOpsLenient } from '@shared/collabApply.js';
 import { parseDeck, type Deck, type Slide } from '@shared/deck.js';
 import { diffDecks } from '@shared/deckDiff.js';
 import { renameRetiredFields } from '@shared/fieldAliases.js';
-import { adoptAuthoredIds, describeHtmlSync } from '@shared/htmlSlides.js';
+import { adoptAuthoredIds, describeHtmlSync, insertionAnchor, stampPage, type PageStamp } from '@shared/htmlSlides.js';
 import { SPEAKER_NOTES_FILE, applySpeakerNotes, serializeSpeakerNotes } from '@shared/speakerNotes.js';
 import { AGENT_GUIDE_FILE, AGENT_GUIDE_MARKER, renderAgentGuide } from '../main/agentGuide.js';
-import { agentRuntimePaths, atomicJson, deckRevision } from '../main/agentRuntime.js';
+import { agentRuntimePaths, atomicJson, deckRevision, replaceFileAtomically } from '../main/agentRuntime.js';
 import deckHelperSource from './deckHelper.mjs?raw';
+import { ownStop } from './scratch.js';
 
 /**
  * The bridge behind `deckwerk-connect.mjs` and `slide-agent connect`: your
@@ -69,6 +71,10 @@ const DECK_PERSIST_DEBOUNCE_MS = 150;
 const LOCAL_CHANGE_DEBOUNCE_MS = 200;
 const HTML_SAVE_DEBOUNCE_MS = 250;
 const ECHO_TIMEOUT_MS = 15_000;
+/** Recent writes per file whose contents count as this process's own echo. */
+const RECENT_WRITES = 16;
+/** Recent written decks an edit in the mirror may have been made from. */
+const RECENT_BASES = 3;
 const RECONNECT_MIN_MS = 500;
 const RECONNECT_MAX_MS = 10_000;
 
@@ -128,6 +134,17 @@ export interface ConnectOptions {
   quiet?: boolean;
   /** Test hook: the `fetch` to use. */
   fetch?: typeof fetch;
+  /** Test hooks: points inside the mirror's own writes a test can stall. */
+  hooks?: BridgeTestHooks;
+}
+
+export interface BridgeTestHooks {
+  /**
+   * Called when a new deck.json or notes.md has been written beside the file
+   * and is about to replace it — the window a large deck holds open for a
+   * while, and a watcher event from the previous write can fall into.
+   */
+  beforeReplace?: (file: string, contents: string) => Promise<void>;
 }
 
 export interface AgentBridge {
@@ -154,6 +171,7 @@ interface SyncResponse {
   slides?: Array<{ id: string; elements: Array<{ id: string; type: string; box: unknown }> }>;
   overflows?: unknown[];
   warnings?: string[];
+  stamp?: PageStamp;
   error?: string;
   message?: string;
 }
@@ -190,12 +208,43 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
   let owner: PresenceState | null = null;
 
   // What this process last wrote itself, so its own file events are echoes.
+  // `null` forces the next persist to write the file even if unchanged.
   let lastWrittenDeckJson: string | null = null;
   let lastWrittenTheme: string | null = null;
   let lastWrittenNotes: string | null = null;
+  /**
+   * The mirror's own files — deck.json, notes.md, the theme — are written,
+   * read back and merged one job at a time. A watcher event that fires while
+   * a write is in flight waits for it, so it reads what was written rather
+   * than the file the write is about to replace: read mid-write, the old
+   * file looked like an agent's edit and went up as one, reverting the
+   * newest transactions (an insert came back as a delete).
+   */
+  let mirrorChain: Promise<void> = Promise.resolve();
+  /** Hashes of what this process recently wrote, per file: any of them on disk is an echo. */
+  const recentWrites = new Map<string, string[]>();
+  /** The stat signature of each file as this process last left it. */
+  const ownSignatures = new Map<string, string | null>();
+  /**
+   * What the last few persists wrote. An agent that rewrites deck.json or
+   * notes.md wrote it from one of these; its edit is the difference from
+   * that one, not from the deck as it stands now — which would undo every
+   * change collaborators made since it read the file.
+   */
+  const recentBases: Array<{ deckJson: string; notes: string }> = [];
+  /** A file contents a problem was reported for, so every persist does not report it again. */
+  const reportedProblems = new Map<string, string>();
   const lastWrittenHtml = new Map<string, string>();
   /** The last page contents synced per file, with what the server said. */
-  const lastSync = new Map<string, { contents: string; result: SyncResponse }>();
+  const lastSync = new Map<string, {
+    contents: string;
+    result: SyncResponse;
+    /**
+     * A page of new slides the watcher synced on its own, so they went last:
+     * no `apply --after` has said where they go yet.
+     */
+    unplaced?: string[];
+  }>();
   /** One sync at a time per file: a second save waits, then re-reads. */
   const htmlQueues = new Map<string, Promise<void>>();
   /** Asset names present locally, whether downloaded or already uploaded. */
@@ -259,16 +308,21 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
     await mkdir(join(dir, 'assets'), { recursive: true });
     await mkdir(paths.inbox, { recursive: true });
     await mkdir(paths.responses, { recursive: true });
-    await atomicJson(marker, {
+    await writeMarker();
+    // The agent's command: generated, executable, always the server's version.
+    const helper = join(dir, HELPER_FILE);
+    await writeFile(helper, deckHelperSource, 'utf8');
+    await chmod(helper, 0o755);
+  }
+
+  /** The marker is also where `./deck` reads which session (and deck id) this is. */
+  async function writeMarker(): Promise<void> {
+    await atomicJson(join(dir, MIRROR_MARKER_FILE), {
       origin: target.origin,
       deckId: target.deckId,
       participantId: target.participantId,
       connectedAt: new Date().toISOString(),
     });
-    // The agent's command: generated, executable, always the server's version.
-    const helper = join(dir, HELPER_FILE);
-    await writeFile(helper, deckHelperSource, 'utf8');
-    await chmod(helper, 0o755);
   }
 
   async function syncFiles(): Promise<void> {
@@ -351,24 +405,165 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
     }
   }
 
-  async function persistDeck(): Promise<void> {
-    if (!shadow) return;
-    try {
-      const json = serializeDeck(shadow);
-      if (json !== lastWrittenDeckJson) {
-        lastWrittenDeckJson = json;
-        await atomicText(join(dir, DECK_FILE), json);
-      }
-      const notes = serializeSpeakerNotes(shadow);
-      if (notes !== lastWrittenNotes) {
-        lastWrittenNotes = notes;
-        const existing = await readFile(join(dir, SPEAKER_NOTES_FILE), 'utf8').catch(() => null);
-        if (existing !== notes) await atomicText(join(dir, SPEAKER_NOTES_FILE), notes);
-      }
-      await publishContext();
-    } catch (error) {
-      log(`could not write the mirrored deck: ${message(error)}`);
+  /** Run a job on the mirror's own files once every earlier one has finished. */
+  function exclusive(job: () => Promise<void>): Promise<void> {
+    const run = mirrorChain.then(job, job);
+    mirrorChain = run.catch(() => undefined);
+    return run;
+  }
+
+  function rememberWrite(file: string, contents: string): void {
+    const hashes = recentWrites.get(file) ?? [];
+    hashes.push(sha256Text(contents));
+    if (hashes.length > RECENT_WRITES) hashes.shift();
+    recentWrites.set(file, hashes);
+  }
+
+  /**
+   * Write one of the mirror's files beside it and rename it into place —
+   * unless somebody else changed the file while ours was being written
+   * (`expected` is its signature from before), in which case theirs stays
+   * and the caller takes it in first. Returns whether ours landed.
+   */
+  async function writeMirrorFile(file: string, contents: string, expected: string | null): Promise<boolean> {
+    const path = join(dir, file);
+    await mkdir(dirname(path), { recursive: true });
+    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, contents, 'utf8');
+    await options.hooks?.beforeReplace?.(file, contents);
+    if ((await statSignature(path)) !== expected) {
+      await unlink(temporary).catch(() => undefined);
+      return false;
     }
+    // Taken from the file before it moves: a rename keeps inode, size and
+    // mtime, and nothing can slip in between the rename and a later stat.
+    const signature = await statSignature(temporary);
+    rememberWrite(file, contents);
+    await rename(temporary, path);
+    ownSignatures.set(file, signature);
+    return true;
+  }
+
+  /**
+   * Take in an edit somebody made to deck.json or notes.md in the mirror,
+   * if there is one this process has not seen. The edit is the difference
+   * from the version it was written from — whichever recent write it differs
+   * from least — and only that travels, as one transaction the server
+   * applies leniently against the deck as it stands now: a slide a
+   * collaborator added after the agent read the file stays.
+   *
+   * `clean`: nothing new on disk. `rewrite`: the file differs from what the
+   * mirror should hold (it was merged, or is stale) and is to be written
+   * again. `keep`: leave the file alone for now — it is not a deck, or the
+   * change could not be sent, and writing over it would lose it.
+   */
+  async function absorbLocal(file: string): Promise<'clean' | 'rewrite' | 'keep'> {
+    if (!shadow) return 'clean';
+    const path = join(dir, file);
+    const signature = await statSignature(path);
+    // Deleted: write the session's copy back.
+    if (signature === null) return ownSignatures.has(file) ? 'rewrite' : 'clean';
+    if (signature === ownSignatures.get(file)) return 'clean';
+    let raw: string;
+    try {
+      raw = await readFile(path, 'utf8');
+    } catch {
+      return 'clean';
+    }
+    const hash = sha256Text(raw);
+    const problem = (text: string): 'keep' => {
+      if (reportedProblems.get(file) !== hash) report(text, { error: true });
+      reportedProblems.set(file, hash);
+      return 'keep';
+    };
+    const hashes = recentWrites.get(file) ?? [];
+    if (hashes.includes(hash)) {
+      // Something this process wrote: the latest (touched, or copied back),
+      // or an older one put back, which the next write replaces.
+      if (hash !== hashes.at(-1)) return 'rewrite';
+      ownSignatures.set(file, signature);
+      return 'clean';
+    }
+    // Nothing written yet to merge against (a mirror left by an earlier
+    // run): the deck the server holds replaces it.
+    if (recentBases.length === 0) return 'rewrite';
+    if (closed) return 'keep';
+    const isDeck = file === DECK_FILE;
+    let local: Deck | null = null;
+    if (isDeck) {
+      try {
+        local = parseDeck(renameRetiredFields(JSON.parse(raw)));
+      } catch (error) {
+        return problem(`${DECK_FILE} is not a valid deck right now (${message(error)}); `
+          + 'fix it, or delete it to get the session\'s copy back');
+      }
+    }
+    let ops: AgentOperation[] | null = null;
+    for (const base of [...recentBases].reverse()) {
+      const before = parseDeck(JSON.parse(base.deckJson));
+      const candidate = diffDecks(before, local ?? applySpeakerNotes(before, raw).deck);
+      if (ops === null || candidate.length < ops.length) ops = candidate;
+      if (ops.length === 0) break;
+    }
+    if (!ops || ops.length === 0) return 'rewrite';
+    try {
+      await sendTransaction(isDeck ? `Update ${DECK_FILE}` : 'Edit speaker notes', ops);
+    } catch (error) {
+      return problem(`could not send the edit to ${file}: ${message(error)}`);
+    }
+    report(isDeck
+      ? `sent a direct ${DECK_FILE} edit (${ops.length} operation${ops.length === 1 ? '' : 's'})`
+      : `updated speaker notes from ${SPEAKER_NOTES_FILE}`);
+    return 'rewrite';
+  }
+
+  function persistDeck(): Promise<void> {
+    return exclusive(async () => {
+      try {
+        // Rarely more than once: only when somebody wrote a file while ours
+        // was being written, and theirs has to be taken in first.
+        for (let attempt = 0; attempt < 3 && shadow; attempt++) {
+          // An edit made in the mirror and not yet taken in goes up first:
+          // writing over it would lose it.
+          const deckState = await absorbLocal(DECK_FILE);
+          const notesState = await absorbLocal(SPEAKER_NOTES_FILE);
+          if (deckState === 'rewrite') lastWrittenDeckJson = null;
+          if (notesState === 'rewrite') lastWrittenNotes = null;
+          const json = serializeDeck(shadow);
+          const notes = serializeSpeakerNotes(shadow);
+          let raced = false;
+          if (json !== lastWrittenDeckJson && deckState !== 'keep') {
+            if (await writeMirrorFile(DECK_FILE, json, await statSignature(join(dir, DECK_FILE)))) {
+              lastWrittenDeckJson = json;
+            } else {
+              raced = true;
+            }
+          }
+          if (notes !== lastWrittenNotes && notesState !== 'keep') {
+            const notesPath = join(dir, SPEAKER_NOTES_FILE);
+            const expected = await statSignature(notesPath);
+            if ((await readFile(notesPath, 'utf8').catch(() => null)) === notes) {
+              // Already says exactly this: leave the file an author may have open alone.
+              rememberWrite(SPEAKER_NOTES_FILE, notes);
+              ownSignatures.set(SPEAKER_NOTES_FILE, expected);
+              lastWrittenNotes = notes;
+            } else if (await writeMirrorFile(SPEAKER_NOTES_FILE, notes, expected)) {
+              lastWrittenNotes = notes;
+            } else {
+              raced = true;
+            }
+          }
+          if (lastWrittenDeckJson === json && recentBases.at(-1)?.deckJson !== json) {
+            recentBases.push({ deckJson: json, notes });
+            if (recentBases.length > RECENT_BASES) recentBases.shift();
+          }
+          if (!raced) break;
+        }
+        await publishContext();
+      } catch (error) {
+        log(`could not write the mirrored deck: ${message(error)}`);
+      }
+    });
   }
 
   function schedulePersist(): void {
@@ -379,9 +574,11 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
     }, DECK_PERSIST_DEBOUNCE_MS);
   }
 
-  async function writeTheme(css: string): Promise<void> {
-    lastWrittenTheme = css;
-    await atomicText(join(dir, themeFile), css);
+  function writeTheme(css: string): Promise<void> {
+    return exclusive(async () => {
+      if (css === lastWrittenTheme) return;
+      if (await writeMirrorFile(themeFile, css, await statSignature(join(dir, themeFile)))) lastWrittenTheme = css;
+    });
   }
 
   /* --- the file bridge the CLI talks to -------------------------------------- */
@@ -520,53 +717,41 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
     }, ms));
   }
 
-  async function onLocalDeckJson(): Promise<void> {
-    if (!shadow) return;
-    let raw: string;
-    try {
-      raw = await readFile(join(dir, DECK_FILE), 'utf8');
-    } catch {
-      return;
-    }
-    if (raw === lastWrittenDeckJson || raw === serializeDeck(shadow)) return;
-    // Somebody wrote deck.json here directly — a script, a git checkout. The
-    // server is authoritative, so the difference travels up as one
-    // transaction rather than replacing anyone's work wholesale.
-    const local = parseDeck(JSON.parse(raw));
-    const ops = diffDecks(shadow, local);
-    if (ops.length === 0) return;
-    await sendTransaction(`Update ${DECK_FILE}`, ops);
-    report(`sent a direct ${DECK_FILE} edit (${ops.length} operation${ops.length === 1 ? '' : 's'})`);
+  /**
+   * Somebody wrote deck.json or notes.md in the mirror — a script, a
+   * checkout, an agent. The server is authoritative, so the edit travels up
+   * as one transaction rather than replacing anyone's work wholesale.
+   */
+  function onLocalMirrorFile(file: string): Promise<void> {
+    return exclusive(async () => {
+      if (await absorbLocal(file) !== 'rewrite') return;
+      // Merged (its echo is on its way) or stale: either way the mirror
+      // writes what the session holds once that settles.
+      if (file === DECK_FILE) lastWrittenDeckJson = null;
+      else lastWrittenNotes = null;
+      schedulePersist();
+    });
   }
 
-  async function onLocalTheme(): Promise<void> {
-    let css: string;
-    try {
-      css = await readFile(join(dir, themeFile), 'utf8');
-    } catch {
-      return;
-    }
-    if (css === lastWrittenTheme) return;
-    lastWrittenTheme = css;
-    send({ kind: 'theme', css });
-    report(`updated ${themeFile}`);
-  }
-
-  async function onLocalNotes(): Promise<void> {
-    if (!shadow) return;
-    let markdown: string;
-    try {
-      markdown = await readFile(join(dir, SPEAKER_NOTES_FILE), 'utf8');
-    } catch {
-      return;
-    }
-    if (markdown === lastWrittenNotes || markdown === serializeSpeakerNotes(shadow)) return;
-    const applied = applySpeakerNotes(shadow, markdown);
-    if (!applied.changed) return;
-    const ops = diffDecks(shadow, applied.deck);
-    if (ops.length === 0) return;
-    await sendTransaction('Edit speaker notes', ops);
-    report(`updated speaker notes from ${SPEAKER_NOTES_FILE}`);
+  function onLocalTheme(): Promise<void> {
+    return exclusive(async () => {
+      const path = join(dir, themeFile);
+      const signature = await statSignature(path);
+      if (signature === null || signature === ownSignatures.get(themeFile)) return;
+      let css: string;
+      try {
+        css = await readFile(path, 'utf8');
+      } catch {
+        return;
+      }
+      ownSignatures.set(themeFile, signature);
+      // Something this process wrote, or already sent.
+      if ((recentWrites.get(themeFile) ?? []).includes(sha256Text(css))) return;
+      rememberWrite(themeFile, css);
+      lastWrittenTheme = css;
+      send({ kind: 'theme', css });
+      report(`updated ${themeFile}`);
+    });
   }
 
   async function onLocalAsset(fileName: string): Promise<void> {
@@ -594,8 +779,7 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
     });
     if (!response.ok) {
       knownAssets.delete(fileName);
-      const body = await response.json().catch(() => ({})) as { error?: string };
-      report(`could not upload assets/${fileName}: ${body.error ?? response.status}`, { error: true });
+      report(`could not upload assets/${fileName} (${response.status}): ${errorText(await responseBody(response))}`, { error: true });
       return;
     }
     report(`uploaded assets/${fileName}`);
@@ -651,7 +835,15 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
     const previous = lastSync.get(path);
     if (authored === lastWrittenHtml.get(path) || (previous && previous.contents === authored)) {
       // Our own id stamp, or the watcher already synced exactly this page.
-      if (request) await finish({ ...(previous?.result ?? { status: 'applied', applied: false }), idempotent: true } as SyncResponse);
+      if (!request) return;
+      // An agent writes a page with one tool and runs `apply --after` with
+      // the next, by which time the watcher has synced the save — at the end,
+      // where a save puts new slides. The apply still says where they go.
+      if (request.after && previous?.unplaced) {
+        await finish(await placeSynced(file, previous, request.after));
+        return;
+      }
+      await finish({ ...(previous?.result ?? { status: 'applied', applied: false }), idempotent: true } as SyncResponse);
       return;
     }
     report(`compiling ${file}…`, { busy: true });
@@ -665,10 +857,15 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
         headers: { ...BRIDGE_HEADERS, 'content-type': 'text/html; charset=utf-8' },
         body: authored,
       });
-      const body = await response.json().catch(() => ({})) as SyncResponse;
+      const body = await responseBody(response) as SyncResponse;
       result = response.ok
         ? { ...body, status: 'applied' }
-        : { status: response.status === 409 ? 'conflict' : 'error', error: body.error ?? `sync failed (${response.status})` };
+        : {
+          status: response.status === 409 ? 'conflict' : 'error',
+          // A 4xx is about the page and says so; a 5xx is the server's own
+          // failure, and the status is part of what the admin needs to know.
+          error: response.status >= 500 ? `sync failed (${response.status}): ${errorText(body)}` : errorText(body),
+        };
     } catch (error) {
       result = { status: 'error', error: message(error) };
     }
@@ -677,23 +874,81 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
       await finish(result);
       return;
     }
-    report(result.applied && result.changes
-      ? `saved ${file}: ${describeHtmlSync(result.changes)}`
-      : `${file}: no change`);
     // Stamp the assigned ids back so the next save replaces rather than
     // inserts — unless the author saved again meanwhile.
+    // The fingerprints too: the next save is compared with what the deck
+    // holds now, not with what the page was first exported from.
+    // Replaced, never written in place: the agent reads its page as soon as
+    // the save is reported, and an in-place write shows it an empty file.
     let stamped = authored;
     const current = await readFile(path, 'utf8').catch(() => null);
     if (current === authored && result.slides) {
-      const adopted = adoptAuthoredIds(authored, result.slides as unknown as Slide[]);
-      if (adopted) {
-        stamped = adopted;
-        lastWrittenHtml.set(path, adopted);
-        await writeFile(path, adopted, 'utf8');
+      const adopted = adoptAuthoredIds(authored, result.slides as unknown as Slide[]) ?? authored;
+      const based = result.stamp ? stampPage(adopted, result.stamp) : adopted;
+      if (based !== authored) {
+        stamped = based;
+        lastWrittenHtml.set(path, based);
+        await replaceFileAtomically(path, based);
       }
     }
-    lastSync.set(path, { contents: stamped, result });
+    const inserted = result.applied && result.changes ? result.changes : null;
+    lastSync.set(path, {
+      contents: stamped,
+      result,
+      ...(!request && inserted && inserted.inserted.length > 0 && inserted.replaced.length === 0
+        && inserted.deleted.length === 0 ? { unplaced: inserted.inserted } : {}),
+    });
+    // Reported once the page is stamped: "saved" means the file now names
+    // the slides it made, so a save of it right away replaces, not inserts.
+    report(result.applied && result.changes
+      ? `saved ${file}: ${describeHtmlSync(result.changes)}`
+      : `${file}: no change`);
     await finish(result);
+  }
+
+  /**
+   * Move the slides a watcher sync added at the end to where an apply that
+   * arrived after it says they go, as the apply would have put them had it
+   * come first. Numbers count the deck without those slides, as they did
+   * when the agent chose one.
+   */
+  async function placeSynced(
+    file: string,
+    synced: { result: SyncResponse; unplaced?: string[] },
+    after: string,
+  ): Promise<SyncResponse> {
+    const ids = synced.unplaced ?? [];
+    // The sync's own transaction reaches this mirror over the socket, which
+    // can be behind the HTTP reply that reported it.
+    const deadline = Date.now() + ECHO_TIMEOUT_MS;
+    while (!ids.every((id) => shadow!.slides.some((slide) => slide.id === id)) && Date.now() < deadline) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    }
+    const others = { ...shadow!, slides: shadow!.slides.filter((slide) => !ids.includes(slide.id)) };
+    const anchor = insertionAnchor(others, after);
+    if (anchor === undefined) {
+      return {
+        status: 'error',
+        error: `no slide ${after}; ${file} was already saved, and its slides were added at the end`,
+      };
+    }
+    const present = ids.filter((id) => shadow!.slides.some((slide) => slide.id === id));
+    const ops: AgentOperation[] = present.map((id, index) => ({
+      op: 'moveSlide', slideId: id, afterSlideId: index === 0 ? anchor : present[index - 1],
+    }));
+    const order = shadow!.slides.map((slide) => slide.id);
+    const at = anchor === null ? 0 : order.indexOf(anchor) + 1;
+    const placed = order.slice(at, at + present.length).join() === present.join();
+    if (ops.length > 0 && !placed) {
+      try {
+        await sendTransaction(`Place ${present.length === 1 ? 'the new slide' : 'the new slides'} after ${anchor ?? 'nothing (first)'}`, ops);
+      } catch (error) {
+        return { status: 'error', error: message(error) };
+      }
+      report(`placed ${file}'s ${present.length === 1 ? 'slide' : `${present.length} slides`} after ${anchor ?? 'the start'}`);
+    }
+    synced.unplaced = undefined;
+    return { ...synced.result, revision: deckRevision(shadow!) };
   }
 
   async function onApplyRequest(path: string): Promise<void> {
@@ -727,8 +982,10 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
     watchers.push(
       watch(dir, (_event, filename) => {
         const entry = filename ? String(filename) : '';
-        if (entry === DECK_FILE) debounceLocal('deck', LOCAL_CHANGE_DEBOUNCE_MS, onLocalDeckJson);
-        else if (entry === SPEAKER_NOTES_FILE) debounceLocal('notes', LOCAL_CHANGE_DEBOUNCE_MS, onLocalNotes);
+        if (entry === DECK_FILE) debounceLocal('deck', LOCAL_CHANGE_DEBOUNCE_MS, () => onLocalMirrorFile(DECK_FILE));
+        else if (entry === SPEAKER_NOTES_FILE) {
+          debounceLocal('notes', LOCAL_CHANGE_DEBOUNCE_MS, () => onLocalMirrorFile(SPEAKER_NOTES_FILE));
+        }
         else if (themeInRoot && entry === themeFile) debounceLocal('theme', LOCAL_CHANGE_DEBOUNCE_MS, onLocalTheme);
       }),
       watch(editDir, (_event, filename) => {
@@ -790,6 +1047,17 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
         pending.delete(id);
       }
       if (closed) return;
+      if (event.code === COLLAB_CLOSE.noSuchDeck) {
+        const why = `The deck "${target.deckId}" no longer exists on ${target.origin} — it may have been `
+          + 'renamed or deleted. Copy the command from the Agent panel again to connect to it.';
+        if (!readySettled) {
+          readySettled = true;
+          failReady(new Error(why));
+        }
+        log(`disconnected: ${why}`);
+        closed = true;
+        return;
+      }
       if (event.code === 4003) {
         const why = event.reason || 'the server refused this connection';
         if (!readySettled) {
@@ -830,6 +1098,7 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
           startWatchers();
           await drainInbox();
           markReady();
+          void checkServerHealth();
         }
         log(`connected to ${target.origin} as ${msg.self.name}`);
         return;
@@ -856,7 +1125,7 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
         return;
       }
       case 'theme': {
-        if (msg.css !== lastWrittenTheme) await writeTheme(msg.css);
+        await writeTheme(msg.css);
         return;
       }
       case 'presence': {
@@ -874,6 +1143,43 @@ export function connectAgentBridge(options: ConnectOptions): AgentBridge {
         await close();
         return;
       }
+      case 'deckMoved': {
+        // Renamed while mirrored. The id is all that changed: the folder here
+        // keeps its path, and the server closes this socket next, so the
+        // ordinary reconnect joins the deck under its new id. Switch before
+        // the first await so that reconnect cannot dial the old one.
+        const previous = target.deckId;
+        target.deckId = msg.deckId;
+        const ws = new URL(target.wsUrl);
+        ws.searchParams.set('deck', msg.deckId);
+        target.wsUrl = ws.href;
+        reconnectDelay = RECONNECT_MIN_MS;
+        log(`the deck "${previous}" was renamed to "${msg.deckId}" — following it`);
+        await writeMarker();
+        await writeGuides();
+        return;
+      }
+    }
+  }
+
+  /**
+   * Ask the server, once, whether it can compile pages at all. A server whose
+   * headless browser cannot start serves the deck and the session perfectly
+   * well, so without this the first sign of it was a failed save.
+   */
+  async function checkServerHealth(): Promise<void> {
+    try {
+      const response = await fetchImpl(apiUrl('/api/agent-mirror/health'), { headers: BRIDGE_HEADERS });
+      // An older server has no such route; its saves will say for themselves.
+      if (!response.ok) return;
+      const { browser } = await response.json() as { browser?: { ok: boolean; error?: string } };
+      if (browser && !browser.ok) {
+        report('warning: this server cannot compile or render pages right now, so saving a page in edit/ '
+          + `will fail until whoever runs it fixes this: ${browser.error ?? 'its headless browser does not start'}`,
+        { error: true });
+      }
+    } catch {
+      // Best effort: a dropped connection is reported by the session itself.
     }
   }
 
@@ -992,7 +1298,11 @@ export async function runConnectCommand(options: ConnectCommandOptions): Promise
 function waitForStop(signal?: AbortSignal): Promise<void> {
   return new Promise((resolvePromise) => {
     if (signal?.aborted) return resolvePromise();
+    // Ctrl-C ends the bridge through `done`, which closes it properly; the
+    // CLI's own signal cleanup must not exit the process first.
+    const release = ownStop();
     const done = () => {
+      release();
       process.off('SIGINT', done);
       process.off('SIGTERM', done);
       resolvePromise();
@@ -1010,10 +1320,12 @@ syncs — with \`./deck new > edit/slide.html\`, then fill in its \`<section>\`:
 const MIRROR_APPLY_STEP = `## 3. Put it in the deck
 
 Saving a page in \`edit/\` updates the shared deck within a second or two;
-there is no separate upload. To choose where a new slide goes, run apply right
-after you write the page:
+there is no separate upload. New slides land last; to choose where they go,
+apply the page with \`--after\` — if the save has synced already, its slides
+move there:
 
     ./deck apply . --html edit/slide.html --after 8    # insert after slide 8
+    ./deck apply . --html edit/slide.html --after 0    # insert as the first slide
 
 Each sync stamps \`data-slide-id\` into your file, and saving it again replaces
 that slide. So never copy a page to start another: the copy carries the same
@@ -1100,6 +1412,23 @@ async function atomicText(path: string, contents: string): Promise<void> {
   await rename(temporary, path);
 }
 
+function sha256Text(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+/**
+ * A file's identity as the filesystem sees it, cheap to take: a rename
+ * brings a new inode, a rewrite in place a new mtime. Null when it is missing.
+ */
+async function statSignature(path: string): Promise<string | null> {
+  try {
+    const info = await stat(path);
+    return `${info.ino}:${info.size}:${info.mtimeMs}`;
+  } catch {
+    return null;
+  }
+}
+
 async function sha256File(path: string): Promise<string> {
   const hash = createHash('sha256');
   await new Promise<void>((resolvePromise, reject) => {
@@ -1117,4 +1446,31 @@ function sanitize(fileName: string): string {
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** A response's body: parsed JSON when it is JSON, its text otherwise. */
+async function responseBody(response: Response): Promise<unknown> {
+  const text = await response.text().catch(() => '');
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+/**
+ * The server's own explanation of a failure, whatever shape it came in.
+ *
+ * API errors are `{ error }`, but a proxy, a crash handler or an older server
+ * answers in plain text — and parsing only JSON turned all of those into a
+ * bare status code, the one thing nobody can act on.
+ */
+function errorText(body: unknown): string {
+  if (body && typeof body === 'object') {
+    const { error, message: text } = body as { error?: unknown; message?: unknown };
+    if (typeof error === 'string' && error) return error;
+    if (typeof text === 'string' && text) return text;
+  }
+  const raw = typeof body === 'string' ? body.trim() : '';
+  return raw ? raw.slice(0, 600) : 'no explanation from the server';
 }

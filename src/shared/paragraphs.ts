@@ -22,6 +22,47 @@ const LIST_TAGS = new Set(['UL', 'OL']);
 export const TYPING_STYLE_SENTINEL = '\u2060';
 export const LIST_MARKER_COLOR_ATTRIBUTE = 'data-list-marker-color';
 export const LIST_MARKER_COLOR_PROPERTY = '--list-marker-color';
+/**
+ * Marks an item that only holds an indented list: the first item of a list,
+ * indented, has no item to hang under, so it hangs in one of its own. That
+ * item is not a line of the text -- type.css gives it no marker and no
+ * number -- and it goes when it holds no list any more.
+ */
+export const LIST_HOLDER_ATTRIBUTE = 'data-list-holder';
+
+/**
+ * How many steps a paragraph outside a list is indented, each one the width
+ * a nested list level steps in (type.css). List items indent by nesting, so
+ * the attribute means nothing on an item.
+ */
+export const PARAGRAPH_INDENT_ATTRIBUTE = 'data-indent';
+export const MAX_PARAGRAPH_INDENT = 8;
+
+/** A paragraph's indent level, 0 when it has none. */
+export function paragraphIndent(block: Element): number {
+  const level = Number.parseInt(block.getAttribute(PARAGRAPH_INDENT_ATTRIBUTE) ?? '', 10);
+  return Number.isFinite(level) ? Math.max(0, Math.min(MAX_PARAGRAPH_INDENT, level)) : 0;
+}
+
+/** Give a paragraph an indent level, clamped; reports whether it changed. */
+export function setParagraphIndent(block: Element, level: number): boolean {
+  const next = Math.max(0, Math.min(MAX_PARAGRAPH_INDENT, Math.round(level)));
+  const written = block.getAttribute(PARAGRAPH_INDENT_ATTRIBUTE);
+  if (next === 0) {
+    if (written === null) return false;
+    block.removeAttribute(PARAGRAPH_INDENT_ATTRIBUTE);
+    return true;
+  }
+  if (written === String(next)) return false;
+  block.setAttribute(PARAGRAPH_INDENT_ATTRIBUTE, String(next));
+  return true;
+}
+/** Inline wrappers that only format their text. */
+const INLINE_FORMAT_TAGS = new Set([
+  'SPAN', 'FONT', 'B', 'STRONG', 'I', 'EM', 'U', 'S', 'STRIKE', 'DEL', 'INS',
+  'SUB', 'SUP', 'MARK', 'SMALL', 'BIG', 'CODE', 'A',
+]);
+
 const BLOCK_TAGS = new Set([
   'P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
   'BLOCKQUOTE', 'PRE', 'TABLE', 'FIGURE', 'SECTION', 'ARTICLE', 'UL', 'OL', 'LI',
@@ -173,7 +214,10 @@ export function paragraphsToList(html: string, ordered = false): string {
       const match = marker.exec(block.textContent ?? '');
       if (match) removeLeadingText(block, match[0].length);
       const li = document.createElement('li');
-      for (const attr of [...block.attributes]) li.setAttribute(attr.name, attr.value);
+      for (const attr of [...block.attributes]) {
+        // An item is indented by nesting, never by the paragraph's attribute.
+        if (attr.name !== PARAGRAPH_INDENT_ATTRIBUTE) li.setAttribute(attr.name, attr.value);
+      }
       while (block.firstChild) li.appendChild(block.firstChild);
       list.appendChild(li);
       block.remove();
@@ -575,6 +619,96 @@ function collectParagraphs(
 }
 
 /**
+ * Pasting a copied line into the middle of a formatted word makes Chromium
+ * put the line's block inside the word's inline wrapper:
+ * `<span bold>f72f73b<p style="font-weight: 400"><br></p>b</span>`. That is
+ * not a shape the block model has -- the run segmentation above never looks
+ * inside a span -- and the caret later lands in the stranded block, where
+ * typing picks up formatting the line does not show. Split each inline
+ * wrapper around the block instead, the way Chromium splits it on Return.
+ * The block's content stays wrapped in the inline's formatting, less any
+ * declaration the block itself sets (its own wins, as it did when nested).
+ */
+function hoistBlocksOutOfInlines(root: ParentNode & Node): void {
+  // Formatting wrappers only: a table cell or anything else structural that
+  // is not in BLOCK_TAGS is a legitimate home for a block.
+  const isInline = (node: Node | null): node is HTMLElement => (
+    node instanceof Element && INLINE_FORMAT_TAGS.has(node.tagName) && node !== root
+  );
+  const blockSelector = [...BLOCK_TAGS].map((tag) => tag.toLowerCase()).join(', ');
+  let hoisted = false;
+  for (const block of [...root.querySelectorAll<HTMLElement>(blockSelector)]) {
+    while (isInline(block.parentNode)) {
+      const inline = block.parentNode;
+      // Everything after the block moves to a copy of the wrapper after it.
+      const after = inline.cloneNode(false) as HTMLElement;
+      while (block.nextSibling) after.appendChild(block.nextSibling);
+      // The block's own content keeps the wrapper's formatting.
+      const inner = inline.cloneNode(false) as HTMLElement;
+      for (let index = 0; index < block.style.length; index += 1) {
+        inner.style.removeProperty(block.style.item(index));
+      }
+      if (inner.getAttribute('style') === '') inner.removeAttribute('style');
+      while (block.firstChild) inner.appendChild(block.firstChild);
+      const innerHasText = (inner.textContent ?? '') !== '';
+      if (innerHasText) block.appendChild(inner);
+      else block.append(...inner.childNodes);
+      inline.after(block);
+      if (after.childNodes.length > 0) block.after(after);
+      if (inline.childNodes.length === 0) inline.remove();
+      hoisted = true;
+    }
+    if (hoisted) splitItemAtHoistedBlock(block);
+    hoisted = false;
+  }
+  // A cut list item pasted into the start of another arrives as its text, a
+  // <br> and an empty list where the item break was: the same break, spelled
+  // with a list instead of a paragraph (list fuzz seed 20261007).
+  for (const list of [...root.querySelectorAll<HTMLElement>('li > ul:empty, li > ol:empty')]) {
+    splitItemAtHoistedBlock(list, true);
+  }
+}
+
+/**
+ * A paragraph hoisted out of a word now sits in the middle of a list item,
+ * between that item's own text runs: one bullet showing three lines, whose
+ * first line ends in one format while the item as a whole ends in another.
+ * What was pasted was a line *break*, so make it one: the text after the
+ * block becomes the next item. A block that is empty was only that break
+ * and goes; one with content stays with the item before the split.
+ */
+function splitItemAtHoistedBlock(block: HTMLElement, emptyList = false): void {
+  const item = block.parentElement;
+  if (!item || item.tagName !== 'LI') return;
+  if (!emptyList && (block.tagName === 'UL' || block.tagName === 'OL')) return;
+  const contentful = (node: Node | null): boolean => (
+    node !== null && (node instanceof Element ? node.tagName !== 'BR' : (node.textContent ?? '') !== '')
+  );
+  let before = false;
+  for (let node = block.previousSibling; node; node = node.previousSibling) before ||= contentful(node);
+  let after = false;
+  for (let node = block.nextSibling; node; node = node.nextSibling) after ||= contentful(node);
+  const empty = (block.textContent ?? '') === '' && !block.querySelector('img, video, svg, table');
+  if (!after) {
+    // An empty list at the end of an item renders nothing and breaks nothing.
+    if (emptyList) block.remove();
+    return;
+  }
+  const next = item.cloneNode(false) as HTMLElement;
+  next.removeAttribute('value');
+  while (block.nextSibling) next.appendChild(block.nextSibling);
+  item.after(next);
+  if (empty && before) {
+    // The <br> that ended the line ahead of the block ends the item now.
+    if (block.previousSibling instanceof Element && block.previousSibling.tagName === 'BR'
+      && block.previousSibling.previousSibling) block.previousSibling.remove();
+    block.remove();
+  } else if (emptyList) {
+    block.remove();
+  }
+}
+
+/**
  * Chrome's indent command nests a list as a *sibling* of the `<li>`s
  * (`<ul><li>a</li><ul>…`), which is invalid HTML and invisible to the
  * paragraph segmentation above. Fold each such list into the `<li>` before
@@ -586,10 +720,37 @@ function nestStrayLists(root: ParentNode & Node): void {
     if (prev?.tagName === 'LI') {
       prev.appendChild(list);
     } else {
-      // No item to attach to (indented the first bullet): give it one.
+      // No item to attach to (indented the first bullet): give it one, which
+      // is not a line of its own. An ordinary item here drew an empty bullet
+      // above the indented one the moment editing ended.
       const li = (root.ownerDocument ?? document).createElement('li');
+      li.setAttribute(LIST_HOLDER_ATTRIBUTE, '');
       list.parentNode?.insertBefore(li, list);
       li.appendChild(list);
+    }
+  }
+}
+
+/**
+ * A holder item (`LIST_HOLDER_ATTRIBUTE`) holds blocks -- the indented list,
+ * and the paragraph an item of it becomes when its bullet is taken off --
+ * and never a line of its own. Words directly in it (a paste can put them
+ * there) are such a line, and make it an ordinary item; holding no block any
+ * more, it is nothing at all and goes, with its list if that leaves the list
+ * empty. Either way the box looks as it did while it was being edited.
+ */
+function settleListHolders(root: ParentNode & Node): void {
+  for (const holder of [...root.querySelectorAll<HTMLElement>(`li[${LIST_HOLDER_ATTRIBUTE}]`)]) {
+    const inline = [...holder.childNodes]
+      .filter((node) => !(node instanceof Element && BLOCK_TAGS.has(node.tagName)));
+    if (hasContent(inline)) {
+      holder.removeAttribute(LIST_HOLDER_ATTRIBUTE);
+    } else if (inline.length < holder.childNodes.length) {
+      for (const node of inline) node.remove();
+    } else {
+      const list = holder.parentElement;
+      holder.remove();
+      if (list && LIST_TAGS.has(list.tagName) && list.children.length === 0) list.remove();
     }
   }
 }
@@ -614,6 +775,36 @@ function adoptOrphanListItems(root: ParentNode & Node): void {
     const list = doc.createElement('ul');
     item.replaceWith(list);
     list.appendChild(item);
+  }
+}
+
+/**
+ * Text or inline markup sitting directly in a list, outside every item.
+ * Return inside an item that holds paragraphs ahead of its text can make
+ * Chromium open the new item *inside* the old one; the next parse closes
+ * the inner item early and strands the old item's trailing words in the
+ * list itself, where no block -- and no line of the outline -- holds them.
+ * Give them back to the item they followed, or to an item of their own.
+ */
+function adoptStrayListContent(root: ParentNode & Node): void {
+  const doc = root.ownerDocument ?? document;
+  for (const list of [...root.querySelectorAll<HTMLElement>('ul, ol')]) {
+    for (const child of [...list.childNodes]) {
+      if (child instanceof Element && (child.tagName === 'LI' || LIST_TAGS.has(child.tagName))) continue;
+      if (child instanceof Text && MARKUP_WHITESPACE.test(child.data)) continue;
+      if (!(child instanceof Text) && !(child instanceof Element)) continue;
+      let item = child.previousSibling;
+      while (item instanceof Text && MARKUP_WHITESPACE.test(item.data)) item = item.previousSibling;
+      if (!(item instanceof Element && item.tagName === 'LI')) {
+        item = doc.createElement('li');
+        list.insertBefore(item, child);
+      }
+      // An item that is only a placeholder line takes the words in its place.
+      if (item.childNodes.length === 1 && item.firstChild instanceof Element && item.firstChild.tagName === 'BR') {
+        item.firstChild.remove();
+      }
+      item.appendChild(child);
+    }
   }
 }
 
@@ -711,8 +902,15 @@ export function stripStructuralWhitespace(root: ParentNode & Node): void {
   }
 }
 
-/** Contenteditable can split one list into adjacent sibling lists on Return. */
-function mergeAdjacentLists(root: ParentNode & Node): void {
+/**
+ * Contenteditable can split one list into adjacent sibling lists on Return,
+ * and a deleted line between two lists leaves them side by side. Either way
+ * they are one list: numbered, the second's own `start` no longer applies.
+ * The editor runs this on the live box too, so the numbers an author sees
+ * while editing are the ones the deck stores. Returns whether it joined any.
+ */
+export function mergeAdjacentLists(root: ParentNode & Node): boolean {
+  let joined = false;
   let current = root.firstElementChild;
   while (current) {
     // Directly adjacent: a bare run of text between two lists is a paragraph
@@ -722,10 +920,12 @@ function mergeAdjacentLists(root: ParentNode & Node): void {
     if (next && LIST_TAGS.has(current.tagName) && next.tagName === current.tagName) {
       while (next.firstChild) current.appendChild(next.firstChild);
       next.remove();
+      joined = true;
       continue;
     }
     current = current.nextElementSibling;
   }
+  return joined;
 }
 
 /**
@@ -744,7 +944,10 @@ export function normalizeParagraphHtml(html: string, splitBreaks = false): strin
   stripStructuralWhitespace(template.content);
   adoptOrphanListItems(template.content);
   nestStrayLists(template.content);
+  adoptStrayListContent(template.content);
+  settleListHolders(template.content);
   mergeAdjacentLists(template.content);
+  hoistBlocksOutOfInlines(template.content);
   // Nesting a stray list into the item before it puts that item's trailing
   // space beside a block; the same pass takes it out.
   stripStructuralWhitespace(template.content);

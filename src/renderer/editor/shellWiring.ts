@@ -1,7 +1,14 @@
-import type { SlideElement } from '@shared/deck.js';
+import type { Comment, SlideElement } from '@shared/deck.js';
+import { openThreadCount } from '@shared/comments.js';
+import { commentHighlightsShown, setCommentHighlightsShown } from './comments.js';
 import { elementFollowsLayout, layoutGeometryFor, realignElementToLayout } from '@shared/layoutMasters.js';
 import { EditorCanvas } from './canvas.js';
+import { isLineFamily } from '@shared/lineFamily.js';
+import { ARRANGE_LABELS, arrangeSelection } from './arrange.js';
 import { setCircularMask } from '@shared/mediaMask.js';
+import { wipeCandidates, wipeOfPair } from '@shared/compare.js';
+import { arrangeWipe } from './compareEdits.js';
+import { classifyMediaName, isPendingSrc } from '@shared/media.js';
 import { mediaNaturalSize } from './mediaNatural.js';
 import { Inspector } from './inspector.js';
 import { SlideRail } from './slideRail.js';
@@ -10,11 +17,13 @@ import {
   copySelectionToClipboard,
   copySlidesToClipboard,
   cutSelectionToClipboard,
-  pasteImageFilesFromClipboard,
+  pasteMediaFilesFromClipboard,
   pasteFromClipboard,
   inAppClipboardToken,
   isInAppClipboardToken,
   pasteInAppClipboard,
+  pasteStashedClipboard,
+  stashedClipboardId,
 } from './store.js';
 import {
   setWholeTextFormat,
@@ -22,6 +31,7 @@ import {
   type TextFormat,
 } from './textFormatting.js';
 import { showPasteThemeDialog } from './pasteThemeDialog.js';
+import { createToolbarPicker } from './exportPicker.js';
 
 /**
  * Shell-independent wiring shared by the Electron editor and the browser
@@ -48,6 +58,12 @@ export interface ShellDeps {
   openTrim?: (element: VideoElement) => void;
   /** Desktop only: open the destructive raster paint window. */
   openRaster?: (element: ImageElement) => void;
+  /**
+   * Save the untouched file behind one image or video: the desktop asks where
+   * through a save panel ("Download original…"), the web hands it to the
+   * browser's downloads ("Download original"), so each shell names its row.
+   */
+  downloadOriginal?: { label: string; run: (element: ImageElement | VideoElement) => void };
   /**
    * Undo/redo overrides. The Electron shell uses the store's snapshot stacks;
    * the collab shell substitutes op-based selective undo, because restoring a
@@ -103,6 +119,8 @@ export function wireCanvasInspector(
   inspector.onApplyTextSelectionParagraphSpacing = (value) =>
     canvas.applyTextSelectionParagraphSpacing(value);
   inspector.textSelectionParagraphSpacing = () => canvas.textSelectionParagraphSpacing();
+  inspector.onApplyTextSelectionLineHeight = (value) => canvas.applyTextSelectionLineHeight(value);
+  inspector.textSelectionLineHeight = () => canvas.textSelectionLineHeight();
   inspector.onApplyTextSelectionColor = (value) => {
     if (targetsTableCells()) {
       canvas.applyTableCellColor('color', value);
@@ -121,6 +139,7 @@ export function wireCanvasInspector(
   inspector.onApplyTextSelectionMarkerColor = (value) =>
     canvas.applyTextSelectionMarkerColor(value);
   inspector.textSelectionMarkerColor = () => canvas.textSelectionMarkerColor();
+  inspector.onShiftTextIndent = (direction) => canvas.shiftTextIndent(direction);
   inspector.tableSelection = () => canvas.tableSelectionInfo();
   inspector.tableBorderSettings = () => canvas.tableBorderSettings();
   inspector.onSetTableBorderColor = (color) =>
@@ -134,12 +153,17 @@ export function wireCanvasInspector(
     canvas.applyTableCellTextStyle(property, value);
   inspector.onInsertTableColumn = (after) => canvas.insertTableColumn(after);
   inspector.onDeleteTableColumn = () => canvas.deleteTableColumn();
+  inspector.onInsertTableRow = (after) => canvas.insertTableRow(after);
+  inspector.onDeleteTableRow = () => canvas.deleteTableRow();
   inspector.textComputedTypography = (elementId) => canvas.textComputedTypography(elementId);
   inspector.onToggleMask = (id) => canvas.toggleMaskMode(id);
   inspector.maskingElement = () => canvas.maskingElement();
+  inspector.onTogglePathEdit = (id) => canvas.togglePathEdit(id);
+  inspector.pathEditingElement = () => canvas.pathEditingElement();
   inspector.onSeekPreview = (id, t) => canvas.seekVideo(id, t);
   inspector.videoDuration = (id) => canvas.videoDuration(id);
   canvas.onMaskModeChange = () => inspector.render();
+  canvas.onPathEditChange = () => inspector.render();
   canvas.onTextEditModeChange = () => inspector.render();
   canvas.onTextFormatStateChange = () => inspector.render();
   canvas.onTableSelectionChange = () => inspector.render();
@@ -154,6 +178,8 @@ export interface ClipboardActions {
   pasteClipboardFiles?: (files: File[]) => Promise<void>;
   /** Paste the in-window copy when the native paste event holds nothing of ours. */
   pasteInAppClipboard?: () => Promise<void>;
+  /** Paste a copy another tab made, by the id its clipboard token carries. */
+  pasteStashedClipboard?: (id: string) => Promise<void>;
 }
 
 /**
@@ -177,16 +203,19 @@ export function createClipboardActions(deps: ShellDeps): ClipboardActions {
   const cutToClipboard = async () => {
     const copied = await copyToClipboard('Cut');
     if (copied === 'elements') store.deleteSelection();
-    else if (copied === 'slides') rail.deleteSlide();
+    else if (copied === 'slides') rail.deleteSlide({ verb: 'Cut' });
   };
 
   const pasteAndReport = async (paste: () => ReturnType<typeof pasteFromClipboard>) => {
     const pasted = deps.runOperation
       ? await deps.runOperation('Pasting clipboard content', paste)
       : await paste();
-    if (pasted) {
+    if (pasted && pasted.count > 0) {
       const noun = pasted.kind === 'slides' ? 'slide' : 'element';
-      setStatusMessage(`Pasted ${pasted.count} ${noun}${pasted.count > 1 ? 's' : ''}.`);
+      const said = `Pasted ${pasted.count} ${noun}${pasted.count > 1 ? 's' : ''}.`;
+      setStatusMessage(pasted.notice ? `${said} ${pasted.notice}` : said);
+    } else if (pasted?.notice) {
+      setStatusMessage(pasted.notice);
     }
   };
   const pasteOptions = () => ({
@@ -195,13 +224,14 @@ export function createClipboardActions(deps: ShellDeps): ClipboardActions {
   });
   const pasteClipboard = () => pasteAndReport(() => pasteFromClipboard(store, undefined, pasteOptions()));
   const pasteInApp = () => pasteAndReport(() => pasteInAppClipboard(store, pasteOptions()));
+  const pasteStashed = (id: string) => pasteAndReport(() => pasteStashedClipboard(store, id, pasteOptions()));
   const pasteClipboardData = (html: string, text: string) =>
     pasteAndReport(() => pasteFromClipboard(store, { kind: 'external-html', html, text }));
 
   const pasteClipboardFiles = async (files: File[]) => {
-    const paste = () => pasteImageFilesFromClipboard(store, files);
+    const paste = () => pasteMediaFilesFromClipboard(store, files);
     const pasted = deps.runOperation
-      ? await deps.runOperation('Uploading clipboard image', paste)
+      ? await deps.runOperation('Uploading clipboard media', paste)
       : await paste();
     if (pasted) setStatusMessage('Pasted 1 element.');
   };
@@ -213,6 +243,7 @@ export function createClipboardActions(deps: ShellDeps): ClipboardActions {
     pasteClipboardData,
     pasteClipboardFiles,
     pasteInAppClipboard: pasteInApp,
+    pasteStashedClipboard: pasteStashed,
   };
 }
 
@@ -270,17 +301,29 @@ export function bindEditorKeys(deps: ShellDeps, clipboard: ClipboardActions): vo
       void clipboard.pasteInAppClipboard();
       return;
     }
+    // The newest copy was made in the app, but in another tab — another
+    // deck, or this one before a reload. Its token names the copy the server
+    // keeps for exactly this.
+    const stashed = stashedClipboardId(text);
+    if (stashed && clipboard.pasteStashedClipboard) {
+      event.preventDefault();
+      void clipboard.pasteStashedClipboard(stashed);
+      return;
+    }
     if (/<table\b/i.test(html) || text.includes('\t')) {
       event.preventDefault();
       void clipboard.pasteClipboardData?.(html, text);
       return;
     }
-    // Any image the importer accepts, not just a PNG screenshot: the paste
-    // handler below picks the first one it can name.
+    // Any image the importer accepts, not just a PNG screenshot, and any
+    // video or image copied in the file manager (Chromium hands those over
+    // as Files named after the original): the paste handler below picks the
+    // first one it can name.
     const files = [...(event.clipboardData?.items ?? [])]
-      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .filter((item) => item.kind === 'file')
       .map((item) => item.getAsFile())
-      .filter((file): file is File => file !== null);
+      .filter((file): file is File => file !== null
+        && (file.type.startsWith('image/') || classifyMediaName(file.name) !== null));
     if (files.length > 0) {
       event.preventDefault();
       void clipboard.pasteClipboardFiles?.(files);
@@ -299,6 +342,10 @@ export function bindEditorKeys(deps: ShellDeps, clipboard: ClipboardActions): vo
     // Modal workflows own their keyboard input; a second Cmd+V must not start
     // another paste behind the theme-choice dialog.
     if (document.querySelector('[aria-modal="true"]')) return;
+    // Cmd/Ctrl +, - and 0 zoom the canvas wherever focus is: no field gives
+    // them a meaning of its own, and left alone they would zoom the whole
+    // interface (the browser's page zoom, the desktop menu's zoom roles).
+    if (canvas.handleZoomShortcut(e)) return;
     const typing =
       t &&
       (t.isContentEditable ||
@@ -351,18 +398,31 @@ export function bindEditorKeys(deps: ShellDeps, clipboard: ClipboardActions): vo
       duplicateSelection(store);
       return;
     }
-    if (mod && ['b', 'i', 'u'].includes(e.key.toLowerCase())) {
+    // Strikethrough is Cmd/Ctrl+Shift+X (Google Docs and Slides), which has
+    // to be caught before Cmd/Ctrl+X cuts the box.
+    const strike = mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'x';
+    if (strike || (mod && ['b', 'i', 'u'].includes(e.key.toLowerCase()))) {
       const texts = store.selectedElements()
         .filter((element): element is Extract<SlideElement, { type: 'text' }> => element.type === 'text');
       if (texts.length > 0) {
         e.preventDefault();
-        const format: TextFormat = e.key.toLowerCase() === 'b'
+        const format: TextFormat = strike ? 'strikethrough' : e.key.toLowerCase() === 'b'
           ? 'bold' : e.key.toLowerCase() === 'i' ? 'italic' : 'underline';
         const active = texts.every((element) => wholeTextFormatState(element, format));
         store.updateSelected((element) => {
           if (element.type === 'text') setWholeTextFormat(element, format, !active);
         }, { label: `${active ? 'Remove' : 'Apply'} ${format}` });
       }
+      return;
+    }
+    // Stacking order, as in Keynote and Figma: [ and ] step the selection
+    // backward and forward, with Shift all the way to the back and front.
+    // By physical key, so Shift's "{"/"}" and other layouts read the same.
+    if (!mod && !e.altKey && (e.code === 'BracketLeft' || e.code === 'BracketRight')) {
+      if (store.get().selection.size === 0) return;
+      e.preventDefault();
+      const up = e.code === 'BracketRight';
+      arrangeSelection(store, e.shiftKey ? (up ? 'front' : 'back') : (up ? 'forward' : 'backward'));
       return;
     }
     if (mod && e.key.toLowerCase() === 'a') {
@@ -434,6 +494,25 @@ export function bindEditorKeys(deps: ShellDeps, clipboard: ClipboardActions): vo
       case 'n':
         if (!mod) rail.addSlide();
         break;
+      // Figma's drawing keys: P takes up the pen, Shift+P the pencil.
+      case 'p':
+      case 'P':
+        if (!mod && !e.altKey) {
+          e.preventDefault();
+          if (e.shiftKey) canvas.startPencil();
+          else canvas.startPen();
+        }
+        break;
+      case 'Enter': {
+        // Return on a selected line, arrow, curve or path opens its points,
+        // as a double-click does; a focused control keeps its own Return.
+        const [only] = store.selectedElements();
+        if (mod || e.altKey || !only || store.get().selection.size !== 1 || !isLineFamily(only)) break;
+        if (t?.closest('button, a, [role="menuitem"], #rail')) break;
+        e.preventDefault();
+        canvas.togglePathEdit(only.id);
+        break;
+      }
     }
   });
 }
@@ -444,7 +523,7 @@ export function makeContextActions(
   deps: ShellDeps,
   clipboard: ClipboardActions,
 ): (el: SlideElement | null) => ContextItems {
-  const { store, canvas, openTrim, openRaster } = deps;
+  const { store, canvas, openTrim, openRaster, downloadOriginal } = deps;
   return (el) => {
     const sel = store.get().selection.size;
     const items: ContextItems = [];
@@ -460,12 +539,11 @@ export function makeContextActions(
         { label: 'Duplicate', action: () => duplicateSelection(store) },
         { label: 'Delete', action: () => store.deleteSelection() },
         'separator',
-        {
-          label: (el.comments?.length ?? 0) > 0 ? 'Comments…' : 'Add comment…',
-          action: () => canvas.openElementComments(el.id),
-        },
-        { label: 'Bring to front', action: () => store.updateSelected((e) => (e.z += 1000)) },
-        { label: 'Send to back', action: () => store.updateSelected((e) => (e.z -= 1000)) },
+        commentItem(el.comments, (compose) => canvas.openComments(el.id, undefined, { compose })),
+        { label: ARRANGE_LABELS.front, action: () => arrangeSelection(store, 'front') },
+        { label: ARRANGE_LABELS.forward, action: () => arrangeSelection(store, 'forward') },
+        { label: ARRANGE_LABELS.backward, action: () => arrangeSelection(store, 'backward') },
+        { label: ARRANGE_LABELS.back, action: () => arrangeSelection(store, 'back') },
       );
       if (el.type === 'text' && store.slide
         && layoutGeometryFor(store.slide, el, store.get().deck.layoutMasters)
@@ -476,6 +554,16 @@ export function makeContextActions(
             const slide = deck.slides.find((candidate) => candidate.elements.some((e) => e.id === el.id));
             if (slide) realignElementToLayout(slide, el.id, deck.layoutMasters);
           }, { label: 'Reset to layout position' }),
+        });
+      }
+      // Two pictures selected, not yet a wipe: stack them into one.
+      const elements = store.slide?.elements ?? [];
+      const pair = wipeCandidates(elements, store.get().selection);
+      if (pair && pair.some((member) => member.id === el.id)
+        && !wipeOfPair(elements, pair.map((member) => member.id))) {
+        items.push('separator', {
+          label: 'Arrange as wipe',
+          action: () => arrangeWipe(store, [pair[0].id, pair[1].id]),
         });
       }
       if (el.type === 'image' || el.type === 'video') {
@@ -507,6 +595,12 @@ export function makeContextActions(
           items.push({ label: 'Edit w/ ffmpeg…', action: () => openTrim(el) });
         }
       }
+      if (isLineFamily(el) && sel === 1) {
+        items.push('separator', {
+          label: canvas.pathEditingElement() === el.id ? 'Done editing points' : 'Edit points',
+          action: () => canvas.togglePathEdit(el.id),
+        });
+      }
       if (el.type === 'web') {
         items.push({
           label: canvas.isWebLive(el.id) ? 'Back to editing' : 'Interact with page',
@@ -516,11 +610,46 @@ export function makeContextActions(
       if (el.type === 'image' && openRaster && !/\.pdf(?:$|[?#])/i.test(el.src)) {
         items.push({ label: 'Rasterize & paint…', action: () => openRaster(el) });
       }
+      // One file at a time, and only once it is one: a drop still uploading
+      // has no bytes on the host yet.
+      if ((el.type === 'image' || el.type === 'video') && downloadOriginal && sel === 1 && !isPendingSrc(el.src)) {
+        items.push({ label: downloadOriginal.label, action: () => downloadOriginal.run(el) });
+      }
       if (el.type === 'text' && sel === 1) {
         items.unshift({ label: 'Edit text', action: () => canvas.beginTextEdit(el.id) }, 'separator');
       }
+    } else if (store.slide) {
+      // The slide's own threads, and the ones on its objects, open from its
+      // background. Comments open only from here: nothing on the canvas is
+      // clickable for them.
+      const slide = store.slide;
+      const open = openThreadCount(slide.comments)
+        + slide.elements.reduce((sum, element) => sum + openThreadCount(element.comments), 0);
+      items.push(
+        'separator',
+        {
+          label: open > 0 ? `Comments on this slide (${open})…` : 'Comment on slide…',
+          action: () => canvas.openComments(null, undefined, { compose: open === 0 }),
+        },
+        {
+          label: commentHighlightsShown() ? 'Hide comment highlights' : 'Show comment highlights',
+          action: () => setCommentHighlightsShown(!commentHighlightsShown()),
+        },
+      );
     }
     return items;
+  };
+}
+
+/** The menu row that opens an object's threads: a count when it has open ones. */
+function commentItem(
+  comments: Comment[] | undefined,
+  open: (compose: boolean) => void,
+): { label: string; action: () => void } {
+  const count = openThreadCount(comments);
+  return {
+    label: count > 0 ? `Comments (${count})…` : 'Comment…',
+    action: () => open(count === 0),
   };
 }
 
@@ -536,6 +665,7 @@ export function barButton(label: string, onClick: () => void, variant = ''): HTM
 export function barIconButton(label: string, iconSvg: string, onClick: () => void): HTMLButtonElement {
   const b = document.createElement('button');
   b.className = 'bar-icon-button';
+  b.title = label;
   b.innerHTML = `${iconSvg}<span>${label}</span>`;
   b.addEventListener('click', onClick);
   return b;
@@ -544,3 +674,21 @@ export function barIconButton(label: string, iconSvg: string, onClick: () => voi
 export const TEXT_ICON =
   '<svg class="bar-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">' +
   '<path d="M3 3.5V2.5h10v1M8 2.5v11M6 13.5h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>';
+
+/**
+ * Text ▾ on the Insert bar: a text box, or a code block. Built on the
+ * toolbar picker, so it opens and reads exactly like Shape ▾ beside it. Both
+ * editors' toolbars use this one, so they cannot drift apart.
+ */
+export function createTextInsertPicker(insert: { textBox: () => void; codeBlock: () => void }): HTMLElement {
+  const trigger = document.createElement('button');
+  trigger.className = 'shape-menu-trigger text-insert-trigger';
+  trigger.innerHTML = `${TEXT_ICON}<span>Text</span>`
+    + '<svg class="shape-menu-chevron" viewBox="0 0 10 10" width="9" height="9" aria-hidden="true">'
+    + '<path d="M2 3.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" '
+    + 'stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  return createToolbarPicker('Text', [
+    { label: 'Text box', action: insert.textBox },
+    { label: 'Code block', action: insert.codeBlock },
+  ], { trigger });
+}

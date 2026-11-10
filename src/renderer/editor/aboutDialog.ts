@@ -1,17 +1,30 @@
 import { showEditorThemeDialog } from './editorThemeDialog.js';
+import { appearanceMenuSection } from '../uiTheme.js';
+import { interfaceSizeMenuSection } from '../uiScale.js';
+import { createToolbarPicker } from './exportPicker.js';
+import { updateMenuEntries } from './updateDialog.js';
 
 const ABOUT_DIALOG_ID = 'deckwerk-about';
 
-/** The product wordmark used at the leading edge of editor toolbars. */
-export function createDeckWerkButton(): HTMLButtonElement {
+/**
+ * The product wordmark at the leading edge of editor toolbars. It opens the
+ * app menu: About, Check for Updates (desktop only), and the editor chrome's
+ * appearance — settings that are set once rather than reached for while
+ * editing, so they stay out of the toolbar.
+ */
+export function createDeckWerkButton(): HTMLElement {
   const button = document.createElement('button');
-  button.type = 'button';
   button.className = 'brand-button';
   button.textContent = 'DeckWerk';
-  button.setAttribute('aria-label', 'About DeckWerk');
-  button.title = 'About DeckWerk';
-  button.addEventListener('click', showAboutDialog);
-  return button;
+  button.setAttribute('aria-label', 'DeckWerk menu');
+  button.title = 'DeckWerk';
+  const updates = updateMenuEntries();
+  return createToolbarPicker('DeckWerk', [
+    { label: 'About DeckWerk', action: showAboutDialog },
+    ...updates,
+    appearanceMenuSection(),
+    interfaceSizeMenuSection(),
+  ], { trigger: button });
 }
 
 /** Open the small, renderer-native About dialog. */
@@ -47,6 +60,15 @@ export function showAboutDialog(): void {
   description.textContent = 'Modern cross-platform slide editor by Vincent Sitzmann';
   copy.append(title, description);
   identity.append(mark, copy);
+  // The desktop app knows its own version (the browser editor is whatever
+  // the server is running); it is how someone confirms an update landed.
+  const updates = (window as { api?: { updates?: Window['api']['updates'] } }).api?.updates;
+  if (updates) {
+    const version = document.createElement('p');
+    version.className = 'about-version';
+    copy.appendChild(version);
+    void updates.state().then((state) => { version.textContent = `Version ${state.currentVersion}`; }, () => version.remove());
+  }
 
   const actions = document.createElement('div');
   actions.className = 'workflow-actions';

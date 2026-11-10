@@ -1,4 +1,5 @@
 import type { Slide } from '@shared/deck.js';
+import { durationField } from './durationField.js';
 import { MORPH_NAME } from '@shared/featureNames.js';
 import { makeId } from '@shared/geometry.js';
 import { explicitMorphPairs, suggestMorphPairs } from '@shared/morph.js';
@@ -6,7 +7,7 @@ import { recoverPreviewFrames } from '../player/previewFrameRecovery.js';
 import { freezePreviewVideos } from '../player/previewPoster.js';
 import { renderSlide } from '../player/render.js';
 import { describeElement as describe, renderElementLabel } from './elementLabel.js';
-import { sameSlideIgnoringNotes, type EditorStore } from './store.js';
+import { sameSlideDrawing, type EditorStore } from './store.js';
 
 const PREVIEW_WIDTH_FALLBACK = 560;
 
@@ -90,24 +91,18 @@ export class MorphPanel {
     duration.className = 'field morph-duration';
     const durationLabel = document.createElement('span');
     durationLabel.textContent = 'Duration';
-    const durationInput = document.createElement('input');
-    durationInput.type = 'number';
-    durationInput.min = '100';
-    durationInput.max = '5000';
-    durationInput.step = '50';
-    durationInput.value = String(next?.morphDuration ?? 1000);
-    durationInput.disabled = !next;
-    durationInput.addEventListener('change', () => {
-      const value = Math.max(100, Math.min(5000, Number(durationInput.value) || 1000));
-      this.store.commit((nextDeck) => {
-        const destination = nextDeck.slides[slideIndex + 1];
-        if (destination) destination.morphDuration = value;
-      }, { label: `Change ${MORPH_NAME} duration` });
-    });
-    const suffix = document.createElement('span');
-    suffix.className = 'field-suffix';
-    suffix.textContent = 'ms';
-    duration.append(durationLabel, durationInput, suffix);
+    const durationControl = durationField(
+      next?.morphDuration ?? 1000,
+      (ms) => {
+        const value = Math.max(100, Math.min(5000, ms || 1000));
+        this.store.commit((nextDeck) => {
+          const destination = nextDeck.slides[slideIndex + 1];
+          if (destination) destination.morphDuration = value;
+        }, { label: `Change ${MORPH_NAME} duration` });
+      },
+      { inputClass: 'morph-duration-input', label: `${MORPH_NAME} duration`, disabled: !next },
+    );
+    duration.append(durationLabel, durationControl);
     this.host.appendChild(duration);
 
     const easing = document.createElement('label');
@@ -186,7 +181,7 @@ export class MorphPanel {
       ? `${pairCount} paired; every other object will fade out or in.`
       : `Disabled · ${pairCount} object${pairCount === 1 ? '' : 's'} paired.`;
     const edit = document.createElement('button');
-    edit.className = 'primary panel-action morph-open';
+    edit.className = 'panel-action morph-open';
     edit.textContent = `Open ${MORPH_NAME} editor…`;
     edit.addEventListener('click', () => this.openModal());
     this.host.append(previews, summary, edit);
@@ -216,7 +211,7 @@ export class MorphPanel {
     header.appendChild(title);
 
     const action = document.createElement('button');
-    action.className = 'primary panel-action morph-bulk-pair';
+    action.className = 'panel-action morph-bulk-pair';
     action.textContent = `Enable ${MORPH_NAME} & Auto-Pair`;
     action.addEventListener('click', () => this.autoPairAcross(slides));
 
@@ -497,7 +492,7 @@ export class MorphPanel {
       cached
       && cached.canvasW === canvas.w
       && cached.canvasH === canvas.h
-      && sameSlideIgnoringNotes(cached.slide, slide)
+      && sameSlideDrawing(cached.slide, slide)
     ) {
       // A note edited since the surface was drawn changes nothing in the
       // picture; remember the current slide so the next comparison is cheap.
@@ -535,7 +530,12 @@ export class MorphPanel {
     updateScale();
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(updateScale);
     observer?.observe(frame);
-    surface.appendChild(renderSlide(slide, { resolveSrc: (src) => window.api.assetUrl(src), mediaPreload: 'metadata', deferVideoSrc: true }));
+    surface.appendChild(renderSlide(slide, {
+      resolveSrc: (src) => window.api.assetUrl(src),
+      mediaPreload: 'metadata',
+      deferVideoSrc: true,
+      decodeImagesAsync: true,
+    }));
     for (const video of surface.querySelectorAll('video')) {
       video.removeAttribute('autoplay');
       video.pause();

@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdir, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { build } from 'electron-vite';
-import { collectProcessOutput, electronBinary, freePort, type DevToolsTarget } from './browserSession.js';
-import { collabClientDir, sharedBuild } from './collabClient.js';
+import { collectProcessOutput, electronBinary, reportedPorts, type DevToolsTarget } from './browserSession.js';
+import { collabClientDir, enableRenderInvariants, sharedBuild } from './collabClient.js';
+import { electronChildEnv } from '../../src/cli/electronDisplay.js';
 
 /**
  * The REAL desktop app for the integration tests: built once per source
@@ -46,8 +47,12 @@ let pending: Promise<string> | null = null;
 export function desktopBuildDir(): Promise<string> {
   pending ??= sharedBuild({
     cacheName: 'slide-editor-vitest-desktop',
-    inputs: ['src', 'electron.vite.config.ts', 'package-lock.json', 'tsconfig.json'],
+    inputs: [
+      'src', 'electron.vite.config.ts', 'package-lock.json', 'tsconfig.json',
+      'test/support/collabClient.ts', 'test/support/desktopApp.ts',
+    ],
     produce: async (outDir, checkout) => {
+      enableRenderInvariants();
       await build({
         root: checkout,
         configFile: join(checkout, 'electron.vite.config.ts'),
@@ -78,8 +83,12 @@ export async function materializeDesktopApp(appDir: string, name: string): Promi
   await symlink(join(buildDir, 'out'), join(appDir, 'out'), 'dir');
   await symlink(join(process.cwd(), 'node_modules'), join(appDir, 'node_modules'), 'dir');
   await symlink(clientDir, join(appDir, 'dist', 'collab'), 'dir');
+  // The app's real version: without one Electron reports its own on macOS
+  // and "0.0" on Linux, which the updater refuses as not semver.
+  const { version } = JSON.parse(await readFile(join(process.cwd(), 'package.json'), 'utf8')) as { version: string };
   await writeFile(join(appDir, 'package.json'), JSON.stringify({
     name,
+    version,
     private: true,
     type: 'module',
     main: 'out/main/index.js',
@@ -89,6 +98,8 @@ export async function materializeDesktopApp(appDir: string, name: string): Promi
 export interface RunningApp {
   process: ChildProcess;
   debugPort: number;
+  /** The main process's Node inspector, when `args` asked for `--inspect=0`. */
+  inspectorPort?: number;
   /** Everything the app has written to stdout and stderr so far. */
   log: () => string;
 }
@@ -104,25 +115,24 @@ export function launchDesktopApp(appDir: string, args: string[], options: {
   env?: Record<string, string>;
   visible?: boolean;
 }): Promise<RunningApp> {
-  return freePort().then((debugPort) => {
-    const child = spawn(electronBinary, [
-      appDir,
-      `--remote-debugging-port=${debugPort}`,
-      '--remote-allow-origins=*',
-      `--user-data-dir=${options.profileDir}`,
-      ...args,
-    ], {
-      cwd: options.cwd ?? process.cwd(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        ELECTRON_DISABLE_SECURITY_WARNINGS: '1',
-        ...(options.visible ? {} : { DECKWERK_HEADLESS_TEST: '1' }),
-        ...options.env,
-      },
-    });
-    return { process: child, debugPort, log: collectProcessOutput(child) };
+  const child = spawn(electronBinary, [
+    appDir,
+    // Chromium picks the port; see `reportedPorts`.
+    '--remote-debugging-port=0',
+    '--remote-allow-origins=*',
+    `--user-data-dir=${options.profileDir}`,
+    ...args,
+  ], {
+    cwd: options.cwd ?? process.cwd(),
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...electronChildEnv(),
+      ...(options.visible ? {} : { DECKWERK_HEADLESS_TEST: '1' }),
+      ...options.env,
+    },
   });
+  const log = collectProcessOutput(child);
+  return reportedPorts(child, args, log).then((ports) => ({ process: child, log, ...ports }));
 }
 
 /** The editor window among an app's DevTools targets. */

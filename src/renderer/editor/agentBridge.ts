@@ -1,3 +1,5 @@
+import { braceDepthOf } from '@shared/brace.js';
+import { authoredFlips } from '@shared/flip.js';
 import {
   AGENT_PROTOCOL_VERSION,
   applyAgentTransaction,
@@ -9,8 +11,9 @@ import {
   type ComputedSlideScene,
 } from '@shared/agent.js';
 import type { Deck, Slide, SlideElement } from '@shared/deck.js';
+import type { PageStamp } from '@shared/htmlSlides.js';
 import { fitAutoText, renderSlide } from '../player/render.js';
-import { sameSlideIgnoringNotes, type EditorStore } from './store.js';
+import { sameSlideDrawing, type EditorStore } from './store.js';
 
 const COMPUTED_PROPERTIES = [
   'color', 'background-color', 'font-family', 'font-size', 'font-weight',
@@ -34,6 +37,8 @@ export interface HtmlSyncOutcome {
   slides: Array<{ id: string; elements: Array<{ id: string; type: string; box: { x: number; y: number; w: number; h: number } }> }>;
   warnings: string[];
   message: string;
+  /** What the page's slides now are, for stamping into the page (`stampPage`). */
+  stamp?: PageStamp;
 }
 
 /** Publishes the editor's live, computed selection through the file-backed main-process bridge. */
@@ -87,7 +92,8 @@ export class AgentBridge {
       try {
         if (!this.options.syncHtml) throw new Error('This editor cannot compile authoring files');
         const outcome = await this.options.syncHtml({
-          path: request.path, contents: request.contents, after: request.after ?? null, label: request.label,
+          // Undefined appends; null is an explicit "before the first slide".
+          path: request.path, contents: request.contents, after: request.after, label: request.label,
         });
         this.options.respond({
           version: AGENT_PROTOCOL_VERSION,
@@ -195,7 +201,7 @@ export class AgentBridge {
         && previous.canvas.h === canvas.h
         && previous.slides.length === selectedSlides.length
         && previous.slides.every((entry, i) => entry.index === selectedSlides[i].index
-          && sameSlideIgnoringNotes(entry.slide, selectedSlides[i].slide));
+          && sameSlideDrawing(entry.slide, selectedSlides[i].slide));
       const scenes = reusable
         ? previous.scenes
         : await buildComputedScenes(
@@ -384,7 +390,7 @@ function computedElement(
     selected: selectedIds.has(element.id),
     authored: {
       x: element.x, y: element.y, w: element.w, h: element.h,
-      rot: element.rot, z: element.z, opacity: element.opacity,
+      rot: element.rot, ...authoredFlips(element), z: element.z, opacity: element.opacity,
     },
     rendered: rect ? {
       x: rect.left - rootRect.left,
@@ -422,6 +428,7 @@ function computedElement(
       arrowStart: element.arrowStart,
       arrowEnd: element.arrowEnd,
       control: element.control ?? null,
+      braceDepth: element.shape === 'brace' ? braceDepthOf(element) : null,
       path: element.path,
     } : null,
     morphId: element.morphId ?? null,

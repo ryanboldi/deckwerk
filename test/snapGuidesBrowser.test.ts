@@ -210,14 +210,17 @@ describe.skipIf(!electronBinary)('spacing and sizing guides in the running edito
     await cdp.clickAt(centre.x, centre.y);
     expect(await cdp.evaluate<string[]>('[...window.store.get().selection]')).toEqual(['middle']);
 
-    // Drag the south-east corner in, past the match and back to 497 square.
+    // Drag the south-east corner in, short of the match and up to it: the
+    // neighbours' width is nearer than the left picture's bottom edge, 2px
+    // further on. (At 497 that edge is exactly aligned, and a keep-aspect
+    // corner honours the nearer cue — the alignment — instead.)
     const corner = toScreen(708 + 503, 304 + 503);
     const resize = await cdp.beginDrag(corner.x, corner.y);
     const at = (size: number) => toScreen(708 + size, 304 + size);
     await resize.moveTo(at(460).x, at(460).y);
     expect((await guides()).sizes).not.toContain('495');
 
-    await resize.moveTo(at(497).x, at(497).y);
+    await resize.moveTo(at(495).x, at(495).y);
     const whileResizing = await guides();
     // Its own bar plus the left picture's and all three captions', which are
     // 495 wide too — every box the author has just matched.
@@ -225,6 +228,47 @@ describe.skipIf(!electronBinary)('spacing and sizing guides in the running edito
 
     await resize.drop();
     expect(await boxOf('middle')).toMatchObject({ w: 495, h: 495 });
+  }, 180_000);
+
+  it('keeps a wide picture\'s corner on one size as it sweeps, and lands it on the guide it shows', async () => {
+    // A 400x200 picture at (200, 400), and a neighbour whose bottom edge sits
+    // at y = 704. The corner used to be driven by whichever side had moved
+    // more raw pixels: on a wide picture that hands over from height to width
+    // far off the diagonal, where the two disagree, so the box jumped. And a
+    // snap was undone by re-imposing the ratio from the other axis, so the
+    // guide came up while the edge stayed where it was.
+    const { cdp, toScreen, boxOf } = await openEditor([
+      picture('p', 200, 400, 200),
+      { ...picture('n', 1300, 300, 554), y: 150 },
+    ]);
+    const centre = toScreen(400, 500);
+    await cdp.clickAt(centre.x, centre.y);
+    expect(await cdp.evaluate<string[]>('[...window.store.get().selection]')).toEqual(['p']);
+
+    const corner = toScreen(600, 600);
+    const resize = await cdp.beginDrag(corner.x, corner.y);
+    // Sweep right with the pointer 60px down. Height leads throughout
+    // (60/200 beats dx/400), so the box stays 520x260 — it used to jump to
+    // 460 wide the moment dx passed 60.
+    const widths: number[] = [];
+    for (let dx = 20; dx <= 110; dx += 10) {
+      const at = toScreen(600 + dx, 660);
+      await resize.moveTo(at.x, at.y);
+      widths.push((await boxOf('p')).w);
+    }
+    expect(new Set(widths)).toEqual(new Set([520]));
+
+    // Now width leads (200/400 beats 96/200) and puts the bottom at 700, 4px
+    // short of the neighbour's: the guide is up, so the edge is on it.
+    const near = toScreen(800, 696);
+    await resize.moveTo(near.x, near.y);
+    const guides = await cdp.evaluate<string[]>(
+      `[...document.querySelectorAll('#canvas .guide-y')].map((g) => g.style.top)`,
+    );
+    expect(guides).toContain('704px');
+    expect(await boxOf('p')).toEqual({ x: 200, y: 400, w: 608, h: 304 });
+    await resize.drop();
+    expect(await boxOf('p')).toEqual({ x: 200, y: 400, w: 608, h: 304 });
   }, 180_000);
 });
 

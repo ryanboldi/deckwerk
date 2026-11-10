@@ -53,10 +53,16 @@ const CLIPBOARD_MARKERS = [
   /pasteFromClipboard/,
   /\[\s*'(?:paste|cut|copy)'\s*\]/,
   /clipboard\.(?:write|read)/,
+  /copyFilesLikeFileManager/,
 ];
 
 /** Suites that share machine state or need a process topology of their own. */
 const SERIAL_BY_NATURE = [
+  // Measures the collab server's event loop under load: timing, so alone.
+  'test/collabStalls.test.ts',
+  // Times keystrokes and frames in the editor: other suites' Electrons on
+  // the same cores showed up as 100-190 ms keystrokes that were not its own.
+  'test/editingLatencyBrowser.test.ts',
   // CDP's IME path reaches Chromium's real InputMethodController. When two
   // Electron apps drive it concurrently under Xvfb, Linux can terminate one
   // synthetic preedit before its next update and leave the old candidate in
@@ -73,12 +79,18 @@ const SERIAL_BY_NATURE = [
   // processes. Under a fully parallel unit run those events can be starved
   // long enough for the file bridge to miss its response deadline.
   'test/localAgentBridge.test.ts',
+  // The same, plus the desktop app, the downloaded bridge in a process of its
+  // own and transient systemd units for the production sandbox.
+  'test/agentCollaboration.test.ts',
+  'test/agentCollaborationSandbox.test.ts',
+  'test/agentCollaborationFuzz.test.ts',
   // Real ffmpeg, Python importer, media-probe, and network pipelines. Their
   // assertions are functional, not performance budgets; run them alone so a
   // busy parallel worker pool cannot turn startup latency into a false red.
   'test/exportDeckCompression.test.ts',
   'test/ffmpeg.test.ts',
   'test/keynoteImport.test.ts',
+  'test/keynoteReference.test.ts',
   'test/mediaImportFormats.test.ts',
   'test/mp4FastStart.test.ts',
   'test/posterCache.test.ts',

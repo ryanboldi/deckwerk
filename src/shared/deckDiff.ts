@@ -1,19 +1,22 @@
 import type { Deck, Slide } from './deck.js';
 import type { AgentOperation } from './agent.js';
+import { contentOf } from './comments.js';
 
 /**
  * Structural diff of two decks into the agent op vocabulary, keyed entirely by
  * stable slide/element ids. Applying the result to `prev` with lenient (or
- * strict) semantics reproduces `next`, up to element array order — which is
- * not load-bearing: render order is governed by `z`, and replaceElement
- * preserves array position.
+ * strict) semantics reproduces `next`. Element array order matters as well
+ * as `z` — objects of equal `z` paint in array order — so replaceElement keeps
+ * an element's position and an inserted element is anchored after its
+ * predecessor in `next`; only a reorder of surviving elements is not
+ * expressed.
  *
  * The inverse of diffDecks(prev, next) is simply diffDecks(next, prev); the
  * collab undo layer relies on that.
  *
  * Fast path: EditorStore.commit preserves object identity for untouched
- * slides (shareUnchangedSlides), so identical references are skipped without
- * a stringify.
+ * slides and elements (reshareDeck), as applyOpsLenient does for whatever no
+ * op touched, so identical references are skipped without a stringify.
  */
 export function diffDecks(prev: Deck, next: Deck): AgentOperation[] {
   const ops: AgentOperation[] = [];
@@ -24,12 +27,17 @@ export function diffDecks(prev: Deck, next: Deck): AgentOperation[] {
   const prevIds = new Set(prev.slides.map((slide) => slide.id));
   const nextIds = new Set(next.slides.map((slide) => slide.id));
 
-  for (const slide of prev.slides) {
-    if (!nextIds.has(slide.id)) ops.push({ op: 'deleteSlide', slideId: slide.id });
-  }
+  const deletes: AgentOperation[] = prev.slides
+    .filter((slide) => !nextIds.has(slide.id))
+    .map((slide) => ({ op: 'deleteSlide', slideId: slide.id }));
+  // A deck never has no slides, so replacing every slide must insert the new
+  // ones before deleting the last old one, or the apply refuses that delete.
+  const replacesEverySlide = deletes.length === prev.slides.length && next.slides.length > 0;
+  if (!replacesEverySlide) ops.push(...deletes);
 
   ops.push(...reorderOps(prev, next, prevIds));
   ops.push(...insertSlideOps(next, prevIds));
+  if (replacesEverySlide) ops.push(...deletes);
 
   const prevById = new Map(prev.slides.map((slide) => [slide.id, slide]));
   for (const nextSlide of next.slides) {
@@ -52,7 +60,7 @@ function diffDeckProps(prev: Deck, next: Deck): AgentOperation | null {
     }
   }
   for (const key of ['canvas', 'themeStyle', 'themeSelection', 'themeHistory', 'customThemes', 'layoutMasters'] as const) {
-    if (JSON.stringify(prev[key]) !== JSON.stringify(next[key])) {
+    if (prev[key] !== next[key] && JSON.stringify(prev[key]) !== JSON.stringify(next[key])) {
       op[key] = structuredClone(next[key]);
       changed = true;
     }
@@ -114,8 +122,18 @@ function insertSlideOps(next: Deck, prevIds: Set<string>): AgentOperation[] {
 function diffSlide(prev: Slide, next: Slide): AgentOperation[] {
   const ops: AgentOperation[] = [];
 
-  const { elements: prevElements, ...prevProps } = prev;
-  const { elements: nextElements, ...nextProps } = next;
+  // Comments travel as their own merging op, never inside a content patch
+  // (shared/comments.ts).
+  const { elements: prevElements, comments: prevComments, ...prevProps } = prev;
+  const { elements: nextElements, comments: nextComments, ...nextProps } = next;
+  if (JSON.stringify(prevComments ?? []) !== JSON.stringify(nextComments ?? [])) {
+    ops.push({
+      op: 'updateComments',
+      slideId: next.id,
+      base: structuredClone(prevComments ?? []),
+      comments: structuredClone(nextComments ?? []),
+    });
+  }
   if (JSON.stringify(prevProps) !== JSON.stringify(nextProps)) {
     // Only the fields that actually changed. Sending the whole blob made a
     // notes edit overwrite a peer's concurrent timeline edit on the same slide.
@@ -151,20 +169,47 @@ function diffSlide(prev: Slide, next: Slide): AgentOperation[] {
     });
   }
 
-  const added = nextElements.filter((element) => !prevById.has(element.id));
-  if (added.length > 0) {
-    ops.push({ op: 'insertElements', slideId: next.id, elements: structuredClone(added) });
-  }
+  // Runs of new elements, each anchored on the element just before it in
+  // `next` — a survivor, or the end of an earlier run (already inserted, since
+  // runs are emitted left to right).
+  let run: typeof nextElements = [];
+  let runAnchor: string | null = null;
+  const flush = () => {
+    if (run.length === 0) return;
+    ops.push({
+      op: 'insertElements', slideId: next.id, elements: structuredClone(run), afterElementId: runAnchor,
+    });
+    run = [];
+  };
+  nextElements.forEach((element, i) => {
+    if (prevById.has(element.id)) {
+      flush();
+      return;
+    }
+    if (run.length === 0) runAnchor = i === 0 ? null : nextElements[i - 1].id;
+    run.push(element);
+  });
+  flush();
 
   for (const element of nextElements) {
     const before = prevById.get(element.id);
     if (!before || before === element) continue;
-    if (JSON.stringify(before) !== JSON.stringify(element)) {
+    const content = contentOf(element);
+    if (JSON.stringify(contentOf(before)) !== JSON.stringify(content)) {
       ops.push({
         op: 'replaceElement',
         slideId: next.id,
         elementId: element.id,
-        element: structuredClone(element),
+        element: structuredClone(content) as typeof element,
+      });
+    }
+    if (JSON.stringify(before.comments ?? []) !== JSON.stringify(element.comments ?? [])) {
+      ops.push({
+        op: 'updateComments',
+        slideId: next.id,
+        elementId: element.id,
+        base: structuredClone(before.comments ?? []),
+        comments: structuredClone(element.comments ?? []),
       });
     }
   }
