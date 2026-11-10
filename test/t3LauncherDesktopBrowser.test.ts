@@ -15,7 +15,7 @@ afterEach(async () => {
   cdp?.close(); main?.close(); await stopBrowser(app?.process ?? null); await server?.close();
   if (root) await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
-it('both T3 buttons open chat links, with Remote reusing a No project server conversation', async () => {
+it('the Agent menu opens local and remote chats, with Remote reusing a No project server conversation', async () => {
   root = await mkdtemp(join(tmpdir(), 'deckwerk-t3-'));
   const deckDir = join(root, 'VPO-Base'), profile = join(root, 'profile'), appDir = join(root, 'app');
   await mkdir(join(deckDir, '.deckwerk-remote'), { recursive: true }); await mkdir(profile);
@@ -50,12 +50,14 @@ it('both T3 buttons open chat links, with Remote reusing a No project server con
   // Capture the OS link handoff; run the real buttons, save, IPC, HTTP route and chat service.
   await evaluate(`globalThis.t3Launches = []; require('electron').shell.openExternal = async url => { globalThis.t3Launches.push(url); };`);
   await eventually(() => cdp!.evaluate<string>(`window.api.getDeck().then(s => s?.deck.title ?? '')`), 'deck loaded', t => t === 'VPO-Base');
-  await eventually(() => cdp!.evaluate<boolean>(`[...document.querySelectorAll('button')].some(b => ['More', 'Open with T3 Remote'].includes(b.textContent.trim()) && b.getBoundingClientRect().width > 0)`), 'T3 toolbar painted');
+  await eventually(() => cdp!.evaluate<boolean>(`[...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Agent' && b.getBoundingClientRect().width > 0)`), 'Agent toolbar painted');
   await eventually(() => cdp!.evaluate<string>(`document.querySelector('#status')?.textContent?.replace(/\\s+/g, ' ') ?? ''`), 'opening finished', text => text === 'VPO-Base · slide 1/1');
-  for (const mode of ['Remote', 'Local', 'Remote']) {
-    const visible = await cdp.evaluate<boolean>(`[...document.querySelectorAll('button')].some(b => b.textContent === 'Open with T3 ${mode}' && b.getBoundingClientRect().width > 0)`);
-    if (!visible) await cdp.clickByText('button', 'More');
-    await cdp.clickByText(visible ? 'button' : '[role=menuitem]', `Open with T3 ${mode}`);
+  for (const [mode, width] of [['Remote', 1600], ['Local', 760], ['Remote', 1600]] as const) {
+    await cdp.call('Emulation.setDeviceMetricsOverride', { width, height: 1000, deviceScaleFactor: 1, mobile: false });
+    expect(await cdp.evaluate<boolean>(`[...document.querySelectorAll('#toolbar button')].some(b => b.textContent.trim().startsWith('t3 '))`)).toBe(false);
+    await cdp.clickByText('button', 'Agent');
+    expect(await cdp.evaluate<string>(`[...document.querySelectorAll('[role=menu]')].filter(m => m.getBoundingClientRect().width > 0).map(m => m.textContent).join(' ')`)).toContain('Agent panel…');
+    await cdp.clickByText('[role=menuitem]', `t3 ${mode.toLowerCase()}`);
     const message = await eventually(() => cdp!.evaluate<string>(`document.body.innerText`), 'T3 launch completed', t => t.includes('Could not open T3:') || t.includes(mode === 'Remote' ? "presentation's T3 chat on the server" : 'local T3 chat draft'));
     expect(message).not.toContain('Could not open T3:');
     expect(message).toContain(mode === 'Remote' ? 'server' : 'local');

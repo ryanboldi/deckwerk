@@ -1,7 +1,7 @@
 # Open a deck in T3
 
-The desktop toolbar has Open with T3 Local and Open with T3 Remote, also in
-More when the window is narrow. Both save the presentation and open a T3 chat
+The desktop toolbar's Agent menu contains t3 local, t3 remote, and Agent panel….
+Both T3 options save the presentation and open a T3 chat
 with presentation context in the composer. Add your requested changes and press
 Send. Opening the chat never sends a message or starts an agent.
 

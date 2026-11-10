@@ -649,20 +649,17 @@ function buildToolbar(): void {
   collaborateButton.id = 'collaborate-trigger';
   const secondaryActions = document.createElement('span');
   secondaryActions.className = 'toolbar-expanded-secondary-actions';
-  secondaryActions.append(
-    barButton('Agent…', () => void toggleAgentPanel()),
-    barButton('Open with T3 Local', () => void openT3Agent('local')),
-    barButton('Open with T3 Remote', () => void openT3Agent('remote')),
-    collaborateButton,
-  );
+  secondaryActions.append(collaborateButton);
   const compactSecondary = createToolbarPicker('More', [
-    { label: 'Agent…', action: () => void toggleAgentPanel() },
-    { label: 'Open with T3 Local', action: () => void openT3Agent('local') },
-    { label: 'Open with T3 Remote', action: () => void openT3Agent('remote') },
     { label: 'Collaboration…', action: () => void startSharing() },
   ]);
   compactSecondary.classList.add('toolbar-compact-secondary-action');
   right.append(
+    createToolbarPicker('Agent', [
+      { label: 't3 local', action: () => void openT3Agent('local') },
+      { label: 't3 remote', action: () => void openT3Agent('remote') },
+      { label: 'Agent panel…', action: () => void toggleAgentPanel() },
+    ]),
     secondaryActions,
     compactSecondary,
     createToolbarSplitButton(
