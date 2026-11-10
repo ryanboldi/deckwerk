@@ -764,8 +764,8 @@ async function openT3Agent(mode: 'local' | 'remote'): Promise<void> {
   try {
     await cssEditor.flush();
     await save();
-    await runOperation('Opening T3…', async () => window.api.openT3(mode));
-    setStatusMessage(`Opened T3 ${mode === 'local' ? 'Local' : 'Remote'} for this presentation.`);
+    const message = await runOperation('Opening T3…', async () => window.api.openT3(mode));
+    setStatusMessage(message);
   } catch (error) {
     setStatusMessage(`Could not open T3: ${error instanceof Error ? error.message : error}`);
   }

@@ -1,22 +1,30 @@
 # Open a deck in T3
 
 The desktop toolbar has Open with T3 Local and Open with T3 Remote, also in
-More when the window is narrow. Local opens the actual deck folder or offline
-mirror in the installed `~/.local/bin/t3 app` CLI. T3 must already be running.
-No prompt is sent and no model starts automatically.
+More when the window is narrow. Both save the current deck, open T3, and copy
+presentation context to the clipboard. Paste it into the conversation you want
+to use, then describe your changes. Neither button registers a project, creates
+a conversation, sends a message, or starts a model.
 
-Remote opens the configured existing T3 thread for the server deck. That thread's
-agent runs on its remote machine, independently of this desktop app. T3's
-linked-environment agent tools are not required; the T3 client needs its usual
-connection to the remote environment.
+Local brings T3 forward and copies the actual deck folder or offline mirror.
+Use a conversation running on this Mac. That agent can keep editing offline.
 
-Configure known deck threads in `t3-workspaces.json` inside DeckWerk's user-data
-directory. It is an array of objects with `server` (exact server origin),
-`deckId` (server folder id), `environmentId`, and `threadId`. A missing mapping
-reports an error rather than opening another deck's agent. The mapping is local
-configuration and contains no credentials. Existing T3 authentication applies.
+Remote opens an existing conversation if one is configured for this exact
+presentation. Otherwise it brings T3 forward. Its copied context identifies the
+server, presentation, and web editor link. Choose a conversation on the server
+(RyBox for RyBox presentations) and paste the context before asking for edits.
+Bringing T3 forward alone does not change which machine a conversation runs on.
+New decks and forks work without setting up a mapping.
 
-Both launchers flush the current deck first. A local agent works in the Mac's
-mirror and can keep editing offline. A remote agent works against the server's
-live deck through slide-agent, while every connected editor sees its changes.
-Avoid having both agents edit the same slide at once.
+Optional existing-conversation links live in `t3-workspaces.json` inside
+DeckWerk's user-data directory. The file is an array of objects with `server`
+(exact server origin), `deckId` (server folder id), `environmentId`, and
+`threadId`. Missing or unreadable configuration falls back to opening T3.
+Invalid identifiers in a matching entry report an error. The file contains no
+credentials; T3 uses its existing connections and authentication. Linked
+environments in Labs are not required to use these buttons.
+
+The copied context asks agents to read the presentation instructions and make
+version checkpoints before and after editing. A remote agent works on the
+server's live deck through slide-agent while connected editors see its changes.
+Avoid having local and remote agents edit the same slide at once.

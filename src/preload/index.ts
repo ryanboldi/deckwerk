@@ -203,7 +203,7 @@ const api = {
     ipcRenderer.invoke(IPC.agentPanelGetState),
 
   /** Deck servers (remoteDecks.ts): the list, the decks on one, opening one as a mirror. */
-  openT3: (mode: 'local' | 'remote'): Promise<void> => ipcRenderer.invoke(IPC.t3Open, mode),
+  openT3: (mode: 'local' | 'remote'): Promise<string> => ipcRenderer.invoke(IPC.t3Open, mode),
   presentationGit: (request: PresentationGitRequest): Promise<PresentationGitResponse> => ipcRenderer.invoke(IPC.presentationGit, request),
   syncRemoteHistoryFiles: async (removed: Record<string, string>): Promise<void> => {
     await ipcRenderer.invoke(IPC.remoteHistoryFiles, removed);
