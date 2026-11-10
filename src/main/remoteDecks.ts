@@ -1,3 +1,4 @@
+import type { PresentationGitRequest, PresentationGitResponse } from '@shared/presentationGit.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync, watch, type FSWatcher } from 'node:fs';
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
@@ -176,6 +177,10 @@ export class RemoteClient {
 
   async deck(deckId: string): Promise<Deck> {
     return parseDeck(renameRetiredFields(await this.json<unknown>('/api/deck', { deck: deckId })));
+  }
+
+  async presentationGit(deckId: string, command: PresentationGitRequest): Promise<PresentationGitResponse> {
+    return (await this.request('/api/git', { deck: deckId }, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(command), signal: AbortSignal.timeout(120_000) })).json() as Promise<PresentationGitResponse>;
   }
 
   async createDeck(name: string): Promise<string> {
@@ -400,6 +405,21 @@ export async function sha256File(file: string): Promise<string> {
   return hash.digest('hex');
 }
 
+/** A history deletion must not remove a locally edited file with the same name. */
+export async function syncMirrorHistoryFiles(client: RemoteClient, dir: string, deckId: string, removed: Record<string, string>): Promise<void> {
+  for (const [path, expected] of Object.entries(removed)) {
+    if (!path.startsWith('assets/') || path.includes('\\') || path.split('/').some((part) => !part || part.startsWith('.')) || !/^[0-9a-f]{40}$/.test(expected)) continue;
+    const file = join(dir, path);
+    try {
+      const info = await stat(file);
+      const hash = createHash('sha1').update(`blob ${info.size}\0`);
+      await pipeline(createReadStream(file), hash);
+      if (hash.digest('hex') === expected) await rm(file, { force: true });
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  }
+  await syncMirrorFiles(client, dir, deckId);
+}
+
 const hashCache = new Map<string, { size: number; mtimeMs: number; sha256: string }>();
 async function cachedSha(file: string): Promise<string> {
   const info = await stat(file);
@@ -614,6 +634,13 @@ export class MirrorAssetUploader {
     });
     this.running = run.catch(() => undefined);
     return run;
+  }
+
+  /** Queue history changes between file syncs, so removed assets stay removed. */
+  exclusive<T>(work: () => Promise<T>): Promise<T> {
+    const result = this.running.then(work);
+    this.running = result.then(() => {}, () => {});
+    return result;
   }
 
   close(): void {

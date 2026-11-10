@@ -96,6 +96,9 @@ export const IPC = {
   remoteLocalCopies: 'remote:localCopies',
   /** Is this open folder the mirror of a server deck? Then how to reach it. */
   remoteBinding: 'remote:binding',
+  presentationGit: 'remote:presentationGit',
+  presentationPdf: 'remote:presentationPdf',
+  remoteHistoryFiles: 'remote:historyFiles',
   /** Persist the last server state the editor saw beside the mirror. */
   remoteBaselineSave: 'remote:baselineSave',
   /** Reconcile the mirror's files with the server now (on every reconnect). */

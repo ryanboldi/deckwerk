@@ -82,6 +82,7 @@ export default defineConfig({
         index: resolve(__dirname, 'src/renderer/collab/index.html'),
         mobile: resolve(__dirname, 'src/renderer/collab/mobile.html'),
         present: resolve(__dirname, 'src/renderer/collab/present.html'),
+        history: resolve(__dirname, 'src/renderer/collab/history.html'),
         print: resolve(__dirname, 'src/renderer/collab/print.html'),
       },
     },

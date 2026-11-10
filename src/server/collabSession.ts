@@ -78,6 +78,8 @@ export interface CollabSessionEvents {
  * (`.deckwerk-server.json`), where they are ordinary transactions.
  */
 export class CollabSession {
+  /** Short filesystem installation window during a reviewed history operation. */
+  historyLocked = false;
   private saveTimer: NodeJS.Timeout | null = null;
   /**
    * What the last autosave wrote, and the file it left: a watcher event for
@@ -153,6 +155,7 @@ export class CollabSession {
    * `meta` — written later, off this path.
    */
   applyOps(ops: AgentOperation[], meta: EditMeta = UNATTRIBUTED): AppliedTxn {
+    if (this.historyLocked) throw new Error('A presentation history operation is applying. Retry the edit shortly.');
     if (this.closed) throw new Error('this presentation was closed (renamed or moved) — reopen it');
     const { deck: next, skipped } = applyOpsLenient(this.deck, ops);
     const errors = validateDeckIntegrity(next);
@@ -180,6 +183,7 @@ export class CollabSession {
   }
 
   saveThemeCss(css: string): void {
+    if (this.historyLocked) throw new Error('A presentation history operation is applying. Retry the theme edit shortly.');
     if (this.closed) return;
     this.themeCss = css;
     this.lastSavedTheme = css;

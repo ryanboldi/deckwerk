@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -11,7 +12,7 @@ import { startCollabServer, type RunningCollabServer } from '../src/server/colla
 import { LocalAgentRegistry } from '../src/server/localAgents.js';
 import {
   HttpError, RemoteClient, RemoteRelay, SavedServers, fetchMissingAssets, listMirrors, mirrorDirFor, normalizeServerUrl,
-  prepareMirror, readRemoteState, syncMirrorFiles, writeRemoteBaseline,
+  prepareMirror, readRemoteState, syncMirrorFiles, syncMirrorHistoryFiles, writeRemoteBaseline,
 } from '../src/main/remoteDecks.js';
 import { startCuttableLink, type CuttableLink } from './support/cuttableLink.js';
 import { OfflineReplica } from './support/offlineReplica.js';
@@ -359,4 +360,21 @@ describe('RemoteRelay', () => {
     await peer.until(() => peer.deck!.title === 'Renamed offline', 'merged title at the peer');
     expect((desktop.deck!.slides[0].elements[0] as { html: string }).html).toBe('Peer');
   });
+});
+
+
+it('history file sync removes unchanged deletions, preserves local edits, and downloads replacement bytes', async () => {
+  const client = new RemoteClient(origin);
+  const files = ['remove.txt', 'edited.txt', 'replace.txt'];
+  for (const file of files) await writeFile(join(rootDir, 'lab/talk/assets', file), 'old');
+  const { dir } = await prepareMirror(client, mirrorsRoot, 'lab/talk');
+  await writeFile(join(dir, 'assets/edited.txt'), 'local work');
+  await rm(join(rootDir, 'lab/talk/assets/remove.txt')); await rm(join(rootDir, 'lab/talk/assets/edited.txt'));
+  await writeFile(join(rootDir, 'lab/talk/assets/replace.txt'), 'new');
+  const old = createHash('sha1').update('blob 3\0old').digest('hex');
+  await syncMirrorHistoryFiles(client, dir, 'lab/talk', { 'assets/remove.txt': old, 'assets/edited.txt': old, '../../outside': old });
+  expect(existsSync(join(dir, 'assets/remove.txt'))).toBe(false);
+  expect(existsSync(join(rootDir, 'lab/talk/assets/remove.txt'))).toBe(false);
+  expect(await readFile(join(dir, 'assets/edited.txt'), 'utf8')).toBe('local work');
+  expect(await readFile(join(dir, 'assets/replace.txt'), 'utf8')).toBe('new');
 });

@@ -1,3 +1,5 @@
+import { showPresentationHistory } from '../editor/presentationHistory.js';
+import { webHistoryHost } from './presentationHistoryApi.js';
 import '../player/player.css';
 import '../appChrome.css';
 import '../editor/editor.css';
@@ -1183,6 +1185,21 @@ function buildToolbar(): void {
       onStatus: setStatusMessage,
       access: serverConfig.access ?? null,
     });
+    const openHistory = (): void => {
+      if (!deckId) return;
+      const host = webHistoryHost(deckId);
+      showPresentationHistory({ ...host, request: async (command) => {
+        if (!connected) throw new Error('Connect to the server before using branches.');
+        canvas.endTextEditing(true);
+        await cssEditor.flush();
+        const deadline = Date.now() + 10_000;
+        while (bridge.unconfirmed) {
+          if (Date.now() > deadline || !connected) throw new Error('Wait for pending edits to sync, then retry.');
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        return host.request(command);
+      } });
+    };
     const importEntries = [
       { label: 'Keynote…', action: () => importKeynoteToServer(setStatusMessage, here) },
       { label: 'PowerPoint…', action: () => importPowerPointToServer(setStatusMessage, here) },
@@ -1195,12 +1212,14 @@ function buildToolbar(): void {
         ? createToolbarSplitButton('Open', openDeck, [{ label: 'Tutorial', action: openServerTutorial }])
         : barButton('Open', openDeck),
       createToolbarPicker('Import…', importEntries),
+      barButton('Branches', openHistory),
     );
     compactFileEntries.push(
       {
         label: 'Presentation',
         options: [
           { label: 'New', action: createDeck },
+          { label: 'Branches…', action: openHistory },
           { label: 'Open…', action: openDeck },
           ...(tutorial ? [{ label: 'Tutorial', action: openServerTutorial }] : []),
         ],

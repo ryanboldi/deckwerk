@@ -74,6 +74,7 @@ export interface CollabBridgeHooks {
    * holding the old URL should move what they can.
    */
   onMediaVariants?: (srcs: string[]) => void;
+  onHistoryFiles?: (removed: Record<string, string>) => void;
   /** One accepted chat message, including the echo of this client's own. */
   onChat?: (message: ChatMessage) => void;
   onStatus: (text: string) => void;
@@ -651,6 +652,7 @@ export class CollabBridge {
         this.hooks.onThemeCss(message.css);
         return;
       case 'media': {
+        if (message.historyRemoved) this.hooks.onHistoryFiles?.(message.historyRemoved);
         const changed = [...new Set([...setMediaVariants(message.variants), ...setPendingMedia(message.pending)])];
         if (changed.length > 0) this.hooks.onMediaVariants?.(changed);
         return;

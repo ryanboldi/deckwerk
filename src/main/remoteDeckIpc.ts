@@ -1,6 +1,8 @@
+import { rm } from 'node:fs/promises';
+import { PresentationGitRequestSchema } from '@shared/presentationGit.js';
 import { homedir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
-import { app, ipcMain } from 'electron';
+import { app, ipcMain, shell } from 'electron';
 import type { IpcMainInvokeEvent, WebContents } from 'electron';
 import { parseDeck, type Deck } from '@shared/deck.js';
 import {
@@ -16,6 +18,9 @@ import type { DeckWindowState } from './deckWindows.js';
 import {
   MirrorAssetUploader,
   RemoteClient,
+  sha256File,
+  syncMirrorFiles,
+  syncMirrorHistoryFiles,
   RemoteRelay,
   SavedServers,
   bindingFor,
@@ -82,6 +87,47 @@ export function registerRemoteDeckIpc(deps: RemoteIpcDeps): void {
     if (resolve(dir) !== resolve(session.dir)) throw new Error('That server deck is no longer open in this window');
     return { state, dir: session.dir };
   };
+
+  const historyMirror = async (event: IpcMainInvokeEvent) => {
+    const session = requireSession(event);
+    const { state, dir } = requireMirror(event, session.dir);
+    const remote = await readRemoteState(dir);
+    const saved = remote && (await savedServers().list()).find((s) => s.url === remote.state.server);
+    if (!remote || !saved) throw new Error('Open a presentation from a saved server to use branches');
+    return { state, dir, deckId: remote.state.deckId, client: new RemoteClient(saved.url) };
+  };
+  ipcMain.handle(IPC.presentationGit, async (event, request: unknown) => {
+    const command = PresentationGitRequestSchema.parse(request);
+    const mirror = await historyMirror(event);
+    const work = async () => {
+      const before = command.command === 'apply' ? await mirror.client.files(mirror.deckId) : [];
+      const result = await mirror.client.presentationGit(mirror.deckId, command);
+      if (command.command === 'apply' && 'ok' in result) {
+        const after = new Set((await mirror.client.files(mirror.deckId)).map((f) => f.path));
+        for (const file of before) {
+          if (!file.path.startsWith('assets/') || file.path.split('/').some((part) => !part || part.startsWith('.')) || file.path.includes('\\') || after.has(file.path)) continue;
+          const path = join(mirror.dir, file.path);
+          if (await sha256File(path).catch(() => '') === file.sha256) await rm(path, { force: true });
+        }
+        await syncMirrorFiles(mirror.client, mirror.dir, mirror.deckId);
+      }
+      return result;
+    };
+    return uploaders.get(mirror.state)?.uploader.exclusive(work) ?? work();
+  });
+  ipcMain.handle(IPC.remoteHistoryFiles, async (event, removed: unknown) => {
+    if (!removed || typeof removed !== 'object' || Array.isArray(removed) || Object.values(removed).some((value) => typeof value !== 'string')) throw new Error('Invalid history files');
+    const mirror = await historyMirror(event);
+    const sync = () => syncMirrorHistoryFiles(mirror.client, mirror.dir, mirror.deckId, removed as Record<string, string>);
+    await (uploaders.get(mirror.state)?.uploader.exclusive(sync) ?? sync());
+  });
+  ipcMain.handle(IPC.presentationPdf, async (event, revision: unknown) => {
+    if (typeof revision !== 'string' || !/^[0-9a-f]{40}$/.test(revision)) throw new Error('Choose a checkpoint first');
+    const { client, deckId } = await historyMirror(event);
+    const url = new URL('/api/git/pdf', client.origin);
+    url.searchParams.set('deck', deckId); url.searchParams.set('revision', revision);
+    await shell.openExternal(url.href);
+  });
 
   ipcMain.handle(IPC.remoteServers, async (): Promise<RemoteServerEntry[]> => savedServers().list());
 

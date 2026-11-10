@@ -135,7 +135,7 @@ void (async () => {
     status.textContent = `${count} ready — choose "Save as PDF" as the destination.`;
     // Opening the dialog straight away is the expected flow; a browser that
     // refuses it without a gesture still leaves the button.
-    window.print();
+    if (params.get('automated') !== '1') window.print();
     return;
   }
   status.textContent = `${count} rendered, but some media did not finish loading`

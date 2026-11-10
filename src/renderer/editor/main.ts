@@ -1,3 +1,4 @@
+import { showPresentationHistory } from './presentationHistory.js';
 import '../player/player.css';
 import '../appChrome.css';
 import './editor.css';
@@ -573,6 +574,7 @@ function buildToolbar(): void {
   ];
   fileActions.append(
     barButton('New', newPresentation),
+    barButton('Branches', openPresentationHistory),
     createToolbarSplitButton('Open', () => void openPresentation(), [
       { label: 'Open Folder…', action: () => void openLocalPresentation() },
       { label: 'Connect to Server…', action: () => void openPresentation({ start: 'connect' }) },
@@ -586,6 +588,7 @@ function buildToolbar(): void {
       label: 'Presentation',
       options: [
         { label: 'New', action: newPresentation },
+        { label: 'Branches…', action: openPresentationHistory },
         { label: 'Open…', action: () => void openPresentation() },
         { label: 'Connect to Server…', action: () => void openPresentation({ start: 'connect' }) },
         { label: 'Tutorial', action: () => void openTutorial() },
@@ -1144,6 +1147,12 @@ function connectRemoteDeck(binding: RemoteDeckBinding): void {
       queueAgentSessionSnapshot();
       noteRemoteDeck(deck);
     },
+    onHistoryFiles: (removed) => {
+      void window.api.syncRemoteHistoryFiles(removed).then(() => {
+        if (remoteBinding !== binding) return;
+        canvas.forceRedraw(); rail.redrawThumbnails();
+      }).catch((error) => setStatusMessage(`History files could not sync: ${String(error)}`));
+    },
     onPeerPresence: (state) => {
       agentPresence?.upsert(state);
       rail.refreshPresence();
@@ -1221,6 +1230,32 @@ function connectRemoteDeck(binding: RemoteDeckBinding): void {
 }
 
 let creatingPresentation = false;
+function openPresentationHistory(): void {
+  if (!remoteBinding?.serverId) { setStatusMessage('Open a presentation from RyBox or another saved server to use branches.'); return; }
+  const binding = remoteBinding;
+  showPresentationHistory({
+    request: async (command) => {
+      if (!remoteConnected || remoteBinding !== binding) throw new Error('Connect to the presentation server before using branches. Offline editing remains available.');
+      canvas.endTextEditing(true);
+      await cssEditor.flush();
+      await save();
+      await window.api.syncRemoteFiles(binding.dir);
+      const deadline = Date.now() + 10_000;
+      while (agentSessionBridge?.unconfirmed) {
+        if (Date.now() > deadline || !remoteConnected) throw new Error('Wait for pending edits to sync, then retry.');
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return window.api.presentationGit(command);
+    },
+    openPdf: (revision) => window.api.presentationPdf(revision),
+    openDeck: async (deckId) => {
+      await save();
+      const session = await window.api.openRemoteDeck(binding.serverId!, deckId);
+      if (session) await adopt(session.dir, session.deck);
+    },
+  });
+}
+
 async function newPresentation(): Promise<void> {
   if (creatingPresentation) return;
   creatingPresentation = true;

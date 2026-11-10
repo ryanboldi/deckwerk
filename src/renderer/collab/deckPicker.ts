@@ -523,7 +523,8 @@ export function showDeckPicker(opts: {
       'Change who can open this presentation',
       () => showShareDialog(deck.id, opts.onStatus, () => reopen(folder)),
     );
-    return rowGroup(row, [rename, move, share, remove]);
+    const history = rowButton('Branches', 'Branch history and checkpoint PDFs', () => { location.href = `/history.html?deck=${encodeURIComponent(deck.id)}`; });
+    return rowGroup(row, [history, rename, move, share, remove]);
   };
 
   const renderTrail = (folders: FolderEntry[]) => {

@@ -1,3 +1,4 @@
+import { PresentationGitService } from './presentationGitService.js';
 import { renameRetiredFields } from '@shared/fieldAliases.js';
 import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -15,10 +16,14 @@ import { pathToFileURL } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { WebSocketServer, type WebSocket } from 'ws';
 import {
-  createDeck, importAsset, importWebPage, loadDeck, loadTheme, originalAssetPath, resolveAsset, saveDeck,
+  createDeck, importAsset, importWebPage, loadDeck, loadTheme, originalAssetPath, resolveAsset, saveDeck, saveTheme,
 } from '../main/deckStore.js';
 import { exportDeck, webExportUnavailableReason } from '../main/exportDeck.js';
 import { capabilities } from '../shared/capabilities.js';
+import { diffDecks } from '../shared/deckDiff.js';
+import { PresentationGitRequestSchema } from '../shared/presentationGit.js';
+import { installPresentationFiles, type GitStoreHost } from './presentationGit.js';
+import { PresentationPdfs } from './presentationPdf.js';
 import { extractStillFrame, getFfmpegPath, getFfprobePath, probeMedia } from '../main/ffmpeg.js';
 import { createFrameCache } from '../main/frameCache.js';
 import { DeckWire } from './deckWire.js';
@@ -231,6 +236,7 @@ const SERVER_SIDECARS: ReadonlySet<string> = new Set(['agent-chats.json', 'acces
 
 /** One hosted deck: its authoritative session plus the peers editing it. */
 interface Room {
+  historyQueue?: Array<() => void>;
   session: CollabSession;
   peers: Map<string, Peer>;
   /** The clip and picture variants this room's clients were last told, as JSON (see announceMedia). */
@@ -427,6 +433,10 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
   const rootDir = resolve(options.rootDir);
   const clientDir = options.clientDir;
   const host = options.host ?? '0.0.0.0';
+  const presentationGit = new PresentationGitService(rootDir);
+  const presentationPdfs = new PresentationPdfs(presentationGit, (root) => startCollabServer({
+    rootDir: root, clientDir, host: '127.0.0.1', port: 0, mediaRenditions: false,
+  }));
   const hostedDeckId = options.hostedDeckId;
   const agentMode = Boolean(options.agentMode);
   const localAgents = options.localAgents;
@@ -2062,6 +2072,99 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
     if (deckParam && request.method !== 'GET' && request.method !== 'HEAD'
       && !(await deckWritable(identity, deckParam))) {
       return respondJson(response, 403, { error: 'you have view-only access to this presentation' });
+    }
+    if (deckParam && rooms.get(deckParam)?.historyQueue && request.method !== 'GET' && request.method !== 'HEAD') {
+      return respondJson(response, 409, { error: 'A history operation is applying. Retry shortly.' });
+    }
+
+    if (path === '/api/git' || path === '/api/git/pdf') {
+      if (!deckParam || hostedDeckId) return respondJson(response, 400, { error: 'Presentation history needs a deck on a standalone server' });
+      if (await deckRoleOf(identity, deckParam) !== 'owner') return respondJson(response, 403, { error: 'Presentation Git history is private to its owner' });
+      const actor = { name: identity?.name || 'DeckWerk user', email: identity?.login || 'deckwerk@localhost' };
+      const gitHost: GitStoreHost = {
+        canRead: async (id) => await deckRoleOf(identity, id) === 'owner',
+        prepareFork: writeImportedDeckAccess,
+        flush: async (id) => {
+          const room = await getRoom(id);
+          const seq = room.session.seq, theme = room.session.themeCss;
+          await room.session.flush();
+          // Theme writes are normally asynchronous; a checkpoint includes the current theme.
+          await saveTheme(room.session.dir, room.session.deck.theme, theme);
+          const guard = () => {
+            if (room.session.seq !== seq || room.session.themeCss !== theme || room.relocating) throw new Error('The presentation changed. Preview the operation again.');
+          };
+          guard();
+          return guard;
+        },
+        apply: async (id, directory, guard, label, rollback, files) => {
+          const room = await getRoom(id);
+          const before = room.session.deck;
+          const themeBefore = room.session.themeCss;
+          const next = files?.deck ?? await loadDeck(directory);
+          const css = files?.theme ?? await loadTheme(directory, next.theme);
+          const errors = validateDeckIntegrity(next, await assetChecker(directory));
+          if (errors.length) throw new Error(errors.join('\n'));
+          guard();
+          room.session.historyLocked = true;
+          room.historyQueue = [];
+          try {
+            await installPresentationFiles(room.session.dir, directory);
+            guard();
+            room.session.historyLocked = false;
+            const ops = files?.ops ?? diffDecks(before, next);
+            const txnId = `history-${randomUUID()}`;
+            const applied = ops.length ? room.session.applyOps(ops, { label, txnId, author: httpAuthor(identity, null) }) : { seq: room.session.seq, skipped: [] };
+            if (applied.skipped.length) throw new Error('Some history changes could not be applied');
+            room.session.saveThemeCss(css);
+            if (ops.length) broadcast(room, { kind: 'txn', seq: applied.seq, txnId, byClientId: 'history', label, ops });
+            broadcast(room, { kind: 'theme', css, byClientId: 'history' });
+            room.session.historyLocked = true;
+            await room.session.flush();
+            await saveTheme(room.session.dir, next.theme, css);
+            if (files && (Object.keys(files.changed).length || Object.keys(files.removed).length)) {
+              broadcast(room, { kind: 'media', variants: Object.fromEntries(Object.entries(files.changed).map(([path, hash]) => [path, `history-${hash}`])), historyRemoved: files.removed });
+            }
+          } catch (error) {
+            room.session.historyLocked = true;
+            await installPresentationFiles(room.session.dir, rollback);
+            room.session.historyLocked = false;
+            const ops = diffDecks(room.session.deck, before);
+            const txnId = `history-recovery-${randomUUID()}`;
+            const applied = ops.length ? room.session.applyOps(ops, { label: 'Recover failed history operation', txnId, author: httpAuthor(identity, null) }) : { seq: room.session.seq };
+            room.session.saveThemeCss(themeBefore);
+            if (ops.length) broadcast(room, { kind: 'txn', seq: applied.seq, txnId, byClientId: 'history', label: 'Recover failed history operation', ops });
+            broadcast(room, { kind: 'theme', css: themeBefore, byClientId: 'history' });
+            await room.session.flush();
+            await saveTheme(room.session.dir, before.theme, themeBefore);
+            throw error;
+          } finally {
+            room.session.historyLocked = false;
+            const queued = room.historyQueue;
+            room.historyQueue = undefined;
+            for (const run of queued ?? []) run();
+          }
+        },
+      };
+      try {
+        if (path === '/api/git/pdf') {
+          if (request.method !== 'GET') return respondJson(response, 405, { error: 'Use GET for a PDF' });
+          const revision = await presentationGit.revision(deckParam, url.searchParams.get('revision') || 'HEAD', actor, gitHost);
+          const pdf = await presentationPdfs.get(revision);
+          response.writeHead(200, { 'content-type': 'application/pdf', 'cache-control': 'private, no-store',
+            'content-disposition': `inline; filename="${sanitizeFilename(deckParam)}-${revision.slice(0, 8)}.pdf"`,
+            'x-deckwerk-revision': revision });
+          await pipeline(createReadStream(pdf), response);
+          return;
+        }
+        const command = request.method === 'GET' ? { command: 'status' as const }
+          : request.method === 'POST' ? PresentationGitRequestSchema.parse(JSON.parse((await readBody(request, 256 * 1024)).toString()))
+            : null;
+        if (!command) return respondJson(response, 405, { error: 'Use GET or POST' });
+        const result = await presentationGit.run(deckParam, command, actor, gitHost);
+        response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        response.end(result);
+      } catch (error) { respondJson(response, 409, { error: error instanceof Error ? error.message : String(error) }); }
+      return;
     }
     // Agent invite URLs open the deck as a viewer. Authoring happens only in
     // the filesystem mirror created by slide-agent connect.
@@ -4433,7 +4536,7 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
     };
     room.peers.set(clientId, peer);
 
-    socket.on('message', (raw) => {
+    socket.on('message', function onMessage(raw) {
       let message;
       try {
         message = ClientMessageSchema.parse(renameRetiredFields(JSON.parse(String(raw))));
@@ -4445,6 +4548,10 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       // applied now would be written nowhere; the peer is about to be told
       // where the deck went.
       if (room.relocating) return;
+      if (room.historyQueue && (message.kind === 'txn' || message.kind === 'theme')) {
+        room.historyQueue.push(() => { if (socket.readyState === socket.OPEN) onMessage.call(socket, raw); });
+        return;
+      }
 
       if (message.kind === 'hello') {
         if (message.agentFor && localAgents) {
@@ -4687,6 +4794,31 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
     })
     : false;
 
+  let checkpointRunning = false;
+  const checkpointTimer = setInterval(() => {
+    if (checkpointRunning || hostedDeckId) return;
+    checkpointRunning = true;
+    void (async () => {
+      for (const id of await presentationGit.tracked()) {
+        try {
+          await presentationGit.run(id, { command: 'commit', message: 'Automatic checkpoint' },
+            { name: 'DeckWerk', email: 'deckwerk@localhost' }, {
+              canRead: async () => false,
+              apply: async () => { throw new Error('Automatic checkpoints never replace live files'); },
+              flush: async () => {
+                const room = await getRoom(id);
+                const seq = room.session.seq, theme = room.session.themeCss;
+                await room.session.flush();
+                await saveTheme(room.session.dir, room.session.deck.theme, theme);
+                return () => { if (room.session.seq !== seq || room.session.themeCss !== theme) throw new Error('Presentation still changing; checkpoint deferred'); };
+              },
+            });
+        } catch (error) { console.warn(`Checkpoint deferred for ${id}: ${String(error)}`); }
+      }
+    })().catch((error) => console.error('Presentation checkpoints:', error)).finally(() => { checkpointRunning = false; });
+  }, 60_000);
+  checkpointTimer.unref();
+
   return {
     port,
     urls: [
@@ -4701,6 +4833,8 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
       for (const room of rooms.values()) broadcast(room, { kind: 'ended' });
     },
     close: async () => {
+      clearInterval(checkpointTimer);
+      await presentationGit.close();
       renditions?.stop();
       wss.close();
       unsubscribeSharedAgent?.();

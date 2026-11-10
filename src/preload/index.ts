@@ -1,3 +1,4 @@
+import type { PresentationGitRequest, PresentationGitResponse } from '@shared/presentationGit.js';
 import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron';
 import type { Deck } from '@shared/deck.js';
 import type { DeckHistoryDocument } from '@shared/deckHistory.js';
@@ -76,6 +77,8 @@ ipcRenderer.on(IPC.deckKey, (_e, key: string) => {
  * The renderer's entire view of the outside world. Context isolation is on and
  * nodeIntegration is off, so this surface is deliberately small and explicit.
  */
+let historyMediaRevision = 0;
+
 const api = {
   /** Zoom this window's chrome: DeckWerk menu → Interface size (uiScale.ts). */
   setUiScale: (factor: number): void => {
@@ -201,6 +204,12 @@ const api = {
 
   /** Deck servers (remoteDecks.ts): the list, the decks on one, opening one as a mirror. */
   openT3: (mode: 'local' | 'remote'): Promise<void> => ipcRenderer.invoke(IPC.t3Open, mode),
+  presentationGit: (request: PresentationGitRequest): Promise<PresentationGitResponse> => ipcRenderer.invoke(IPC.presentationGit, request),
+  syncRemoteHistoryFiles: async (removed: Record<string, string>): Promise<void> => {
+    await ipcRenderer.invoke(IPC.remoteHistoryFiles, removed);
+    historyMediaRevision += 1;
+  },
+  presentationPdf: (revision: string): Promise<void> => ipcRenderer.invoke(IPC.presentationPdf, revision),
   remoteServers: (): Promise<RemoteServerEntry[]> => ipcRenderer.invoke(IPC.remoteServers),
   addRemoteServer: (url: string, name?: string): Promise<RemoteServerEntry & { info: RemoteServerInfo }> =>
     ipcRenderer.invoke(IPC.remoteServerAdd, url, name),
@@ -260,7 +269,7 @@ const api = {
 
   /** Deck-relative asset path -> a URL this window can load. */
   assetUrl: (src: string): string =>
-    `deck://${deckKey}/${src.replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/')}`,
+    `deck://${deckKey}/${src.replace(/^\/+/, '').split('/').map(encodeURIComponent).join('/')}${historyMediaRevision ? `?history=${historyMediaRevision}` : ''}`,
 
   onDeckState: (fn: (s: DeckSession) => void): (() => void) =>
     on(IPC.deckState, fn),

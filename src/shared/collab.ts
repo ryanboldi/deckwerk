@@ -214,6 +214,8 @@ export const ServerWelcomeSchema = z.object({
 export const ServerMediaSchema = z.object({
   kind: z.literal('media'),
   variants: z.record(z.string(), z.string()),
+  /** Old Git blob hashes: mirrors remove only unchanged files deleted by a history operation. */
+  historyRemoved: z.record(z.string(), z.string().regex(/^[0-9a-f]{40}$/)).optional(),
   /** The deck's clips still waiting for a streaming version, all of them (see `pendingMedia`). */
   pending: z.array(z.string()).optional(),
 });

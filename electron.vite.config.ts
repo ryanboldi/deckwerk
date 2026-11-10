@@ -7,7 +7,7 @@ export default defineConfig({
   main: {
     build: {
       rollupOptions: {
-        input: resolve(__dirname, 'src/main/index.ts'),
+        input: { index: resolve(__dirname, 'src/main/index.ts'), presentationGitWorker: resolve(__dirname, 'src/server/presentationGitWorker.ts') },
         // Bundling ws breaks its optional native bufferutil/utf-8-validate
         // loading (bufferUtil.unmask is not a function at runtime).
         // electron-updater picks its platform updater with lazy require()s
