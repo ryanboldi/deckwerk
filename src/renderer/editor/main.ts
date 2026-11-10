@@ -647,10 +647,14 @@ function buildToolbar(): void {
   secondaryActions.className = 'toolbar-expanded-secondary-actions';
   secondaryActions.append(
     barButton('Agent…', () => void toggleAgentPanel()),
+    barButton('Open with T3 Local', () => void openT3Agent('local')),
+    barButton('Open with T3 Remote', () => void openT3Agent('remote')),
     collaborateButton,
   );
   const compactSecondary = createToolbarPicker('More', [
     { label: 'Agent…', action: () => void toggleAgentPanel() },
+    { label: 'Open with T3 Local', action: () => void openT3Agent('local') },
+    { label: 'Open with T3 Remote', action: () => void openT3Agent('remote') },
     { label: 'Collaboration…', action: () => void startSharing() },
   ]);
   compactSecondary.classList.add('toolbar-compact-secondary-action');
@@ -749,6 +753,17 @@ async function saveOriginalAsset(src: string): Promise<void> {
     if (saved) setStatusMessage(`Saved the original to ${saved}`);
   } catch (err) {
     setStatusMessage(`Download failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+async function openT3Agent(mode: 'local' | 'remote'): Promise<void> {
+  try {
+    await cssEditor.flush();
+    await save();
+    await runOperation('Opening T3…', async () => window.api.openT3(mode));
+    setStatusMessage(`Opened T3 ${mode === 'local' ? 'Local' : 'Remote'} for this presentation.`);
+  } catch (error) {
+    setStatusMessage(`Could not open T3: ${error instanceof Error ? error.message : error}`);
   }
 }
 

@@ -200,6 +200,7 @@ const api = {
     ipcRenderer.invoke(IPC.agentPanelGetState),
 
   /** Deck servers (remoteDecks.ts): the list, the decks on one, opening one as a mirror. */
+  openT3: (mode: 'local' | 'remote'): Promise<void> => ipcRenderer.invoke(IPC.t3Open, mode),
   remoteServers: (): Promise<RemoteServerEntry[]> => ipcRenderer.invoke(IPC.remoteServers),
   addRemoteServer: (url: string, name?: string): Promise<RemoteServerEntry & { info: RemoteServerInfo }> =>
     ipcRenderer.invoke(IPC.remoteServerAdd, url, name),

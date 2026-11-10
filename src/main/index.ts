@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, watch } from 'node:fs';
+import { openT3Workspace } from './t3Launcher.js';
 import { writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
@@ -890,6 +891,10 @@ function registerHandlers(): void {
   });
   ipcMain.on(IPC.agentResponse, (event, response: AgentResponse) => {
     void requireOwner(event).agentRuntime.respond(response);
+  });
+  ipcMain.handle(IPC.t3Open, async (event, mode: 'local' | 'remote'): Promise<void> => {
+    const session = requireSession(event);
+    await openT3Workspace(session.dir, mode, app.getPath('userData'), (url) => shell.openExternal(url));
   });
   ipcMain.handle(IPC.agentPanelGetState, async (event): Promise<AgentPanelState> => {
     const s = requireSession(event);

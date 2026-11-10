@@ -79,6 +79,7 @@ export const IPC = {
   agentResponse: 'agent:response',
   /** Read-only status/activity/scratchpad for the user's filesystem agent. */
   agentPanelGetState: 'agentPanel:getState',
+  t3Open: 'agent:t3Open',
   agentPanelState: 'agentPanel:state',
   collabStart: 'collab:start',
   agentSessionStart: 'agentSession:start',
