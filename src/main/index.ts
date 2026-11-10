@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
 import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { BrowserWindow, app, clipboard, ipcMain, screen, shell } from 'electron';
-import type { Display, IpcMainInvokeEvent, WebContents } from 'electron';
+import type { IpcMainInvokeEvent, WebContents } from 'electron';
 import { parseDeck, type Deck } from '@shared/deck.js';
 import type { DeckHistoryDocument } from '@shared/deckHistory.js';
 import {
@@ -80,6 +80,8 @@ import { copyFileStreamed } from './copyFileStreamed.js';
 import { closeRemoteDecks, registerRemoteDeckIpc, releaseRemoteMirror } from './remoteDeckIpc.js';
 import { HTML_EDIT_DIR, isAuthoringFileName, readSettledFile, writeHtmlScope } from './htmlAuthoring.js';
 import { AGENT_GUIDE_FILE, defaultLauncherPath, writeAgentGuide } from './agentGuide.js';
+import { findShippedTutorial, installTutorial, loadShippedTutorial } from './tutorial.js';
+import { askAgentPrompt, parseTutorialLink, TUTORIAL_LINK_SCHEME } from '@shared/tutorial.js';
 import { replaceFileAtomically } from './agentRuntime.js';
 import {
   attachWindow,
@@ -102,6 +104,8 @@ import {
   createPresenterWindow,
   createRasterWindow,
   createTrimWindow,
+  loadAudiencePage,
+  loadSpeakerPage,
   showSpeakerWindowAboveFullscreen,
   type WindowContinuityState,
 } from './windows.js';
@@ -116,6 +120,8 @@ import {
   shouldShowAudienceWindow,
   swappedPresentationDisplays,
 } from './presentationDisplays.js';
+import { moveFullscreenWindow } from './fullscreenMove.js';
+import { presentationScreens } from './displays.js';
 import { registerDeckAssetIpc } from './deckAssetsIpc.js';
 import { registerUpdates } from './updates.js';
 
@@ -160,35 +166,36 @@ localAgents.subscribe((state, participantId) => {
   if (editor && !editor.isDestroyed()) editor.webContents.send(IPC.agentPanelState, state);
 });
 
-function moveFullscreenWindowToDisplay(
-  win: BrowserWindow | null,
-  display: Display,
-): Promise<void> {
-  if (!win || win.isDestroyed()) return Promise.resolve();
-  const enterFullscreen = (): void => {
-    if (win.isDestroyed()) return;
-    win.setBounds(display.bounds);
-    win.setFullScreen(true);
-  };
-  if (!win.isFullScreen()) {
-    enterFullscreen();
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => {
-    win.once('leave-full-screen', () => {
-      enterFullscreen();
-      resolve();
-    });
-    win.setFullScreen(false);
+/** Hand Speaker View the show's current state once its page has loaded. */
+function sendStateWhenLoaded(state: DeckWindowState, win: BrowserWindow): void {
+  win.webContents.once('did-finish-load', () => {
+    if (state.presentationState && !win.isDestroyed() && state.presenter === win) {
+      win.webContents.send(IPC.presentState, state.presentationState);
+    }
   });
 }
 
-function moveSpeakerWindowToDisplay(state: DeckWindowState, display: Display): Promise<void> {
-  return moveFullscreenWindowToDisplay(state.presenter, display);
-}
-
-function moveAudienceWindowToDisplay(state: DeckWindowState, display: Display): Promise<void> {
-  return moveFullscreenWindowToDisplay(state.present, display);
+/**
+ * Either presentation window closing ends the show. Which role a window
+ * plays can change mid-show (Switch displays), so the handler asks the state
+ * rather than remembering what the window was opened as.
+ */
+function endShowWhenClosed(state: DeckWindowState, win: BrowserWindow): void {
+  win.on('closed', () => {
+    if (state.present === win) {
+      state.present = null;
+      // Leaving the show lands the editor where the show was, not where it
+      // started.
+      const ended = state.presentationState?.cursor.slide;
+      if (ended !== undefined && !state.editor.isDestroyed()) {
+        state.editor.webContents.send(IPC.presentEnded, ended);
+      }
+    }
+    if (state.presenter === win) state.presenter = null;
+    state.presentationDisplays = null;
+    if (state.present && !state.present.isDestroyed()) state.present.close();
+    if (state.presenter && !state.presenter.isDestroyed()) state.presenter.close();
+  });
 }
 
 function openSpeakerWindow(
@@ -199,41 +206,54 @@ function openSpeakerWindow(
   const win = createPresenterWindow(displayId, visibleAboveFullscreen);
   state.presenter = win;
   attachWindow(state, win);
-  win.webContents.once('did-finish-load', () => {
-    if (state.presentationState && !win.isDestroyed()) {
-      win.webContents.send(IPC.presentState, state.presentationState);
-    }
-  });
-  win.on('closed', () => {
-    if (state.presenter === win) state.presenter = null;
-    state.presentationDisplays = null;
-    if (state.present && !state.present.isDestroyed()) state.present.close();
-  });
+  sendStateWhenLoaded(state, win);
+  endShowWhenClosed(state, win);
   return win;
 }
 
-async function swapPresentationDisplayRoles(state: DeckWindowState): Promise<void> {
-  if (state.swappingPresentationDisplays || !state.presentationDisplays || !state.presenter) return;
-  const displays = screen.getAllDisplays();
-  const primary = screen.getPrimaryDisplay();
-  const swapped = swappedPresentationDisplays(displays, state.presentationDisplays, primary);
+/**
+ * Switch displays: the projector gets Speaker View and the laptop the slides.
+ *
+ * The windows stay where they are and trade pages instead. Moving two
+ * fullscreen windows between displays means leaving and re-entering
+ * fullscreen, and on macOS each window springs back to the display it left,
+ * so a swap by moving looked like a flicker that changed nothing. A page
+ * reload inside a fullscreen window keeps it fullscreen on its display, and
+ * the new audience page resumes at the same build step with the same timers.
+ * (The browser client trades roles the same way, see collab/present.ts.)
+ */
+function swapPresentationDisplayRoles(state: DeckWindowState): void {
+  const audience = state.present;
+  const speaker = state.presenter;
+  const displays = state.presentationDisplays;
+  const show = state.presentationState;
+  if (!audience || audience.isDestroyed() || !speaker || speaker.isDestroyed()) return;
+  if (!displays || !show) return;
+  // Both displays must still be there; one display has nothing to switch.
+  const screens = presentationScreens();
+  const swapped = swappedPresentationDisplays(screens.displays, displays, screens.primary);
   if (!swapped) return;
-  const { audience: audienceTarget, presenter: presenterTarget } = swapped;
 
-  state.swappingPresentationDisplays = true;
+  state.present = speaker;
+  state.presenter = audience;
   state.presentationDisplays = {
-    audienceDisplayId: audienceTarget.id,
-    presenterDisplayId: presenterTarget.id,
+    audienceDisplayId: swapped.audience.id,
+    presenterDisplayId: swapped.presenter.id,
   };
-  try {
-    await Promise.all([
-      moveSpeakerWindowToDisplay(state, presenterTarget),
-      moveAudienceWindowToDisplay(state, audienceTarget),
-    ]);
-    if (state.presenter && !state.presenter.isDestroyed()) state.presenter.focus();
-  } finally {
-    state.swappingPresentationDisplays = false;
-  }
+  loadAudiencePage(speaker, {
+    slide: show.range?.start ?? show.cursor.slide,
+    endSlide: show.range?.end,
+    resume: {
+      slide: show.cursor.slide,
+      step: show.cursor.step,
+      startedAt: show.startedAt,
+      slideStartedAt: show.slideStartedAt,
+      blanked: show.blanked === true,
+    },
+  });
+  sendStateWhenLoaded(state, audience);
+  loadSpeakerPage(audience);
+  audience.focus();
 }
 
 /**
@@ -393,6 +413,77 @@ function openDeckForRequester(
   );
   setSession(opened, dir, deck);
   return null;
+}
+
+/**
+ * The tutorial deck that ships with the app (resources/tutorial in a checkout,
+ * tutorial/ in a packaged app's resources), and the person's own copy of it in
+ * the profile folder: they try every step on its slides, and an agent can add
+ * a slide to it, so it survives updates (src/main/tutorial.ts).
+ */
+function shippedTutorialDir(): string | null {
+  return findShippedTutorial({
+    resourcesPath: app.isPackaged ? process.resourcesPath : undefined,
+    searchFrom: [import.meta.dirname, app.getAppPath(), process.cwd()],
+  });
+}
+
+function userTutorialDir(): string {
+  return join(app.getPath('userData'), 'Tutorial');
+}
+
+/** The person's tutorial, installed or brought up to the shipped release. */
+async function preparedTutorial(): Promise<string> {
+  const shipped = shippedTutorialDir();
+  if (!shipped) throw new Error('This installation of DeckWerk does not include the tutorial');
+  const dir = userTutorialDir();
+  // A copy open in a window is that window's document: rewriting deck.json
+  // under it would be an edit behind the editor's back. It is brought up to
+  // date the next time it is opened.
+  if (!stateForDeckDir(dir)) await installTutorial(shipped, dir);
+  return dir;
+}
+
+/**
+ * Slides a tutorial link asked for, by deck folder, until the window that
+ * opens the deck takes it (`deckTakeShowSlide`). A window can be created for
+ * the deck before its renderer exists, so the slide cannot be pushed to it.
+ */
+const pendingShowSlides = new Map<string, string>();
+
+/** Show a slide of a deck that is already open, in the window holding it. */
+function showSlideIn(state: DeckWindowState, slideId: string): void {
+  if (!state.session || state.editor.isDestroyed()) return;
+  if (state.editor.isMinimized()) state.editor.restore();
+  state.editor.focus();
+  state.editor.webContents.send(IPC.deckShowSlide, { dir: state.session.dir, slideId });
+}
+
+/**
+ * Open the tutorial for a `deckwerk://tutorial/<slide>` link: in the window
+ * that already has it, else an empty window, else a window of its own.
+ */
+async function openTutorialLink(url: string): Promise<void> {
+  const link = parseTutorialLink(url);
+  if (!link) return;
+  try {
+    const dir = await preparedTutorial();
+    const open = stateForDeckDir(dir);
+    if (open) {
+      if (link.slideId) showSlideIn(open, link.slideId);
+      else if (!open.editor.isDestroyed()) open.editor.focus();
+      return;
+    }
+    if (link.slideId) pendingShowSlides.set(resolve(dir), link.slideId);
+    await openDeckFromOutside(dir);
+  } catch (error) {
+    console.error(`Could not open ${url}:`, error);
+  }
+}
+
+/** `deckwerk://` links on the command line (Windows and Linux hand them over that way). */
+function tutorialLinksIn(argv: readonly string[]): string[] {
+  return argv.filter((arg) => arg.startsWith(`${TUTORIAL_LINK_SCHEME}:`));
 }
 
 /** A new editor window, registered as a document before its renderer loads. */
@@ -565,8 +656,8 @@ function broadcastDeck(state: DeckWindowState, except?: BrowserWindow | null): v
  * A deck folder named on the command line, if any. Used by `npm run dev -- <dir>`
  * and by opening a deck from the shell.
  */
-function deckDirFromArgv(): string | null {
-  const args = process.argv.slice(app.isPackaged ? 1 : 2);
+function deckDirFromArgv(argv: readonly string[] = process.argv): string | null {
+  const args = argv.slice(app.isPackaged ? 1 : 2);
   for (const arg of args) {
     if (arg.startsWith('-')) continue;
     if (existsSync(join(arg, 'deck.json'))) return resolve(arg);
@@ -592,7 +683,80 @@ if (process.env['DECKWERK_HEADLESS_TEST'] === '1') {
   app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 }
 
+/**
+ * `deckwerk://` links (src/shared/tutorial.ts) open the tutorial on a slide;
+ * agents hand them to people answering a question about a feature. Only an
+ * installed app registers the scheme: a checkout's Electron binary is not
+ * DeckWerk, and the browser tests must not take over the link for the
+ * person's real installation.
+ *
+ * macOS delivers a link to the running app as `open-url`. Windows and Linux
+ * start a second process with the link in its argv, so an installed app
+ * holds the single-instance lock and the second process hands over its
+ * arguments — a link, or a deck folder — and leaves.
+ */
+let startupWindowsReady: () => void = () => {};
+const startupWindows = new Promise<void>((resolveStartup) => { startupWindowsReady = resolveStartup; });
+let secondInstance = false;
+if (app.isPackaged) app.setAsDefaultProtocolClient(TUTORIAL_LINK_SCHEME);
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  void startupWindows.then(() => openTutorialLink(url));
+});
+if (app.isPackaged && process.platform !== 'darwin') {
+  if (!app.requestSingleInstanceLock()) {
+    secondInstance = true;
+    app.quit();
+  } else {
+    app.on('second-instance', (_event, argv) => {
+      void startupWindows.then(async () => {
+        const links = tutorialLinksIn(argv);
+        for (const url of links) await openTutorialLink(url);
+        if (links.length > 0) return;
+        const dir = deckDirFromArgv(argv);
+        if (dir) await openDeckFromOutside(dir);
+        else focusOrCreateEditor();
+      });
+    });
+  }
+}
+
+/** Bring an editor window forward, or make one: someone launched the app again. */
+function focusOrCreateEditor(): void {
+  const editor = editorStates().find((state) => !state.editor.isDestroyed())?.editor;
+  if (!editor) {
+    createEditorState();
+    return;
+  }
+  if (editor.isMinimized()) editor.restore();
+  editor.focus();
+}
+
+/** A deck named by a second launch: its window if open, an empty one, else a new one. */
+async function openDeckFromOutside(dir: string): Promise<void> {
+  const open = stateForDeckDir(dir);
+  if (open) {
+    if (!open.editor.isDestroyed()) open.editor.focus();
+    return;
+  }
+  try {
+    const deck = await loadDeck(dir);
+    const empty = editorStates().find((state) => isEmptyEditor(state) && !state.editor.isDestroyed());
+    if (empty) {
+      setSession(empty, dir, deck);
+      broadcastDeck(empty);
+      empty.editor.focus();
+      return;
+    }
+    const source = editorStates().find((state) => !state.editor.isDestroyed())?.editor;
+    setSession(createEditorState('', source ? cascadedEditorBounds(source) : undefined), dir, deck);
+  } catch (error) {
+    console.error(`Could not open ${dir}:`, error);
+  }
+}
+
 app.whenReady().then(async () => {
+  if (secondInstance) return;
   // Packaged macOS builds get this from the bundle's .icns. During local
   // development Electron would otherwise keep its own icon in the Dock and
   // app switcher, so set the matching high-resolution artwork explicitly.
@@ -622,23 +786,26 @@ app.whenReady().then(async () => {
   // it from the start rather than being adopted from anything app-wide.
   const first = createEditorState();
   if (initial && deck) setSession(first, initial, deck);
+  startupWindowsReady();
+  for (const url of tutorialLinksIn(process.argv)) void openTutorialLink(url);
 
   screen.on('display-removed', () => {
-    const primary = screen.getPrimaryDisplay();
+    const { primary } = presentationScreens();
     for (const state of editorStates()) {
       if (!state.present || state.present.isDestroyed()) continue;
       state.presentationDisplays = {
         audienceDisplayId: primary.id,
         presenterDisplayId: primary.id,
       };
-      void Promise.all([
-        moveSpeakerWindowToDisplay(state, primary),
-        moveAudienceWindowToDisplay(state, primary),
-      ]).then(() => {
-        if (state.presenter && !state.presenter.isDestroyed()) {
-          showSpeakerWindowAboveFullscreen(state.presenter);
-        }
-      });
+      // One window at a time: macOS drops a fullscreen transition started
+      // while another window's is still animating (fullscreenMove.ts).
+      void moveFullscreenWindow(state.present, primary.bounds)
+        .then(() => moveFullscreenWindow(state.presenter, primary.bounds))
+        .then(() => {
+          if (state.presenter && !state.presenter.isDestroyed()) {
+            showSpeakerWindowAboveFullscreen(state.presenter);
+          }
+        });
     }
   });
 
@@ -728,6 +895,36 @@ function registerHandlers(): void {
     const s = requireSession(event);
     const participantId = desktopAgentParticipantId ??= randomUUID();
     return localAgents.getState(s.dir, participantId);
+  });
+
+  ipcMain.handle(IPC.tutorialOpen, async (event, operationId?: string, slideId?: string): Promise<DeckSession | null> => {
+    reportOperation(event, operationId, 'Preparing the tutorial');
+    const dir = await preparedTutorial();
+    const open = stateForDeckDir(dir);
+    if (open && slideId) showSlideIn(open, slideId);
+    else if (slideId) pendingShowSlides.set(resolve(dir), slideId);
+    reportOperation(event, operationId, 'Reading Tutorial/deck.json', 0.4);
+    return openDeckForRequester(requireOwner(event), dir, await loadDeck(dir), event);
+  });
+  ipcMain.handle(IPC.tutorialInfo, () => ({
+    available: shippedTutorialDir() !== null,
+    dir: userTutorialDir(),
+  }));
+  ipcMain.handle(IPC.tutorialPrompt, async (): Promise<string | null> => {
+    if (!shippedTutorialDir()) return null;
+    // The prompt names files in the tutorial folder; make sure they are there.
+    return askAgentPrompt({ kind: 'desktop', tutorialDir: await preparedTutorial() });
+  });
+  ipcMain.handle(IPC.tutorialShippedDeck, async (): Promise<Deck> => {
+    const shipped = shippedTutorialDir();
+    if (!shipped) throw new Error('This installation of DeckWerk does not include the tutorial');
+    return loadShippedTutorial(shipped);
+  });
+  ipcMain.handle(IPC.deckTakeShowSlide, (_event, dir: string): string | null => {
+    const key = resolve(dir);
+    const slideId = pendingShowSlides.get(key) ?? null;
+    pendingShowSlides.delete(key);
+    return slideId;
   });
 
   ipcMain.handle(
@@ -1041,8 +1238,9 @@ function registerHandlers(): void {
   });
 
   ipcMain.handle(IPC.displayList, () => {
-    const primaryId = screen.getPrimaryDisplay().id;
-    return screen.getAllDisplays().map((display, index) => ({
+    const { displays, primary } = presentationScreens();
+    const primaryId = primary.id;
+    return displays.map((display, index) => ({
       id: display.id,
       label: display.label || `Display ${index + 1}`,
       primary: display.id === primaryId,
@@ -1054,8 +1252,7 @@ function registerHandlers(): void {
     // Presenting belongs to one document: the window that asked. Another
     // presentation's projector, if there is one, is left exactly as it is.
     const state = requireOwner(event);
-    const displays = screen.getAllDisplays();
-    const primary = screen.getPrimaryDisplay();
+    const { displays, primary } = presentationScreens();
     if (state.present && !state.present.isDestroyed()) {
       if (options.speakerView && (!state.presenter || state.presenter.isDestroyed())) {
         const audienceDisplay = chooseDisplayById(
@@ -1118,19 +1315,7 @@ function registerHandlers(): void {
     state.presenter = openSpeakerView
       ? openSpeakerWindow(state, presenterDisplay.id, false)
       : null;
-    audience.on('closed', () => {
-      if (state.present === audience) {
-        state.present = null;
-        // Leaving the show lands the editor where the show was, not where it
-        // started.
-        const ended = state.presentationState?.cursor.slide;
-        if (ended !== undefined && !state.editor.isDestroyed()) {
-          state.editor.webContents.send(IPC.presentEnded, ended);
-        }
-      }
-      state.presentationDisplays = null;
-      if (state.presenter && !state.presenter.isDestroyed()) state.presenter.close();
-    });
+    endShowWhenClosed(state, audience);
   });
   ipcMain.on(IPC.presentCommand, (event, command: PresentationCommand) => {
     const state = ownerOf(event.sender);
@@ -1141,7 +1326,10 @@ function registerHandlers(): void {
       return;
     }
     if (command.type === 'swapDisplays') {
-      void swapPresentationDisplayRoles(state);
+      // Only the current Speaker View may switch. A second press of a
+      // double-click can reach the window that was Speaker View a moment ago
+      // and would otherwise switch straight back.
+      if (event.sender === state.presenter?.webContents) swapPresentationDisplayRoles(state);
       return;
     }
     state.present?.webContents.send(IPC.presentCommand, command);
