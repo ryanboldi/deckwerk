@@ -21,7 +21,7 @@ const cssVar = (name: string): string => root().style.getPropertyValue(name);
 /** Every custom property a theme writes; the stylesheets must declare each one. */
 const THEMED_VARS = [
   '--bg', '--panel', '--panel-2', '--line', '--text', '--muted', '--accent',
-  '--accent-soft', '--green', '--yellow', '--danger', '--canvas', '--mono',
+  '--accent-soft', '--green', '--yellow', '--danger', '--canvas-ground', '--mono',
 ];
 
 // Node's own experimental localStorage shadows jsdom's; hand the code jsdom's.
@@ -58,12 +58,12 @@ describe('editor theme presets', () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it('default to the look the stylesheet already ships', () => {
-    const css = readFileSync(resolve(__dirname, '../src/renderer/appChrome.css'), 'utf8');
+  it('applies the personal default over the shared chrome', () => {
+    installEditorTheme();
     const palette = presetById(DEFAULT_EDITOR_THEME.preset).palette;
-    expect(css).toContain(`--bg: ${palette.bg};`);
-    expect(css).toContain(`--accent: ${palette.accent};`);
-    expect(css).toContain(`--canvas: ${palette.canvas};`);
+    expect(cssVar('--bg')).toBe(palette.bg);
+    expect(cssVar('--accent')).toBe(palette.accent);
+    expect(cssVar('--canvas-ground')).toBe(palette.canvas);
   });
 });
 
@@ -82,7 +82,7 @@ describe('applyEditorTheme', () => {
 
   it('themes the canvas behind the slide', () => {
     applyEditorTheme({ preset: 'paper', font: 'krypton' });
-    expect(cssVar('--canvas')).toBe(presetById('paper').palette.canvas);
+    expect(cssVar('--canvas-ground')).toBe(presetById('paper').palette.canvas);
     expect(root().dataset['editorTheme']).toBe('light');
   });
 
@@ -125,7 +125,7 @@ describe('editor theme persistence', () => {
     saveEditorTheme({ preset: 'paper', font: 'krypton' });
     window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY }));
     expect(cssVar('--bg')).toBe(presetById('paper').palette.bg);
-    expect(cssVar('--canvas')).toBe(presetById('paper').palette.canvas);
+    expect(cssVar('--canvas-ground')).toBe(presetById('paper').palette.canvas);
 
     window.dispatchEvent(new StorageEvent('storage', { key: 'something-else' }));
     expect(cssVar('--bg')).toBe(presetById('paper').palette.bg);
@@ -144,6 +144,6 @@ describe('editor stylesheets', () => {
     // Later rules win, so the last .canvas-host background is the one that shows.
     const rules = [...editor.matchAll(/^\.canvas-host\s*\{[^}]*background:\s*([^;]+);/gm)];
     expect(rules.length).toBeGreaterThan(0);
-    expect(rules.at(-1)![1]!.trim()).toBe('var(--canvas)');
+    expect(rules.at(-1)![1]!.trim()).toBe('var(--canvas-ground)');
   });
 });

@@ -52,7 +52,7 @@ describe('editor appearance dialog', () => {
     showEditorThemeDialog();
     card('paper').click();
     expect(cssVar('--bg')).toBe(presetById('paper').palette.bg);
-    expect(cssVar('--canvas')).toBe(presetById('paper').palette.canvas);
+    expect(cssVar('--canvas-ground')).toBe(presetById('paper').palette.canvas);
     expect(card('paper').getAttribute('aria-checked')).toBe('true');
     expect(localStorage.getItem('deckwerk.editorTheme')).toBeNull();
   });

@@ -157,7 +157,9 @@ export function applyEditorTheme(choice: EditorThemeChoice, root: HTMLElement = 
     '--green': palette.green,
     '--yellow': palette.yellow,
     '--danger': palette.danger,
-    '--canvas': palette.canvas,
+    '--canvas-ground': palette.canvas,
+    '--accent-text': accent,
+    '--accent-hover': withAlpha(accent, 0.24),
     '--mono': fontById(choice.font).stack,
   };
   for (const [name, value] of Object.entries(vars)) root.style.setProperty(name, value);
