@@ -79,16 +79,20 @@ export class DelayedOperationProgress {
 
   /**
    * Keep the operation alive across two animation frames. A frame callback
-   * runs before Chromium paints; the second frame guarantees that the status
-   * and the newly-created deck DOM were actually presented in between. This
+   * runs before Chromium paints; the second lets the status and the newly-created
+   * deck DOM appear in between. Hidden windows may not receive frames, so bound
+   * the wait to let opening finish while macOS considers the window occluded. This
    * also gives an overdue 500 ms timer a chance to surface after a long,
    * synchronous layout pass blocked the renderer event loop.
    */
   private async waitForPaint(id: string): Promise<void> {
-    if (this.active?.id !== id) return;
-    await new Promise<void>((resolve) => this.scheduleFrame(resolve));
-    if (this.active?.id !== id) return;
-    await new Promise<void>((resolve) => this.scheduleFrame(resolve));
+    for (let frame = 0; frame < 2; frame++) {
+      if (this.active?.id !== id) return;
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, 250);
+        this.scheduleFrame(() => { clearTimeout(timeout); resolve(); });
+      });
+    }
   }
 
   private finishActive(): void {

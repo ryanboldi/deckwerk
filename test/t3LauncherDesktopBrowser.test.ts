@@ -27,6 +27,7 @@ it('both T3 buttons open without creating a project, including an unmapped remot
   app = await launchDesktopApp(appDir, [deckDir, '--inspect=0'], { profileDir: profile });
   const target = await findTarget(app.debugPort, isEditorTarget, app.log);
   cdp = await Cdp.connect(target.webSocketDebuggerUrl!);
+  await cdp.call('Emulation.setDeviceMetricsOverride', { width: 1600, height: 1000, deviceScaleFactor: 1, mobile: false });
   const inspector = await fetch(`http://127.0.0.1:${app.inspectorPort}/json/list`).then(r => r.json()) as Array<{ webSocketDebuggerUrl: string }>;
   main = await Cdp.connect(inspector[0]!.webSocketDebuggerUrl);
   const evaluate = async <T>(expression: string): Promise<T> => {
@@ -47,6 +48,7 @@ it('both T3 buttons open without creating a project, including an unmapped remot
     }; require('node:module').syncBuiltinESMExports();`);
   await eventually(() => cdp!.evaluate<string>(`window.api.getDeck().then(s => s?.deck.title ?? '')`), 'deck loaded', t => t === 'VPO-Base');
   await eventually(() => cdp!.evaluate<boolean>(`[...document.querySelectorAll('button')].some(b => ['More', 'Open with T3 Remote'].includes(b.textContent.trim()) && b.getBoundingClientRect().width > 0)`), 'T3 toolbar painted');
+  await eventually(() => cdp!.evaluate<string>(`document.querySelector('#status')?.textContent?.replace(/\\s+/g, ' ') ?? ''`), 'opening finished', text => text === 'VPO-Base · slide 1/1');
   for (const mode of ['Remote', 'Local']) {
     const visible = await cdp.evaluate<boolean>(`[...document.querySelectorAll('button')].some(b => b.textContent === 'Open with T3 ${mode}' && b.getBoundingClientRect().width > 0)`);
     if (!visible) await cdp.clickByText('button', 'More');

@@ -79,4 +79,19 @@ describe('delayed operation progress', () => {
     expect(render).toHaveBeenLastCalledWith({ message: '', busy: false });
     vi.useRealTimers();
   });
+
+  it('finishes opening when a hidden window never receives animation frames', async () => {
+    vi.useFakeTimers();
+    try {
+      const progress = new DelayedOperationProgress(vi.fn(), 500, () => {});
+      const operation = progress.begin('Opening presentation');
+      const finished = vi.fn();
+      void operation.waitForPaint().then(finished);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(finished).toHaveBeenCalledOnce();
+      operation.finish();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
