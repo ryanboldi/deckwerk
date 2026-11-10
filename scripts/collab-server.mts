@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { T3Chats, withT3Rpc } from '../src/server/t3Chats.js';
 import { startCollabServer, defaultClientDir, importerProblems, mediaToolProblems } from '../src/server/collabServer.js';
 import { LocalAgentRegistry } from '../src/server/localAgents.js';
 import { headlessBrowserProblem } from '../src/cli/compileHtml.js';
@@ -124,6 +125,7 @@ if (problems.length > 0) {
 const localAgents = localAgentsEnabled ? new LocalAgentRegistry({ name: agentName }) : undefined;
 const server = await startCollabServer({
   rootDir: resolve(rootDir),
+  ...(process.env.DECKWERK_T3_HOME ? { t3Chats: new T3Chats(resolve(rootDir, '.deckwerk-t3'), work => withT3Rpc(process.env.DECKWERK_T3_HOME!, work)) } : {}),
   clientDir,
   port,
   host,

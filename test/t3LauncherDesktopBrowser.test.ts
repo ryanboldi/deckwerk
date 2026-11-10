@@ -2,17 +2,20 @@ import { afterEach, expect, it } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { T3Chats } from '../src/server/t3Chats.js';
+import { startCollabServer, type RunningCollabServer } from '../src/server/collabServer.js';
 import { parseDeck } from '../src/shared/deck.js';
 import { saveDeck } from '../src/main/deckStore.js';
 import { materializeDesktopApp, launchDesktopApp, isEditorTarget, type RunningApp } from './support/desktopApp.js';
 import { Cdp, eventually, findTarget, stopBrowser } from './support/browserSession.js';
 
+let server: RunningCollabServer | undefined;
 let root: string, app: RunningApp | undefined, cdp: Cdp | undefined, main: Cdp | undefined;
 afterEach(async () => {
-  cdp?.close(); main?.close(); await stopBrowser(app?.process ?? null);
+  cdp?.close(); main?.close(); await stopBrowser(app?.process ?? null); await server?.close();
   if (root) await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
-it('both T3 buttons open without creating a project, including an unmapped remote deck', async () => {
+it('both T3 buttons open chat links, with Remote reusing a No project server conversation', async () => {
   root = await mkdtemp(join(tmpdir(), 'deckwerk-t3-'));
   const deckDir = join(root, 'VPO-Base'), profile = join(root, 'profile'), appDir = join(root, 'app');
   await mkdir(join(deckDir, '.deckwerk-remote'), { recursive: true }); await mkdir(profile);
@@ -20,8 +23,18 @@ it('both T3 buttons open without creating a project, including an unmapped remot
   await saveDeck(deckDir, deck);
   await writeFile(join(deckDir, 'theme.css'), '');
   await writeFile(join(deckDir, '.deckwerk-remote/base.json'), JSON.stringify(deck));
+  const launches: any[] = [];
+  const existing: Record<string, string> = {};
+  const t3Chats = new T3Chats(join(root, 'chats'), async work => work(async (method: string, payload: any): Promise<any> => {
+    if (method === 'server.getConfig') return { environment: { environmentId: 'server-env' }, settings: { defaultModelSelection: { instanceId: 'provider', model: 'model' } } };
+    if (method === 'orchestration.getThreadTitles') return existing;
+    if (method === 'projects.ensureScratch') return { projectId: 'scratch' };
+    existing[payload.threadId] = payload.title; launches.push(payload); return { threadId: payload.threadId };
+  }));
+  server = await startCollabServer({ rootDir: root, host: '127.0.0.1', port: 0, mediaRenditions: false, t3Chats });
+  const origin = `http://127.0.0.1:${server.port}`;
   await writeFile(join(deckDir, '.deckwerk-remote/sync.json'), JSON.stringify({
-    version: 1, server: 'http://127.0.0.1:9', deckId: 'VPO-Base', title: deck.title, seq: 0, themeCss: '', savedAt: new Date().toISOString(),
+    version: 1, server: origin, deckId: 'VPO-Base', title: deck.title, seq: 0, themeCss: '', savedAt: new Date().toISOString(),
   }));
   await materializeDesktopApp(appDir, 'deckwerk-t3-test');
   app = await launchDesktopApp(appDir, [deckDir, '--inspect=0'], { profileDir: profile });
@@ -34,34 +47,28 @@ it('both T3 buttons open without creating a project, including an unmapped remot
     const result = await main!.call('Runtime.evaluate', { expression, includeCommandLineAPI: true, returnByValue: true }) as { result: { value: T } };
     return result.result.value;
   };
-  // Only the OS handoff is captured. The real buttons, save, IPC, mirror/config
-  // reads and launcher run, without opening T3 or touching the user's clipboard.
-  await evaluate(`globalThis.t3Launches = []; globalThis.t3Context = '';
-    require('electron').clipboard.writeText = text => { globalThis.t3Context = text; };
-    require('electron').shell.openExternal = async url => { globalThis.t3Launches.push({url}); };
-    const cp = require('node:child_process'); const original = cp.execFile;
-    cp.execFile = function(file, args, options, callback) {
-      if (file === '/usr/bin/open' || file.endsWith('/t3')) {
-        globalThis.t3Launches.push({file, args}); callback(null, '', ''); return {};
-      }
-      return original.apply(this, arguments);
-    }; require('node:module').syncBuiltinESMExports();`);
+  // Capture the OS link handoff; run the real buttons, save, IPC, HTTP route and chat service.
+  await evaluate(`globalThis.t3Launches = []; require('electron').shell.openExternal = async url => { globalThis.t3Launches.push(url); };`);
   await eventually(() => cdp!.evaluate<string>(`window.api.getDeck().then(s => s?.deck.title ?? '')`), 'deck loaded', t => t === 'VPO-Base');
   await eventually(() => cdp!.evaluate<boolean>(`[...document.querySelectorAll('button')].some(b => ['More', 'Open with T3 Remote'].includes(b.textContent.trim()) && b.getBoundingClientRect().width > 0)`), 'T3 toolbar painted');
   await eventually(() => cdp!.evaluate<string>(`document.querySelector('#status')?.textContent?.replace(/\\s+/g, ' ') ?? ''`), 'opening finished', text => text === 'VPO-Base · slide 1/1');
-  for (const mode of ['Remote', 'Local']) {
+  for (const mode of ['Remote', 'Local', 'Remote']) {
     const visible = await cdp.evaluate<boolean>(`[...document.querySelectorAll('button')].some(b => b.textContent === 'Open with T3 ${mode}' && b.getBoundingClientRect().width > 0)`);
     if (!visible) await cdp.clickByText('button', 'More');
     await cdp.clickByText(visible ? 'button' : '[role=menuitem]', `Open with T3 ${mode}`);
-    const message = await eventually(() => cdp!.evaluate<string>(`document.body.innerText`), 'T3 launch completed', t => t.includes('Could not open T3:') || t.includes(`${mode === 'Remote' ? 'server' : 'local'} deck context copied`));
+    const message = await eventually(() => cdp!.evaluate<string>(`document.body.innerText`), 'T3 launch completed', t => t.includes('Could not open T3:') || t.includes(mode === 'Remote' ? "presentation's T3 chat on the server" : 'local T3 chat draft'));
     expect(message).not.toContain('Could not open T3:');
     expect(message).toContain(mode === 'Remote' ? 'server' : 'local');
-    const context = await evaluate<string>('globalThis.t3Context');
-    expect(context).toContain('VPO-Base');
-    expect(context).toContain(mode === 'Remote' ? 'http://127.0.0.1:9' : deckDir);
-    await evaluate(`globalThis.t3Context = ''`);
   }
-  const launches = await evaluate<Array<{ file?: string; args?: string[]; url?: string }>>('globalThis.t3Launches');
-  expect(launches).toHaveLength(2);
-  expect(launches.every(l => l.url === 't3code://' || (l.file === '/usr/bin/open' && l.args?.join(' ') === '-b com.t3tools.t3code'))).toBe(true);
+  const links = await evaluate<string[]>('globalThis.t3Launches');
+  expect(links).toHaveLength(3);
+  const remote = new URL(links[0]!); const local = new URL(links[1]!);
+  expect(remote.host).toBe('threads');
+  expect(remote.pathname).toMatch(/^\/server-env\/[\w-]+$/);
+  expect(remote.searchParams.get('prompt')).toContain(deckDir);
+  expect(local.host).toBe('new'); expect(local.searchParams.has('repo')).toBe(false);
+  expect(links[2]).toBe(links[0]);
+  expect(launches).toHaveLength(1);
+  expect(launches.every(p => p.projectId === 'scratch' && !p.initialMessage)).toBe(true);
+
 }, 120_000);

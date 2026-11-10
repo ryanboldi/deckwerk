@@ -894,7 +894,7 @@ function registerHandlers(): void {
   });
   ipcMain.handle(IPC.t3Open, async (event, mode: 'local' | 'remote'): Promise<string> => {
     const session = requireSession(event);
-    return openT3Workspace(session.dir, mode, app.getPath('userData'), (url) => shell.openExternal(url), (text) => clipboard.writeText(text));
+    return openT3Workspace(session.dir, mode, (url) => shell.openExternal(url));
   });
   ipcMain.handle(IPC.agentPanelGetState, async (event): Promise<AgentPanelState> => {
     const s = requireSession(event);

@@ -179,6 +179,10 @@ export class RemoteClient {
     return parseDeck(renameRetiredFields(await this.json<unknown>('/api/deck', { deck: deckId })));
   }
 
+  async t3Chat(deckId: string): Promise<import('../shared/t3Chat.js').T3Chat> {
+    return (await this.request('/api/t3-chat', { deck: deckId }, { method: 'POST', signal: AbortSignal.timeout(90_000) })).json();
+  }
+
   async presentationGit(deckId: string, command: PresentationGitRequest): Promise<PresentationGitResponse> {
     return (await this.request('/api/git', { deck: deckId }, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(command), signal: AbortSignal.timeout(120_000) })).json() as Promise<PresentationGitResponse>;
   }

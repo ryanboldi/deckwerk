@@ -1,4 +1,5 @@
 import { PresentationGitService } from './presentationGitService.js';
+import type { T3ChatHost } from './t3Chats.js';
 import { renameRetiredFields } from '@shared/fieldAliases.js';
 import { spawn } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -320,6 +321,8 @@ interface HttpNativeDraft {
 }
 
 export interface CollabServerOptions {
+  /** Optional chat launcher for the host's T3 instance, accessible only to the host. */
+  t3Chats?: T3ChatHost;
   /**
    * The single directory this server exposes. Every immediate subdirectory
    * containing a deck.json is an openable deck; nothing outside this
@@ -2075,6 +2078,15 @@ export async function startCollabServer(options: CollabServerOptions): Promise<R
     }
     if (deckParam && rooms.get(deckParam)?.historyQueue && request.method !== 'GET' && request.method !== 'HEAD') {
       return respondJson(response, 409, { error: 'A history operation is applying. Retry shortly.' });
+    }
+
+    if (path === '/api/t3-chat') {
+      if (request.method !== 'POST' || request.headers[BRIDGE_HEADER] !== '1') return respondJson(response, 405, { error: 'Use the DeckWerk chat launcher' });
+      if (!isHostRequest(request)) return respondJson(response, 403, { error: 'T3 chats are private to the presentation server owner' });
+      if (!deckParam || hostedDeckId) return respondJson(response, 400, { error: 'Choose a server presentation first' });
+      if (!options.t3Chats) return respondJson(response, 503, { error: 'T3 chats are not configured on this server' });
+      const room = await getRoom(deckParam);
+      return respondJson(response, 200, await options.t3Chats.open(room.session.dir));
     }
 
     if (path === '/api/git' || path === '/api/git/pdf') {
