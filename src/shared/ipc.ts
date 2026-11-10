@@ -90,6 +90,7 @@ export const IPC = {
   remoteServerAdd: 'remote:serverAdd',
   remoteServerRemove: 'remote:serverRemove',
   remoteListing: 'remote:listing',
+  remoteCreate: 'remote:create',
   remoteOpen: 'remote:open',
   /** The decks of one server already copied to this computer (open offline). */
   remoteLocalCopies: 'remote:localCopies',

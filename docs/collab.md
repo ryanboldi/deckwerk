@@ -101,6 +101,13 @@ editing them when the connection drops.
   user data). Once one is known, **Open** shows one dialog with *This
   computer* and a tab per server, browsing the server's folders like its web
   picker; with none, Open goes straight to the folder picker as before.
+- **Create.** With a saved server, **New** asks where to create the
+  presentation. Choose *This Mac* (or *This computer*) for a local folder,
+  or choose a server and enter a name. The server creates the presentation
+  and the app downloads and opens its synced local copy. Creating on a
+  server requires a connection; the downloaded copy works offline afterward.
+  Existing names are refused. If creation succeeds but downloading fails,
+  use **Open** to retry opening the existing presentation.
 - **A mirror, not a window onto the server.** Opening a server deck makes (or
   refreshes) an ordinary deck folder at
   `~/.deckwerk/remote/<host>/<deck id>` (`DECKWERK_REMOTE_ROOT` overrides it)

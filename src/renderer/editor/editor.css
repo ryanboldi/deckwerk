@@ -4088,6 +4088,7 @@ button.deck-picker-row.active { border-color: var(--accent); }
 
 /* Open: this computer and the deck servers (openDialog.ts). */
 .open-dialog { width: min(640px, calc(100vw - 56px)); }
+.new-presentation-dialog .field[hidden] { display: none; }
 .open-dialog-sources { grid-auto-columns: minmax(0, max-content); }
 .open-dialog-sources .segment-button { padding: 0 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .open-dialog-body { display: flex; flex-direction: column; gap: 10px; min-height: 220px; }

@@ -206,6 +206,8 @@ const api = {
     ipcRenderer.invoke(IPC.remoteServerAdd, url, name),
   removeRemoteServer: (id: string): Promise<void> => ipcRenderer.invoke(IPC.remoteServerRemove, id),
   remoteListing: (serverId: string): Promise<RemoteDeckListing> => ipcRenderer.invoke(IPC.remoteListing, serverId),
+  createRemoteDeck: (serverId: string, name: string, operationId?: string): Promise<string> =>
+    ipcRenderer.invoke(IPC.remoteCreate, serverId, name, operationId),
   openRemoteDeck: (
     serverId: string,
     deckId: string,

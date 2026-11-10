@@ -105,6 +105,13 @@ export function registerRemoteDeckIpc(deps: RemoteIpcDeps): void {
   ipcMain.handle(IPC.remoteListing, async (_event, serverId: string): Promise<RemoteDeckListing> =>
     (await clientFor(serverId)).listing());
 
+  ipcMain.handle(IPC.remoteCreate, async (event, serverId: string, name: string, operationId?: string): Promise<string> => {
+    requireOwner(event);
+    const saved = await savedServers().get(serverId);
+    reportOperation(event, operationId, `Creating the presentation on ${saved.name}`);
+    return new RemoteClient(saved.url).createDeck(name);
+  });
+
   ipcMain.handle(
     IPC.remoteOpen,
     async (

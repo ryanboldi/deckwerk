@@ -178,6 +178,14 @@ export class RemoteClient {
     return parseDeck(renameRetiredFields(await this.json<unknown>('/api/deck', { deck: deckId })));
   }
 
+  async createDeck(name: string): Promise<string> {
+    if (typeof name !== 'string' || !name.trim()) throw new Error('Enter a presentation name');
+    const response = await this.request('/api/decks', { name: name.trim() }, { method: 'POST' });
+    const body = await response.json() as { id?: unknown };
+    if (typeof body.id !== 'string' || !body.id) throw new Error('The server did not return the new presentation');
+    return body.id;
+  }
+
   async theme(deckId: string): Promise<string> {
     return (await this.request('/api/theme', { deck: deckId })).text();
   }

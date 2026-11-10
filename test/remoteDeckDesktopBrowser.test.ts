@@ -171,6 +171,41 @@ async function openFromServer(cdp: Cdp): Promise<void> {
 }
 
 describe('desktop editing a server deck', () => {
+  it('creates from New on a saved server, refuses duplicates, and reopens the new deck offline', async () => {
+    await writeFile(join(profileDir, 'remote-servers.json'), JSON.stringify({
+      servers: [{ id: 'lab-server', name: 'Lab', url: serverUrl() }],
+    }));
+    editor = await launch();
+    await eventually(() => editor!.evaluate<boolean>(`Boolean(document.querySelector('[data-action="new"]')?.getClientRects().length)`),
+      'the welcome screen');
+    await editor.click('[data-action="new"]', 'New presentation');
+    await eventually(() => editor!.evaluate<boolean>(`Boolean(document.querySelector('.new-presentation-dialog'))`), 'location dialog');
+    await editor.chooseByKeys('.new-presentation-dialog select', 'lab-server', 'creation location');
+    await eventually(() => editor!.evaluate<string>(`document.querySelector('.new-presentation-dialog select').value`),
+      'the server choice', (value) => value === 'lab-server');
+    await shot(editor, 'new-remote-dialog');
+    await editor.typeInto('.new-presentation-dialog input', 'New remote talk', 'presentation name');
+    await chipState(editor, 'online', 'the new deck to connect');
+    const createdMirror = mirrorDirFor(remoteRoot, serverUrl(), 'New remote talk');
+    const serverDeck = JSON.parse(await readFile(join(rootDir, 'New remote talk', 'deck.json'), 'utf8')) as Deck;
+    expect(serverDeck.title).toBe('New remote talk');
+    expect(existsSync(join(createdMirror, '.deckwerk-remote', 'sync.json'))).toBe(true);
+    await shot(editor, 'new-remote-online');
+
+    // A duplicate must fail, keeping the deck that was already open intact.
+    await editor.evaluate(`window.api.createRemoteDeck('lab-server', 'New remote talk').then(
+      () => { throw new Error('Duplicate was accepted'); },
+      error => { if (!error.message.includes('already exists')) throw error; }
+    )`);
+    expect(JSON.parse(await readFile(join(rootDir, 'New remote talk', 'deck.json'), 'utf8'))).toEqual(serverDeck);
+
+    await quit();
+    link!.cut();
+    editor = await launch([createdMirror]);
+    await chipState(editor, 'offline', 'the newly created deck to reopen offline');
+    expect(await editor.evaluate<string>(`document.querySelector('.bar-deck-name').textContent`)).toBe('New remote talk');
+  }, 120_000);
+
   it('opens from the Open dialog, syncs live, edits offline, and merges through the dialog', async () => {
     editor = await launch();
     await openFromServer(editor);

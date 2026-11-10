@@ -90,6 +90,27 @@ describe('saved servers', () => {
 });
 
 describe('RemoteClient', () => {
+  it('creates on the server and prepares a copy that opens offline', async () => {
+    const client = new RemoteClient(origin);
+    const id = await client.createDeck('  New talk & review  ');
+    expect(id).toBe('New talk - review');
+    expect((await client.listing()).decks.some((deck) => deck.id === id)).toBe(true);
+    const { dir, deck } = await prepareMirror(client, mirrorsRoot, id);
+    expect(deck.title).toBe(id);
+    expect((await readRemoteState(dir))!.state.deckId).toBe(id);
+    const offline = await prepareMirror(client, mirrorsRoot, id, () => {}, { offline: true });
+    expect(offline.deck).toEqual(deck);
+  });
+
+  it('refuses blank or duplicate names without replacing the existing deck', async () => {
+    const client = new RemoteClient(origin);
+    await expect(client.createDeck('  ')).rejects.toThrow('Enter a presentation name');
+    const id = await client.createDeck('Existing talk');
+    const original = await client.deck(id);
+    await expect(client.createDeck('Existing talk')).rejects.toThrow(/409.*already exists/);
+    expect(await client.deck(id)).toEqual(original);
+  });
+
   it('lists decks in folders and says who we are', async () => {
     const client = new RemoteClient(origin);
     expect(await client.info()).toEqual({ origin, user: null, userName: null });
@@ -104,6 +125,8 @@ describe('RemoteClient', () => {
     const { port } = probe.address() as { port: number };
     await new Promise<void>((resolve) => probe.close(() => resolve()));
     await expect(new RemoteClient(`http://127.0.0.1:${port}`).listing()).rejects.toThrow(/nothing is listening/);
+    await expect(new RemoteClient(`http://127.0.0.1:${port}`).createDeck('Offline talk'))
+      .rejects.toThrow(/nothing is listening/);
   });
 });
 

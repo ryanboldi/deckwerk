@@ -24,6 +24,7 @@ import {
 import { AgentBridge, type HtmlSyncOutcome } from './agentBridge.js';
 import { AgentPanel } from './agentPanel.js';
 import { createDeckWerkButton } from './aboutDialog.js';
+import { showNewPresentationDialog, type NewPresentationChoice } from './newPresentationDialog.js';
 import { showEditorThemeDialog } from './editorThemeDialog.js';
 import { installEditorTheme } from '../editorTheme.js';
 import { installUpdates } from './updateDialog.js';
@@ -1219,14 +1220,35 @@ function connectRemoteDeck(binding: RemoteDeckBinding): void {
   renderRemoteChip();
 }
 
+let creatingPresentation = false;
 async function newPresentation(): Promise<void> {
+  if (creatingPresentation) return;
+  creatingPresentation = true;
+  let createdOnServer: string | null = null;
   try {
+    const servers = await window.api.remoteServers();
+    const choice: NewPresentationChoice | null = servers.length
+      ? await showNewPresentationDialog(servers, remoteBinding?.serverId)
+      : { kind: 'local' };
+    if (!choice) return;
     await runOperation('Creating presentation…', async (operation) => {
-      const session = await window.api.newDeck(operation.id);
+      let session;
+      if (choice.kind === 'local') {
+        session = await window.api.newDeck(operation.id);
+      } else {
+        const deckId = await window.api.createRemoteDeck(choice.server.id, choice.name, operation.id);
+        createdOnServer = `Created “${deckId}” on ${choice.server.name}. Reopen it using Open → ${choice.server.name}.`;
+        session = await window.api.openRemoteDeck(choice.server.id, deckId, operation.id);
+      }
       if (session) await adopt(session.dir, session.deck, operation);
     });
   } catch (err) {
-    setStatusMessage(`Could not create presentation: ${err instanceof Error ? err.message : err}`);
+    const reason = err instanceof Error ? err.message : String(err);
+    setStatusMessage(createdOnServer
+      ? `${createdOnServer} Could not open its local copy: ${reason}`
+      : `Could not create presentation: ${reason}`);
+  } finally {
+    creatingPresentation = false;
   }
 }
 
