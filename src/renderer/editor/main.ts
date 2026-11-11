@@ -50,6 +50,7 @@ import { persistSessionDeck } from './sessionPersistence.js';
 import { createThemePanel } from './themePanel.js';
 import {
   barButton,
+  barIconButton,
   createTextInsertPicker,
   bindEditorKeys,
   createClipboardActions,

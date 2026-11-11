@@ -245,7 +245,7 @@ for (const kind of BACKENDS) describe.skipIf(!electronBinary)(`an agent working 
     // does not loop, unmute or autoplay; the region is not wrapped in its own
     // export box; the class's margin and object-position were not frozen in.
     for (const id of [
-      'details-math', 'details-framed', 'details-clip', 'details-curve', 'details-brace', 'details-mirrored', 'details-arrow',
+      'details-math', 'details-lists', 'details-framed', 'details-clip', 'details-curve', 'details-brace', 'details-mirrored', 'details-arrow',
       'details-pen', 'details-marker', 'details-region',
     ]) {
       expect(element(after, id), id).toEqual(element(before, id));

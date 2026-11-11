@@ -38,6 +38,7 @@ import { PAPER_ICON, insertPaperCard } from '../editor/paperCardDialog.js';
 import { Inspector } from '../editor/inspector.js';
 import {
   barButton,
+  barIconButton,
   createTextInsertPicker,
   bindEditorKeys,
   createClipboardActions,

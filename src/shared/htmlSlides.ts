@@ -14,7 +14,7 @@ import { bakeEndpointFlips, canonicalOrientation, elementTransform, orientationF
 import { codeElementFromNode, codeElementToHtml, lineBuildsFromNode } from './codeHtml.js';
 import { formatLineBuilds } from './codeBlocks.js';
 import { CODE_AUTHORING_CSS } from './codeBlocks.js';
-import { applyTableColumnWidths } from './paragraphs.js';
+import { applyTableColumnWidths, BULLET_STYLES, LIST_BULLET_ATTRIBUTE } from './paragraphs.js';
 import { normalizeHtmlLineHeights, normalizeStyleLineHeight } from './lineHeight.js';
 import { compareDataAttrs, compareFromDataset, syncLengthFromDataset } from './compare.js';
 import { mediaFragmentTrim, withoutFragment } from './mediaFragment.js';
@@ -1518,6 +1518,13 @@ function countSlides(count: number): string {
   return `${count} slide${count === 1 ? '' : 's'}`;
 }
 
+/** A list's own marker style, as an attribute for its rebuilt tag; known styles only. */
+function listBulletAttribute(style: string | undefined): string {
+  return BULLET_STYLES.some((choice) => choice.value === style)
+    ? ` ${LIST_BULLET_ATTRIBUTE}="${style}"`
+    : '';
+}
+
 /**
  * Inline CSS worth keeping once an element is absolutely positioned.
  *
@@ -2006,7 +2013,8 @@ function elementFromMeasured(
     ...effectsFromNode(node, base.style),
     type: 'text',
     // A list is one text object; without its own tag around the items the
-    // markers and indentation would not survive into the deck.
+    // markers and indentation would not survive into the deck — nor would the
+    // marker style the tag carries.
     html: normalizeHtmlLineHeights(node.tag === 'ul' || node.tag === 'ol'
       ? `<${node.tag}${listAttributes(node)}>${trimCollapsible(node.html)}</${node.tag}>`
       // A deck text box's own markup is kept exactly: the player shows it
@@ -2049,9 +2057,10 @@ function elementFromMeasured(
  * around the items, so `<ol start="4">` came back counting from 1.
  */
 function listAttributes(node: MeasuredNode): string {
-  if (node.tag !== 'ol') return '';
+  const bullet = listBulletAttribute(node.dataset.bullet);
+  if (node.tag !== 'ol') return bullet;
   const start = Number.parseInt(node.attrs.start ?? '', 10);
-  return (Number.isFinite(start) ? ` start="${start}"` : '')
+  return bullet + (Number.isFinite(start) ? ` start="${start}"` : '')
     + (node.attrs.reversed ? ' reversed' : '');
 }
 
