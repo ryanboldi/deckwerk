@@ -39,6 +39,7 @@ import { MediaPanel, installMediaDrop } from './mediaPanel.js';
 import { authoredHtmlSync, fileName } from './htmlCompile.js';
 import { createPenButton, createShapeInsertPicker, createTableInsertPicker, insertText } from './elementCreation.js';
 import { insertCode } from './codeInspector.js';
+import { PAPER_ICON, insertPaperCard } from './paperCardDialog.js';
 import { createToolbarPicker, createToolbarSplitButton } from './exportPicker.js';
 import { showPdfExportDialog } from './pdfExportDialog.js';
 import { showWebExportDialog } from './webExportDialog.js';
@@ -650,6 +651,11 @@ function buildToolbar(): void {
     createPenButton(canvas),
     createTableInsertPicker(store),
     createMediaButton(mediaHost),
+    barIconButton('Paper', PAPER_ICON, () => void insertPaperCard({
+      store,
+      beginOperation: (message) => operationProgress.begin(message),
+      setStatusMessage,
+    })),
   );
 
   const right = document.createElement('div');

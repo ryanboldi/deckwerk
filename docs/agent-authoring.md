@@ -45,6 +45,7 @@ slide backgrounds, request only the matching named recipe:
     slide-agent capabilities image crop mask media-frame video shapes flip
     slide-agent capabilities video-compare
     slide-agent capabilities code-block
+    slide-agent capabilities paper-card     (or: slide-agent paper . <arXiv id | DOI | URL | file.pdf>)
     slide-agent capabilities text-roles lists auto-fit latex background background-image
     slide-agent capabilities comments web-element html-element
 

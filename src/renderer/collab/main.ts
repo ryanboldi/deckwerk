@@ -34,6 +34,7 @@ import {
   insertText,
 } from '../editor/elementCreation.js';
 import { insertCode } from '../editor/codeInspector.js';
+import { PAPER_ICON, insertPaperCard } from '../editor/paperCardDialog.js';
 import { Inspector } from '../editor/inspector.js';
 import {
   barButton,
@@ -1279,6 +1280,11 @@ function buildToolbar(): void {
     createPenButton(canvas),
     createTableInsertPicker(store),
     createMediaButton(mediaHost),
+    barIconButton('Paper', PAPER_ICON, () => void insertPaperCard({
+      store,
+      beginOperation: (message) => operationProgress.begin(message),
+      setStatusMessage,
+    })),
   );
 
   const right = document.createElement('div');
